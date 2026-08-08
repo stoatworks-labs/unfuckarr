@@ -77,8 +77,14 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # `latest` comes from metadata-action's default `latest=auto`
+          # flavor, which applies it to semver tags only. Do NOT also set it
+          # on main: a main build is amd64-only, so `latest` would flip
+          # between multi-arch and amd64-only depending on which job ran last,
+          # and an arm64 user would see it break at random. `edge` is the
+          # rolling main tag.
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=edge,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short

@@ -119,9 +119,17 @@ docker compose up -d
 
 See [docker-compose.yml](docker-compose.yml). Then open `http://<host>:6969`.
 
-Images: `latest` tracks `main` and is **amd64 only**. Tagged releases (`1.0.0`, `1.0`) are
-multi-arch, amd64 and arm64 — arm64 is emulated at build time and gets no VAAPI drivers, so
-there is no hardware transcoding there.
+Image tags:
+
+| Tag | Means | Architectures |
+|---|---|---|
+| `latest`, `1.0.0`, `1.0` | the newest release | amd64 + arm64 |
+| `edge` | current `main` | amd64 only |
+| `sha-abc1234` | one specific commit | amd64 (arm64 too, on releases) |
+
+arm64 is emulated at build time and ships no VAAPI drivers, so there is no hardware transcoding
+there. `edge` is amd64-only because building arm64 under QEMU on every push is not worth the
+minutes — which is also why `latest` never points at a `main` build.
 
 ### From source
 
