@@ -35,7 +35,16 @@
   </Overview>
   <Category>MediaApp:Video Tools:Utilities</Category>
   <WebUI>http://[IP]:[PORT:6969]/</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/stoatworks-labs/stoatworks-unraid/main/templates/unfuckarr.xml</TemplateURL>
+  <!--
+    Deliberately empty. Unraid's dockerMan uses TemplateURL to check for
+    template updates, and a URL that 404s surfaces as an error on the container
+    page. This template is installed by hand (drop it in
+    /boot/config/plugins/dockerMan/templates-user/), because the GHCR package
+    is private and Community Applications cannot install a private image.
+    Restore the stoatworks-unraid/templates/unfuckarr.xml URL if it is ever
+    published there.
+  -->
+  <TemplateURL/>
   <Icon>https://raw.githubusercontent.com/stoatworks-labs/stoatworks-unraid/main/icon.png</Icon>
   <ExtraParams/>
   <PostArgs/>
