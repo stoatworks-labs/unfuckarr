@@ -1,0 +1,335 @@
+"""Remediation: the transcode plan, the recycle bin, and the *arr calls."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import httpx
+import pytest
+
+from unfuckarr import db, recycle, transcode
+from unfuckarr.checks import CheckResult, Finding
+from unfuckarr.clients.arr import ArrClient
+from unfuckarr.probe import probe
+from unfuckarr.remediation import Decision, Remediator
+from unfuckarr.scanner import check_file
+
+from .conftest import needs_ffmpeg
+
+
+# -- planning -------------------------------------------------------------
+
+@needs_ffmpeg
+def test_plan_copies_a_stream_that_already_passes(video_factory, settings):
+    """A compatible H.264 stream in the wrong container is a remux, not a
+    re-encode. Getting this wrong turns 20 seconds of work into 6 hours."""
+    path = video_factory("ok.mkv", seconds=6)
+    info = probe(str(path), settings.ffprobe_path)
+    result = CheckResult(path=str(path))
+    result.add(Finding("compat", "bad_container", "error", ""))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    assert p.video_action == "copy"
+    assert p.audio_action == "copy"
+    assert p.is_remux
+
+
+@needs_ffmpeg
+def test_plan_re_encodes_a_bad_video_codec(video_factory, settings):
+    path = video_factory("m2v.mkv", seconds=6, vcodec="mpeg2video",
+                         extra=["-b:v", "1M"])
+    info = probe(str(path), settings.ffprobe_path)
+    result = CheckResult(path=str(path))
+    result.add(Finding("compat", "bad_video_codec", "error", ""))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    assert p.video_action == "encode"
+
+
+@needs_ffmpeg
+def test_repair_plan_never_re_encodes(video_factory, settings):
+    path = video_factory("r.mkv", seconds=6)
+    info = probe(str(path), settings.ffprobe_path)
+    result = CheckResult(path=str(path))
+    result.add(Finding("integrity", "decode_errors", "error", ""))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat,
+                       repair=True)
+    assert p.video_action == "copy" and p.audio_action == "copy" and p.is_remux
+
+
+@needs_ffmpeg
+def test_emby_transcode_reasons_drive_the_plan(video_factory, settings):
+    """Emby's own verdict names the stream; the planner must honour it even
+    when the local codec table was happy."""
+    path = video_factory("emby.mkv", seconds=6)
+    info = probe(str(path), settings.ffprobe_path)
+    result = CheckResult(path=str(path))
+    result.add(Finding("emby", "no_direct_play", "error", "",
+                       {"reasons": ["VideoCodecNotSupported"]}))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    assert p.video_action == "encode"
+
+
+@needs_ffmpeg
+def test_pgs_subtitles_are_dropped_for_mp4(video_factory, settings):
+    """Copying PGS into MP4 fails the whole job, so it must be dropped."""
+    from unfuckarr.probe import MediaInfo, Stream
+    info = MediaInfo(path="x.mkv", container="mkv", duration=60, streams=[
+        Stream(index=0, codec_type="video", codec_name="h264"),
+        Stream(index=1, codec_type="audio", codec_name="aac"),
+        Stream(index=2, codec_type="subtitle", codec_name="hdmv_pgs_subtitle"),
+    ])
+    settings.transcode.container = "mp4"
+    p = transcode.plan(info, CheckResult(path="x"), settings.transcode,
+                       settings.emby_compat)
+    assert p.drop_subtitles == [0]
+
+
+@needs_ffmpeg
+def test_build_command_is_well_formed(video_factory, settings):
+    path = video_factory("cmd.mkv", seconds=6)
+    info = probe(str(path), settings.ffprobe_path)
+    p = transcode.plan(info, CheckResult(path=str(path)), settings.transcode,
+                       settings.emby_compat, repair=True)
+    cmd = transcode.build_command(str(path), "/tmp/out.mkv", info, p,
+                                  settings.transcode, ffmpeg="ffmpeg")
+    assert cmd[0] == "ffmpeg" and cmd[-1] == "/tmp/out.mkv"
+    assert "-nostdin" in cmd          # or a stalled ffmpeg eats stdin and hangs
+    assert "-c:v" in cmd
+
+
+# -- end to end -----------------------------------------------------------
+
+@needs_ffmpeg
+def test_incompatible_file_is_transcoded_and_verified(video_factory, settings):
+    path = video_factory("legacy.avi", seconds=8, vcodec="mpeg2video",
+                         acodec="ac3", extra=["-b:v", "1M"])
+    db.ex("INSERT INTO files (path, library, source, title) VALUES (?,?,?,?)",
+          (str(path), "Movies", "folder", "Legacy"))
+    row = {"path": str(path), "source": "folder", "title": "Legacy",
+           "arr_id": None, "arr_parent_id": None}
+
+    result, info = check_file(str(path), settings)
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("transcode", "incompatible"))
+
+    assert out["ok"], out
+    new = Path(out["path"])
+    assert new.exists() and new.suffix == ".mkv"
+    assert not path.exists(), "the original should have been recycled"
+
+    recheck, _ = check_file(str(new), settings)
+    assert recheck.status == "ok", [f.code for f in recheck.findings]
+
+
+@needs_ffmpeg
+def test_a_bad_transcode_output_is_discarded(video_factory, settings, monkeypatch):
+    """ffmpeg exiting 0 having written rubbish must not replace the source."""
+    path = video_factory("keep.mkv", seconds=8)
+    row = {"path": str(path), "source": "folder", "title": "Keep",
+           "arr_id": None, "arr_parent_id": None}
+    result, info = check_file(str(path), settings)
+    result.add(Finding("compat", "bad_container", "error", ""))
+
+    def fake_run(cmd, *a, **k):
+        Path(cmd[-1]).write_bytes(b"garbage")
+        return True, "faked"
+    monkeypatch.setattr(transcode, "run", fake_run)
+
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("transcode", "incompatible"))
+    assert not out["ok"]
+    assert path.exists(), "the source must survive a bad output"
+
+
+@needs_ffmpeg
+def test_a_failed_repair_falls_through_to_redownload(video_factory, settings,
+                                                     monkeypatch):
+    path = video_factory("fail.mkv", seconds=8)
+    row = {"path": str(path), "source": "folder", "title": "Fail",
+           "arr_id": None, "arr_parent_id": None}
+    db.ex("INSERT INTO files (path) VALUES (?)", (str(path),))
+    result, info = check_file(str(path), settings)
+    result.add(Finding("integrity", "decode_errors", "error", ""))
+
+    monkeypatch.setattr(transcode, "run", lambda *a, **k: (False, "ffmpeg died"))
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("repair", "container damage"))
+
+    assert out["action"] == "redownload"
+    assert not path.exists()
+    assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 1
+
+
+@needs_ffmpeg
+def test_a_transcode_that_does_not_fix_it_is_not_repeated_for_ever(
+        video_factory, settings, monkeypatch):
+    """A transcode that leaves the finding in place would otherwise be redone
+    on every scan, indefinitely, with nothing saying why."""
+    from unfuckarr.remediation import MAX_FIX_ATTEMPTS
+
+    path = video_factory("loop.mkv", seconds=8)
+    db.ex("INSERT INTO files (path, title) VALUES (?,?)", (str(path), "Loop"))
+    row = {"path": str(path), "source": "folder", "title": "Loop",
+           "arr_id": None, "arr_parent_id": None, "fix_attempts": 0}
+
+    # Whatever comes out, the checker keeps saying it is incompatible.
+    from unfuckarr import scanner as scanner_mod
+    real_check = scanner_mod.check_file
+
+    def always_bad(p, s, **kw):
+        result, info = real_check(p, s, **kw)
+        result.add(Finding("compat", "bad_container", "error", "still wrong"))
+        return result, info
+    monkeypatch.setattr(scanner_mod, "check_file", always_bad)
+
+    rem = Remediator(lambda: settings)
+    result, info = check_file(str(path), settings)
+    result.add(Finding("compat", "bad_container", "error", ""))
+
+    current = str(path)
+    for _ in range(MAX_FIX_ATTEMPTS):
+        out = rem.apply(row, result, info, Decision("transcode", "incompatible"))
+        assert out["ok"], out
+        current = out["path"]
+        row = {**row, "path": current,
+               "fix_attempts": db.q1("SELECT fix_attempts FROM files WHERE path=?",
+                                     (current,))["fix_attempts"]}
+
+    # The cap is now reached, so the next attempt refuses rather than running.
+    out = rem.apply(row, result, info, Decision("transcode", "incompatible"))
+    assert out["action"] == "flag"
+    assert "not trying again" in out["message"]
+
+
+def test_fix_attempts_column_is_added_to_an_existing_database(tmp_path):
+    """The column was added after 1.0.0, and CREATE TABLE IF NOT EXISTS will
+    not add it to a database that already exists."""
+    import sqlite3
+    p = tmp_path / "old.db"
+    conn = sqlite3.connect(p)
+    conn.executescript(db.SCHEMA)
+    conn.execute("ALTER TABLE files DROP COLUMN fix_attempts")   # the 1.0.0 shape
+    conn.execute("INSERT INTO files (path, status) VALUES ('/old.mkv', 'ok')")
+    conn.commit()
+    conn.close()
+
+    db.reset_for_tests(p)
+    # The existing row survives the migration.
+    assert db.q1("SELECT status FROM files WHERE path='/old.mkv'")["status"] == "ok"
+    cols = {r["name"] for r in db.connect().execute("PRAGMA table_info(files)")}
+    assert "fix_attempts" in cols
+
+
+# -- recycle bin ----------------------------------------------------------
+
+def test_recycled_file_can_be_restored(tmp_path, settings):
+    src = tmp_path / "movie.mkv"
+    src.write_bytes(b"x" * 4096)
+    stored = recycle.store(str(src), "test", "", 14)
+    assert stored and Path(stored).exists() and not src.exists()
+
+    row = db.q1("SELECT * FROM recycle")
+    recycle.restore(row["id"])
+    assert src.exists()
+    assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 0
+
+
+def test_zero_retention_unlinks_immediately(tmp_path, settings):
+    src = tmp_path / "gone.mkv"
+    src.write_bytes(b"x" * 100)
+    assert recycle.store(str(src), "test", "", 0) is None
+    assert not src.exists()
+    # Still recorded, so the activity log can show what happened.
+    assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 1
+
+
+def test_sweep_only_removes_expired_entries(tmp_path, settings):
+    import time
+    src = tmp_path / "old.mkv"
+    src.write_bytes(b"x" * 100)
+    stored = recycle.store(str(src), "test", "", 14)
+    db.ex("UPDATE recycle SET deleted = ?", (time.time() - 20 * 86400,))
+    assert recycle.sweep(14) == 1
+    assert not Path(stored).exists()
+
+    src2 = tmp_path / "new.mkv"
+    src2.write_bytes(b"x" * 100)
+    stored2 = recycle.store(str(src2), "test", "", 14)
+    assert recycle.sweep(14) == 0
+    assert Path(stored2).exists()
+
+
+def test_two_files_with_the_same_name_do_not_collide(tmp_path, settings):
+    for d in ("a", "b"):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / "video.mkv").write_bytes(b"x" * 100)
+        recycle.store(str(tmp_path / d / "video.mkv"), "test", "", 14)
+    stored = [r["stored"] for r in db.q("SELECT stored FROM recycle")]
+    assert len(set(stored)) == 2
+    assert all(Path(s).exists() for s in stored)
+
+
+# -- *arr client ----------------------------------------------------------
+
+def _arr(monkeypatch, handler) -> ArrClient:
+    from unfuckarr.config import ArrConfig
+    transport = httpx.MockTransport(handler)
+    real = httpx.Client
+
+    def client_factory(*a, **kw):
+        return real(transport=transport, **kw)
+    monkeypatch.setattr(httpx, "Client", client_factory)
+    return ArrClient(ArrConfig(enabled=True, url="http://arr:7878", api_key="k"),
+                     "radarr")
+
+
+def test_radarr_library_is_normalised(monkeypatch):
+    def handler(request):
+        assert request.headers["X-Api-Key"] == "k"
+        return httpx.Response(200, json=[{
+            "id": 12, "title": "Some Film", "runtime": 100,
+            "movieFile": {"id": 99, "path": "/movies/Some Film/film.mkv",
+                          "size": 5_000_000_000,
+                          "quality": {"quality": {"name": "Bluray-1080p"}}},
+        }, {"id": 13, "title": "No File", "runtime": 90}])
+    client = _arr(monkeypatch, handler)
+    lib = client.library()
+    assert len(lib) == 1, "a movie with no file must not appear"
+    assert lib[0]["expected_runtime"] == 6000       # minutes → seconds
+    assert lib[0]["arr_id"] == 99 and lib[0]["arr_parent_id"] == 12
+
+
+def test_blocklist_picks_the_newest_grab(monkeypatch):
+    posted = []
+
+    def handler(request):
+        if request.url.path.endswith("/history/movie"):
+            return httpx.Response(200, json=[
+                {"id": 1, "eventType": "grabbed", "date": "2026-01-01T00:00:00Z"},
+                {"id": 2, "eventType": "grabbed", "date": "2026-06-01T00:00:00Z"},
+                {"id": 3, "eventType": "downloadFolderImported", "date": "2026-07-01T00:00:00Z"},
+            ])
+        posted.append(request.url.path)
+        return httpx.Response(200, json={})
+    client = _arr(monkeypatch, handler)
+    assert client.blocklist_last_grab(12) is True
+    assert posted == ["/api/v3/history/failed/2"]
+
+
+def test_blocklist_reports_false_with_no_grab_history(monkeypatch):
+    """A hand-imported file has no grab. That is not an error — the caller
+    falls back to a plain search."""
+    def handler(request):
+        return httpx.Response(200, json=[])
+    client = _arr(monkeypatch, handler)
+    assert client.blocklist_last_grab(12) is False
+
+
+def test_arr_errors_are_wrapped(monkeypatch):
+    from unfuckarr.clients.arr import ArrError
+
+    def handler(request):
+        return httpx.Response(401, text="unauthorised")
+    client = _arr(monkeypatch, handler)
+    with pytest.raises(ArrError, match="rejected the API key"):
+        client.library()

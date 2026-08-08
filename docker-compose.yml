@@ -1,0 +1,30 @@
+services:
+  unfuckarr:
+    image: ghcr.io/stoatworks-labs/unfuckarr:latest
+    container_name: unfuckarr
+    restart: unless-stopped
+    ports:
+      - "6969:6969"
+    environment:
+      PUID: "99"
+      PGID: "100"
+      UMASK: "002"
+      TZ: "Europe/London"
+      # Optional seeding — anything set here overrides the saved config on
+      # start, so leave them out once you have used the settings page.
+      # UNFUCKARR_SONARR_URL: "http://sonarr:8989"
+      # UNFUCKARR_SONARR_API_KEY: ""
+      # UNFUCKARR_RADARR_URL: "http://radarr:7878"
+      # UNFUCKARR_RADARR_API_KEY: ""
+      # UNFUCKARR_EMBY_URL: "http://emby:8096"
+      # UNFUCKARR_EMBY_API_KEY: ""
+      # UNFUCKARR_WATCH_FOLDERS: "/media/downloads/complete"
+    volumes:
+      - ./config:/config
+      # Mount media at the SAME path the *arrs use, or set path mappings in
+      # the settings page. A mismatch is the single most common cause of
+      # "every file is missing".
+      - /mnt/user/media:/media
+    devices:
+      # Intel QuickSync / VAAPI. Remove if the host has no render node.
+      - /dev/dri:/dev/dri

@@ -1,0 +1,107 @@
+<?xml version="1.0"?>
+<!--
+  Unraid Community Applications template for unfuckarr.
+
+  CA reads templates ONLY from a templates repository, never from an app repo.
+  To list this: copy this file into stoatworks-unraid/templates/ and let the
+  App Feed rebuild. This copy is the source of truth for its contents.
+
+  Category tokens must carry no trailing colon on a subcategory —
+  "MediaApp:Video Tools:Utilities" is two valid tokens; "Tools:Utilities:" is
+  neither, and lands the app uncategorised.
+-->
+<Container version="2">
+  <Name>unfuckarr</Name>
+  <Repository>ghcr.io/stoatworks-labs/unfuckarr:latest</Repository>
+  <Registry>https://ghcr.io/stoatworks-labs/unfuckarr</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/stoatworks-labs/unfuckarr/issues</Support>
+  <Project>https://github.com/stoatworks-labs/unfuckarr</Project>
+  <Overview>
+    Scans a Sonarr/Radarr library, checks every video file is intact and will
+    direct play in Emby, and fixes what is not: transcodes files Emby would
+    have to transcode on every play, remuxes container damage, and deletes and
+    re-searches genuinely broken files (blocklisting the release so the same
+    bad copy is not grabbed again).
+
+    Watch folders check new downloads the moment they land, before the *arr
+    imports them. Everything deleted goes to a recycle bin with a retention
+    window, so an automatic decision can be undone.
+
+    Web UI shows library status, what it is doing right now, and every setting.
+  </Overview>
+  <Category>MediaApp:Video Tools:Utilities</Category>
+  <WebUI>http://[IP]:[PORT:6969]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/stoatworks-labs/stoatworks-unraid/main/templates/unfuckarr.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/stoatworks-labs/stoatworks-unraid/main/icon.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>Sonarr and/or Radarr. Emby is optional but strongly recommended — with it, unfuckarr asks the server itself whether it would direct play each file instead of guessing.</Requires>
+
+  <Config Name="WebUI Port" Target="6969" Default="6969" Mode="tcp"
+          Description="Host port for the web interface."
+          Type="Port" Display="always" Required="true" Mask="false">6969</Config>
+
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/unfuckarr" Mode="rw"
+          Description="Settings, the file database, and the recycle bin. Keep this on the cache/appdata share."
+          Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/unfuckarr</Config>
+
+  <Config Name="Media" Target="/media" Default="/mnt/user/media" Mode="rw"
+          Description="Your library. Mount it at the SAME path Sonarr/Radarr use, or set path mappings in the settings page — a mismatch makes every file look missing. Read-write is required: transcoding and deleting both write here."
+          Type="Path" Display="always" Required="true" Mask="false">/mnt/user/media</Config>
+
+  <Config Name="Downloads (watch folder)" Target="/downloads" Default="/mnt/user/downloads/complete" Mode="rw"
+          Description="Optional. Point this at your completed-downloads folder, then add /downloads as a watch folder in Settings to have new files checked the moment they land."
+          Type="Path" Display="always" Required="false" Mask="false"/>
+
+  <Config Name="PUID" Target="PUID" Default="99" Mode=""
+          Description="Run as this user id. Match your *arr containers or Sonarr will not be able to delete its own files."
+          Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
+
+  <Config Name="PGID" Target="PGID" Default="100" Mode=""
+          Description="Run as this group id."
+          Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
+
+  <Config Name="UMASK" Target="UMASK" Default="002" Mode=""
+          Description="File mode mask for files unfuckarr creates."
+          Type="Variable" Display="advanced" Required="false" Mask="false">002</Config>
+
+  <Config Name="TZ" Target="TZ" Default="Europe/London" Mode=""
+          Description="Timezone, so scheduled scan times read correctly."
+          Type="Variable" Display="advanced" Required="false" Mask="false">Europe/London</Config>
+
+  <Config Name="Sonarr URL" Target="UNFUCKARR_SONARR_URL" Default="" Mode=""
+          Description="Optional seed. Set it here or in the settings page. If set, it overrides the saved setting on every start."
+          Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <Config Name="Sonarr API key" Target="UNFUCKARR_SONARR_API_KEY" Default="" Mode=""
+          Description="Optional seed. Sonarr → Settings → General → API Key."
+          Type="Variable" Display="advanced" Required="false" Mask="true"/>
+
+  <Config Name="Radarr URL" Target="UNFUCKARR_RADARR_URL" Default="" Mode=""
+          Description="Optional seed."
+          Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <Config Name="Radarr API key" Target="UNFUCKARR_RADARR_API_KEY" Default="" Mode=""
+          Description="Optional seed. Radarr → Settings → General → API Key."
+          Type="Variable" Display="advanced" Required="false" Mask="true"/>
+
+  <Config Name="Emby URL" Target="UNFUCKARR_EMBY_URL" Default="" Mode=""
+          Description="Optional seed."
+          Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <Config Name="Emby API key" Target="UNFUCKARR_EMBY_API_KEY" Default="" Mode=""
+          Description="Optional seed. Emby → Settings → Advanced → API Keys."
+          Type="Variable" Display="advanced" Required="false" Mask="true"/>
+
+  <Config Name="Intel GPU (/dev/dri)" Target="/dev/dri" Default="/dev/dri" Mode=""
+          Description="Pass the render node through for QuickSync/VAAPI hardware transcoding. Remove this if the server has no Intel iGPU. Set the matching accelerator in Settings → Transcoding."
+          Type="Device" Display="advanced" Required="false" Mask="false">/dev/dri</Config>
+</Container>

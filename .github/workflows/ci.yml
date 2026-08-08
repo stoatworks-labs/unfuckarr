@@ -1,0 +1,156 @@
+name: CI
+
+# This repository is PRIVATE, so every Actions minute is billed. Two
+# consequences, both deliberate:
+#   * no `pull_request` trigger — image builds are minute-heavy and a push to
+#     the branch already covers it;
+#   * arm64 is emulated through QEMU and takes roughly ten times as long as
+#     amd64, so it is built only on a tagged release. Unraid is x86-64, which
+#     is what `latest` is for.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # The check engine is tested against files ffmpeg actually renders, so
+      # the runner needs a real ffmpeg — not a mock.
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest tests -q
+
+      - name: Validate the Unraid template
+        run: python scripts/validate_template.py
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decide platforms
+        id: platforms
+        run: |
+          if [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = "true" ]; then
+            echo "list=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+          else
+            echo "list=linux/amd64" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+        if: startsWith(github.ref, 'refs/tags/v')
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ steps.platforms.outputs.list }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A green build only proves the image assembled. Boot it and ask the
+      # health endpoint, so a container that crashes on start fails here
+      # rather than on someone's server.
+      - name: Smoke test the image
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository }}:sha-$(git rev-parse --short HEAD)"
+          docker run -d --name smoke -p 6969:6969 -e PUID=1000 -e PGID=1000 "$IMAGE"
+          ok=""
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:6969/health; then echo; ok=1; break; fi
+            sleep 2
+          done
+          docker logs smoke
+          if [ -z "$ok" ]; then echo "container never became healthy"; exit 1; fi
+          curl -fsS http://localhost:6969/api/status > /dev/null
+          curl -fsS http://localhost:6969/ | grep -q unfuckarr
+          docker exec smoke ffmpeg -version | head -1
+          docker rm -f smoke
+          echo "image smoke test passed"
+
+  release:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # The tag's own annotation is the release body; keeping one source
+          # stops the two drifting.
+          git fetch --force --tags
+          NOTES="$(git tag -l --format='%(contents)' "$TAG")"
+          printf '%s\n' "$NOTES" > notes.md
+          cat >> notes.md <<EOF
+
+          ---
+
+          ## Container image
+
+          \`\`\`
+          ghcr.io/${{ github.repository }}:${TAG#v}
+          ghcr.io/${{ github.repository }}:latest
+          \`\`\`
+
+          Multi-arch: \`linux/amd64\` and \`linux/arm64\` (no hardware
+          transcoding on arm64 — the VAAPI drivers are amd64-only).
+
+          The Unraid Community Applications template is \`unraid/unfuckarr.xml\`.
+          EOF
+          gh release create "$TAG" --title "unfuckarr $TAG" --notes-file notes.md \
+            unraid/unfuckarr.xml docker-compose.yml

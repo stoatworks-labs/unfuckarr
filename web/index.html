@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>unfuckarr</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🔧</text></svg>">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">🔧</span>
+    <span class="name">unfuckarr</span>
+    <span class="ver" id="version"></span>
+  </div>
+  <nav id="nav">
+    <a href="#/" data-route="/">Dashboard</a>
+    <a href="#/files" data-route="/files">Files</a>
+    <a href="#/activity" data-route="/activity">Activity</a>
+    <a href="#/recycle" data-route="/recycle">Recycle bin</a>
+    <a href="#/settings" data-route="/settings">Settings</a>
+  </nav>
+  <div class="topbar-right">
+    <span id="conn" class="conn" title="Event stream">●</span>
+    <button id="pauseBtn" class="btn btn-ghost">Pause</button>
+    <button id="scanBtn" class="btn btn-primary">Scan now</button>
+  </div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<main id="view"></main>
+
+<div id="drawer" class="drawer hidden">
+  <div class="drawer-head">
+    <h3 id="drawerTitle">File</h3>
+    <button class="btn btn-ghost" id="drawerClose">Close</button>
+  </div>
+  <div id="drawerBody" class="drawer-body"></div>
+</div>
+<div id="scrim" class="scrim hidden"></div>
+
+<div id="toasts" class="toasts"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

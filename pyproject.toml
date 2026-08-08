@@ -1,0 +1,28 @@
+[project]
+name = "unfuckarr"
+version = "1.0.0"
+description = "Validates a Sonarr/Radarr library against Emby, then transcodes or re-downloads what is broken."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.32,<1.0",
+    "httpx>=0.27,<1.0",
+    "pydantic>=2.9,<3.0",
+    "watchdog>=5.0,<7.0",
+]
+
+[project.scripts]
+unfuckarr = "unfuckarr.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["unfuckarr", "unfuckarr.checks", "unfuckarr.clients"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
