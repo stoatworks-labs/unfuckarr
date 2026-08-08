@@ -95,6 +95,11 @@ Break any of these and the failure is quiet and expensive.
 - The full API surface, settings round-trip, API-key gating, and the settle timer.
 - The web UI: dashboard, files list, file drawer, and a settings round-trip driven through the
   real page in a browser, persisted to disk.
+- **The Docker image builds and runs.** CI boots it and asserts `/health`, `/api/status`, the
+  served UI and `ffmpeg -version`; the log shows the PUID/PGID drop working
+  (`unfuckarr starting as unfuckarr:unfuckarr (1000:1000)`). Multi-arch amd64 + arm64 on tags.
+  This is the only container proof available — there is no runtime on the dev machine.
+- That the scheduled-scan time survives a restart.
 
 **Assumed — no real hardware or service has ever been connected:**
 
@@ -102,12 +107,13 @@ Break any of these and the failure is quiet and expensive.
   API and tested against `httpx.MockTransport`. Response shapes, especially Sonarr's
   `history/failed` semantics and Emby's `PlaybackInfo` `TranscodeReasons`, are from documentation,
   not observation.
-- **The Docker image has never been built.** There is no container runtime on the development
-  machine; CI is the only proof. The `RUN test -f /app/web/index.html` line and the smoke-test job
-  exist so a broken image fails there rather than on a server.
 - **No Unraid server has installed the template.** It is written against the CA conventions used
   elsewhere in this fleet (root `<Container version="2">`, no trailing colon on subcategory tokens,
-  per-image `<Registry>` URL).
+  per-image `<Registry>` URL) and `scripts/validate_template.py` checks those in CI, but "valid
+  XML" and "installs cleanly" are different claims.
+- **The image has only ever run on a CI runner**, as an empty install with no media mounted. No
+  volume permission problem, no real `/mnt/user` share and no `/dev/dri` passthrough has been
+  exercised.
 - **Hardware transcoding is untested.** All four accelerator paths (qsv/nvenc/vaapi/videotoolbox)
   are command-line construction only.
 - **No large library has been scanned.** Performance on 10,000 files is unknown; `sample` depth
