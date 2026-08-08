@@ -2,7 +2,7 @@
 
 > **AI-assisted project.** This codebase was created with [Claude Code](https://claude.com/claude-code).
 > The check engine, the transcode planner, the policy brakes and the recycle bin are covered by a
-> 76-test suite that runs against real files rendered by ffmpeg on every push. What has **not** been
+> 78-test suite that runs against real files rendered by ffmpeg on every push. What has **not** been
 > exercised is the other half: no Sonarr, Radarr or Emby server has ever been connected to this code.
 > Every *arr and Emby call is written to the documented v3 / Emby API and tested against mocked HTTP,
 > which is not the same thing as working. Treat the first run against a real library as a trial —
@@ -13,6 +13,8 @@ direct play, and fixes them — by transcoding, by remuxing, or by deleting the 
 *arr for a better copy.
 
 Runs as a Docker container with a web UI. Packaged for Unraid Community Applications.
+
+![Dashboard](docs/screenshots/dashboard.png)
 
 ---
 
@@ -42,6 +44,15 @@ not permit it.
 
 **Emby's activity log.** Real playback failures the server recorded, for files that otherwise
 look fine.
+
+Every file lists what is wrong with it, worst first:
+
+![Files list](docs/screenshots/files.png)
+
+…and each one opens on the findings, the actual stream layout, and the actions you can take by
+hand:
+
+![File detail](docs/screenshots/file-detail.png)
 
 ## What it does about it
 
@@ -76,6 +87,10 @@ Unattended deletion needs to be wrong safely, so there are three layers:
   *nothing*. That is what an unmounted array looks like, and it is the failure mode that costs
   people their library.
 
+All of it is on one settings page, with every option explaining what it actually does:
+
+![Policy settings](docs/screenshots/settings-policy.png)
+
 ## Watch folders — the live import gate
 
 Point a watch folder at your completed-downloads directory and every new video file is checked
@@ -101,17 +116,6 @@ use*, or fix it afterwards with path mappings in Settings.
 Or add the template by hand: `unraid/unfuckarr.xml` in this repo.
 
 ### Docker Compose
-
-**This repository is private, so the GHCR package is private too** — an anonymous `docker pull`
-gets a 403. Log in first with a token carrying `read:packages`:
-
-```bash
-echo "$GHCR_TOKEN" | docker login ghcr.io -u stoatworks-labs --password-stdin
-```
-
-On Unraid the same applies: add the registry credentials under Docker → Add Container, or make
-the package public from its GHCR settings page. Community Applications cannot install a private
-image.
 
 ```bash
 docker compose up -d
@@ -178,6 +182,18 @@ python -m pytest tests -q
 The suite renders real clips with ffmpeg rather than mocking the probe, because the interesting
 bugs are in what ffmpeg actually says about a file. Tests that need ffmpeg skip cleanly without it.
 The *arr and Emby clients are tested against `httpx.MockTransport`.
+
+To work on the UI without three real servers — this is also how the screenshots above are
+regenerated:
+
+```bash
+python scripts/demo_services.py &
+UNFUCKARR_CONFIG_DIR=./demo python scripts/seed_demo.py --with-services
+UNFUCKARR_CONFIG_DIR=./demo python -m unfuckarr
+```
+
+`demo_services.py` is a real HTTP stub answering the handshake endpoints, so the connection panel
+going green means the client code genuinely worked rather than a flag being set.
 
 ## API
 

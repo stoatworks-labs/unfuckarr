@@ -81,7 +81,7 @@ Break any of these and the failure is quiet and expensive.
 
 ## Verified vs assumed
 
-**Verified** — 76 tests, green, run against real ffmpeg output in CI:
+**Verified** — 78 tests, green, run against real ffmpeg output in CI:
 
 - The whole check engine against files ffmpeg actually renders: good, garbage, truncated,
   MPEG-2/AVI, HEVC, dual-audio, faststart vs not.

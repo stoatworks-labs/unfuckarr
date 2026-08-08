@@ -180,6 +180,41 @@ def test_partial_download_suffixes_are_ignored(tmp_path, settings):
     assert touched == [str(tmp_path / "movie.mkv")]
 
 
+def test_last_scan_time_survives_a_restart(settings):
+    """It lives in memory, so without restoring it from the scans table a
+    container restart reports "No scan yet" and — worse — pushes the next
+    scheduled scan out by a full interval. A nightly restart would mean the
+    schedule never fires."""
+    import time
+
+    from unfuckarr.service import Service
+    from unfuckarr.state import state
+
+    finished = time.time() - 3600
+    db.ex("INSERT INTO scans (started, finished, trigger) VALUES (?,?,?)",
+          (finished - 60, finished, "scheduled"))
+
+    state.last_scan_finished = None
+    svc = Service()
+    svc._restore_last_scan()
+    assert state.last_scan_finished == finished
+
+    settings.schedule.scan_interval_hours = 24
+    svc._recompute_next_scan()
+    # Due 24h after the last scan, not 24h after boot.
+    assert abs(state.next_scan_at - (finished + 86400)) < 2
+
+
+def test_restore_is_a_no_op_with_no_completed_scans(settings):
+    from unfuckarr.service import Service
+    from unfuckarr.state import state
+
+    db.ex("INSERT INTO scans (started, trigger) VALUES (?,?)", (1.0, "manual"))
+    state.last_scan_finished = None
+    Service()._restore_last_scan()
+    assert state.last_scan_finished is None
+
+
 def test_walk_skips_incomplete_and_metadata_directories(tmp_path):
     from unfuckarr.scanner import walk_video_files
 

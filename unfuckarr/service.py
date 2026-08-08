@@ -41,6 +41,7 @@ class Service:
     def start(self) -> None:
         db.init()
         config.load()
+        self._restore_last_scan()
         self.watcher.start()
         self._sched_stop.clear()
         self._sched_thread = threading.Thread(target=self._scheduler, daemon=True,
@@ -59,6 +60,19 @@ class Service:
         if self._sched_thread is not None:
             self._sched_thread.join(timeout=5)
         db.log("service_stopped", "info")
+
+    def _restore_last_scan(self) -> None:
+        """Carry the last scan time across a restart.
+
+        Without this a container restart reports "No scan yet" on a library
+        that has been scanned for months, and — worse — `_recompute_next_scan`
+        falls back to `time.time()`, so every restart pushes the next
+        scheduled scan out by a full interval. A daily restart would mean the
+        schedule never fires at all.
+        """
+        row = db.q1("SELECT MAX(finished) f FROM scans WHERE finished IS NOT NULL")
+        if row and row["f"]:
+            state.last_scan_finished = row["f"]
 
     def reload(self) -> None:
         """Called after settings are saved."""
