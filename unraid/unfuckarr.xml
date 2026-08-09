@@ -117,6 +117,10 @@
           Description="Optional seed. Emby → Settings → Advanced → API Keys."
           Type="Variable" Display="advanced" Required="false" Mask="true"/>
 
+  <Config Name="Bind interface (tailnet-only)" Target="UNFUCKARR_BIND_INTERFACE" Default="" Mode=""
+          Description="Optional. Bind the web server to ONE interface by name — e.g. tailscale0 with this container's Tailscale toggle enabled — so it is unreachable except through that network. Startup waits for the interface (60s) and then STOPS rather than listening everywhere; if the container exits, this value is why. Deliberately not on the settings page: a wrong bind saved there would take down the UI you would fix it with. Remove the WebUI port mapping when using this."
+          Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
   <Config Name="Intel GPU (/dev/dri)" Target="/dev/dri" Default="/dev/dri" Mode=""
           Description="Pass the render node through for QuickSync/VAAPI hardware transcoding. Remove this if the server has no Intel iGPU. Set the matching accelerator in Settings → Transcoding."
           Type="Device" Display="advanced" Required="false" Mask="false">/dev/dri</Config>

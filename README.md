@@ -176,6 +176,11 @@ This is how you pin unfuckarr to a [Tailscale](https://tailscale.com) tailnet pe
 `UNFUCKARR_BIND_INTERFACE=tailscale0` and it is unreachable except through Tailscale, even from
 the LAN.
 
+Neither variable appears on the settings page, and that is deliberate: the bind address is
+consumed before the web server exists, and a wrong value saved through the UI would take down
+the exact UI you would use to fix it. Set them where the container is configured — compose file,
+or the container's edit page on Unraid.
+
 The Docker catch: a process can only bind an interface that exists inside its own network
 namespace. In the default bridge network the container cannot see the host's `tailscale0` —
 there, control exposure from the host side instead, by publishing the port on the tailscale
