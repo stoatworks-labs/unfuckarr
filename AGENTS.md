@@ -73,6 +73,14 @@ Break any of these and the failure is quiet and expensive.
   `_container_from` reconciles that against the extension.
 - **PGS subtitles cannot be copied into MP4** — it fails the whole job. `_subtitles_to_drop`
   handles it per container.
+- **Never ask VAAPI to filter frames it did not decode.** `-hwaccel vaapi
+  -hwaccel_output_format vaapi` + `scale_vaapi` only works when the *decoder* also ran on the
+  GPU. Hardware decode is per-codec, and the sources this tool exists to fix are exactly the ones
+  GPUs have dropped — no recent AMD part decodes MPEG-2 at all. The decode silently falls back to
+  software and the filter then dies **partway through the file** with "Failed to inject frame
+  into filter network: Function not implemented", which reads like a driver fault rather than a
+  command-line one. Decode in software, `format=nv12,hwupload`, encode on the GPU: the encode is
+  the expensive half, and it works whatever the decoder did.
 - **`-ss` before `-i`** so ffmpeg seeks rather than decoding up to the point. Sampling the middle
   of a 40 GB file takes seconds this way and minutes the other way.
 - **Unraid user shares are SMB/NFS and produce no inotify events.** `WatchManager._needs_polling`
@@ -86,6 +94,13 @@ Break any of these and the failure is quiet and expensive.
   worker. Two workers would mean two scanners fighting over the same library.
 
 ## Verified vs assumed
+
+**Verified on real hardware — `vaapi`:** an AMD Radeon 880M (gfx1150) encodes 1080p MPEG-2 to
+HEVC at ~12x realtime through `plan` → `build_command` → `run`, output probed as hevc/yuv420p
+with the audio and duration intact. Two things had to be fixed to get there, and both are the
+kind of thing only hardware finds: Debian stable's Mesa cannot initialise any AMD GPU newer than
+RDNA2 (hence bookworm-backports in the Dockerfile), and the command asked the GPU to filter
+frames it had never decoded (see the trap below).
 
 **Verified in live use (since 1.0.0):** a real Sonarr, Radarr and Emby setup has been connected
 and used against a ~17,000-file library. That covers the half that used to be assumed: real
@@ -119,10 +134,8 @@ against a live library. Keep this paragraph honest if the claims below change.
   used elsewhere in this fleet (root `<Container version="2">`, no trailing colon on subcategory
   tokens, per-image `<Registry>` URL) and `scripts/validate_template.py` checks those in CI, but
   "valid XML" and "installs cleanly" are different claims.
-- **Hardware transcoding is untested.** All four accelerator paths (qsv/nvenc/vaapi/videotoolbox)
-  are command-line construction only. The live repairs observed so far are remuxes (stream copy —
-  no encoder involved) and delete-and-re-search; no hardware-accelerated *encode* has been
-  confirmed to complete.
+- **`qsv`, `nvenc` and `videotoolbox` are untested** — command-line construction only, no Intel,
+  NVIDIA or macOS hardware has ever run them. (`vaapi` is now verified; see below.)
 - **Performance on a very large library is unmeasured.** `sample` depth should be a few seconds
   per file, but 10,000-file behaviour is still arithmetic, not measurement.
 - ~~Interface binding not yet observed against a real `tailscale0`~~ — it now is: the live

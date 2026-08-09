@@ -165,8 +165,15 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
 
     hw = tcfg.hwaccel
     if p.video_action == "encode" and hw == "vaapi":
-        cmd += ["-hwaccel", "vaapi", "-hwaccel_device", tcfg.vaapi_device,
-                "-hwaccel_output_format", "vaapi"]
+        # Decode in software and upload, rather than -hwaccel vaapi
+        # -hwaccel_output_format vaapi. Hardware *decode* is per-codec and the
+        # sources this tool exists to fix are exactly the ones GPUs no longer
+        # decode — no recent AMD part has an MPEG-2 decoder at all. When the
+        # decoder falls back to software the frames are not VA surfaces, and
+        # scale_vaapi dies mid-stream with "Failed to inject frame into filter
+        # network: Function not implemented" rather than at startup. The encode
+        # is what needs the GPU; decoding an SD MPEG-2 in software is cheap.
+        cmd += ["-vaapi_device", tcfg.vaapi_device]
     elif p.video_action == "encode" and hw == "qsv":
         cmd += ["-hwaccel", "qsv"]
 
@@ -187,7 +194,10 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
         encoder = ENCODERS.get((tcfg.video_codec, hw), "libx264")
         cmd += ["-c:v", encoder]
         if hw == "vaapi":
-            cmd += ["-vf", "scale_vaapi=format=nv12", "-qp", str(tcfg.crf)]
+            # format=nv12 before hwupload: the encoder wants nv12, and doing the
+            # conversion on the CPU side keeps this working for 10-bit and
+            # odd-pixel-format sources too.
+            cmd += ["-vf", "format=nv12,hwupload", "-qp", str(tcfg.crf)]
         elif hw == "nvenc":
             cmd += ["-preset", "p5", "-cq", str(tcfg.crf), "-pix_fmt", "yuv420p"]
         elif hw == "qsv":

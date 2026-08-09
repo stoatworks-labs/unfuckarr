@@ -209,8 +209,19 @@ Pass `/dev/dri` into the container and set the accelerator in Settings → Trans
 The amd64 image ships the Intel and Mesa VAAPI drivers. **The arm64 image ships neither** — there
 is no hardware transcoding on ARM.
 
-None of the four accelerator paths has been run on real hardware; they are command-line
-construction only. `none` (libx264) is the tested default.
+**`vaapi` is tested on real hardware** — an AMD Radeon 880M (gfx1150), where a 1080p MPEG-2
+source re-encodes to HEVC at about 12× realtime through unfuckarr's own transcode path. Mesa
+comes from bookworm-backports precisely for this: Debian's stable Mesa knows no AMD GPU newer
+than RDNA2 and fails with `amdgpu: unknown (family_id, chip_external_rev)` on anything newer,
+with the card sitting right there in `/dev/dri`.
+
+`qsv`, `nvenc` and `videotoolbox` are still command-line construction only — no Intel, NVIDIA or
+macOS hardware has run them. `none` (libx264) remains the default.
+
+Note that hardware *decode* is not required and not requested: the file is decoded in software
+and uploaded to the GPU for encoding. The sources this tool exists to fix are often ones modern
+GPUs no longer decode at all — no recent AMD part has an MPEG-2 decoder — and asking the GPU to
+filter frames it never decoded fails partway through the file rather than at startup.
 
 ## Development
 

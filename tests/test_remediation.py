@@ -97,6 +97,33 @@ def test_build_command_is_well_formed(video_factory, settings):
     assert "-c:v" in cmd
 
 
+@needs_ffmpeg
+def test_vaapi_uploads_rather_than_assuming_a_hardware_decode(video_factory,
+                                                              settings):
+    """The GPU must not be asked to filter frames it never decoded.
+
+    Verified against a real Radeon 880M: with -hwaccel_output_format vaapi, an
+    MPEG-2 source (no recent AMD part decodes MPEG-2) falls back to a software
+    decode and scale_vaapi then dies mid-stream with "Failed to inject frame
+    into filter network". Uploading explicitly works whatever the decoder did.
+    """
+    path = video_factory("va.mkv", seconds=4)
+    info = probe(str(path), settings.ffprobe_path)
+    settings.transcode.hwaccel = "vaapi"
+    settings.transcode.video_codec = "hevc"
+    result = CheckResult(path=str(path))
+    result.add(Finding("compat", "bad_video_codec", "error", "needs encoding"))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    assert p.video_action == "encode"
+    cmd = transcode.build_command(str(path), "/tmp/out.mkv", info, p,
+                                  settings.transcode, ffmpeg="ffmpeg")
+    joined = " ".join(cmd)
+    assert "-c:v hevc_vaapi" in joined
+    assert "hwupload" in joined
+    assert "-hwaccel_output_format" not in joined
+    assert "scale_vaapi" not in joined
+
+
 # -- end to end -----------------------------------------------------------
 
 @needs_ffmpeg
