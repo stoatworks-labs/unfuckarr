@@ -32,6 +32,13 @@
     window, so an automatic decision can be undone.
 
     Web UI shows library status, what it is doing right now, and every setting.
+
+    SECURITY: intended to run purely inside a private network or Tailscale
+    tailnet. It deletes and rewrites media unattended, has no auth until an
+    API key is set, and its security has not been independently reviewed by
+    a human - never expose it to the public internet. To pin it to Tailscale,
+    enable this container's Tailscale toggle and set UNFUCKARR_BIND_INTERFACE
+    to tailscale0.
   </Overview>
   <Category>MediaApp:Video Tools:Utilities</Category>
   <WebUI>http://[IP]:[PORT:6969]/</WebUI>

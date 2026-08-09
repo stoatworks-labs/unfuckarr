@@ -55,6 +55,12 @@ Break any of these and the failure is quiet and expensive.
    (2) `_transcode` refuses. Without this, a transcode that does not clear the finding is redone
    on *every* scan, for ever, with nothing in the log saying why — an unattended service burning
    a CPU indefinitely on one file.
+10. **The tailnet-only stance is policy, not decoration.** The README warning (private
+    network/tailnet only, never the public internet, no independent human security review) stays,
+    because the service deletes media unattended and has no auth until a key is set. In the same
+    spirit, `__main__.resolve_host` **fails the start** when `UNFUCKARR_BIND_INTERFACE` names an
+    interface that never gets an address — falling back to `0.0.0.0` would silently expose the
+    service exactly when the VPN is down. Do not "fix" that into a fallback.
 
 ## Traps found the hard way
 
@@ -81,7 +87,13 @@ Break any of these and the failure is quiet and expensive.
 
 ## Verified vs assumed
 
-**Verified** — 78 tests, green, run against real ffmpeg output in CI:
+**Verified in live use (since 1.0.0):** a real Sonarr, Radarr and Emby setup has been connected
+and used against a ~17,000-file library. That covers the half that used to be assumed: real
+library enumeration, Emby's actual `PlaybackInfo`/`TranscodeReasons` responses, and real repairs
+— remuxes completed and verified, originals recycled, delete-and-re-search triggered — executed
+against a live library. Keep this paragraph honest if the claims below change.
+
+**Verified in CI** — the test suite, green, run against real ffmpeg output on every push:
 
 - The whole check engine against files ffmpeg actually renders: good, garbage, truncated,
   MPEG-2/AVI, HEVC, dual-audio, faststart vs not.
@@ -101,23 +113,20 @@ Break any of these and the failure is quiet and expensive.
   This is the only container proof available — there is no runtime on the dev machine.
 - That the scheduled-scan time survives a restart.
 
-**Assumed — no real hardware or service has ever been connected:**
+**Still assumed:**
 
-- **No Sonarr, Radarr or Emby server has been touched.** Every call is written to the documented
-  API and tested against `httpx.MockTransport`. Response shapes, especially Sonarr's
-  `history/failed` semantics and Emby's `PlaybackInfo` `TranscodeReasons`, are from documentation,
-  not observation.
-- **No Unraid server has installed the template.** It is written against the CA conventions used
-  elsewhere in this fleet (root `<Container version="2">`, no trailing colon on subcategory tokens,
-  per-image `<Registry>` URL) and `scripts/validate_template.py` checks those in CI, but "valid
-  XML" and "installs cleanly" are different claims.
-- **The image has only ever run on a CI runner**, as an empty install with no media mounted. No
-  volume permission problem, no real `/mnt/user` share and no `/dev/dri` passthrough has been
-  exercised.
+- **No Unraid server has installed the CA template.** It is written against the CA conventions
+  used elsewhere in this fleet (root `<Container version="2">`, no trailing colon on subcategory
+  tokens, per-image `<Registry>` URL) and `scripts/validate_template.py` checks those in CI, but
+  "valid XML" and "installs cleanly" are different claims.
 - **Hardware transcoding is untested.** All four accelerator paths (qsv/nvenc/vaapi/videotoolbox)
-  are command-line construction only.
-- **No large library has been scanned.** Performance on 10,000 files is unknown; `sample` depth
-  should be a few seconds per file, but that is arithmetic, not measurement.
+  are command-line construction only. The live repairs observed so far are remuxes (stream copy —
+  no encoder involved) and delete-and-re-search; no hardware-accelerated *encode* has been
+  confirmed to complete.
+- **Performance on a very large library is unmeasured.** `sample` depth should be a few seconds
+  per file, but 10,000-file behaviour is still arithmetic, not measurement.
+- **Interface binding (`UNFUCKARR_BIND_INTERFACE`) is tested against loopback**, on Linux and
+  macOS, plus the fail-closed path — not yet observed against a real `tailscale0`.
 
 ## Layout
 

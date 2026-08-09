@@ -1,12 +1,21 @@
 # unfuckarr
 
+> [!WARNING]
+> **unfuckarr is designed to run purely inside a [Tailscale](https://tailscale.com) tailnet (or
+> another private network you trust end to end). Do not expose it to the public internet.**
+> This is a service that deletes and rewrites media files unattended, its API has no
+> authentication until you set a key, and its security has **not** been independently reviewed
+> by a human. Bind it to your tailnet with `UNFUCKARR_BIND_INTERFACE=tailscale0` — see
+> [Binding to an interface](#binding-to-an-interface) — set an API key, and keep it off the
+> open internet. No reverse proxy, no port forward, no "it's fine, it has a password".
+
 > **AI-assisted project.** This codebase was created with [Claude Code](https://claude.com/claude-code).
 > The check engine, the transcode planner, the policy brakes and the recycle bin are covered by a
-> 78-test suite that runs against real files rendered by ffmpeg on every push. What has **not** been
-> exercised is the other half: no Sonarr, Radarr or Emby server has ever been connected to this code.
-> Every *arr and Emby call is written to the documented v3 / Emby API and tested against mocked HTTP,
-> which is not the same thing as working. Treat the first run against a real library as a trial —
-> start with the actions set to `flag`, look at what it found, and only then let it act.
+> test suite that runs against real files rendered by ffmpeg on every push — and since 1.0.0 it
+> has been used live: a real Sonarr, Radarr and Emby setup has been connected, and real repairs
+> (remuxes, recycling, delete-and-re-search) have run against a live 17,000-file library.
+> Hardware-accelerated encoding and the Unraid template install remain unexercised. On *your* library, still start
+> with the actions set to `flag`, look at what it found, and only then let it act.
 
 Scans a Sonarr/Radarr library, works out which video files are broken or which Emby cannot
 direct play, and fixes them — by transcoding, by remuxing, or by deleting the file and asking the
@@ -149,7 +158,32 @@ Needs `ffmpeg` and `ffprobe` on `PATH`.
 Everything is on the settings page and written to `/config/config.json`. Environment variables
 (`UNFUCKARR_SONARR_URL`, `UNFUCKARR_SONARR_API_KEY`, `UNFUCKARR_RADARR_*`, `UNFUCKARR_EMBY_*`,
 `UNFUCKARR_WATCH_FOLDERS`, `UNFUCKARR_API_KEY`, `UNFUCKARR_PORT`) seed it and **override the saved
-file on every start** — set them once to bootstrap, then remove them.
+file on every start** — set them once to bootstrap, then remove them. `UNFUCKARR_HOST` and
+`UNFUCKARR_BIND_INTERFACE` (below) control the bind address and are env-only.
+
+### Binding to an interface
+
+By default the server binds `0.0.0.0` — every interface it can see. Two variables narrow that:
+
+- `UNFUCKARR_HOST` — a literal address to bind, e.g. `100.64.0.5`.
+- `UNFUCKARR_BIND_INTERFACE` — an interface *name*, e.g. `tailscale0`. Its IPv4 address is
+  looked up at start, so the binding survives the address changing. Startup **waits** for the
+  interface to appear (60 s, tune with `UNFUCKARR_BIND_WAIT`) and then fails rather than
+  falling back to `0.0.0.0` — a VPN that comes up a few seconds late must not mean a service
+  that is briefly listening everywhere. Takes precedence over `UNFUCKARR_HOST`.
+
+This is how you pin unfuckarr to a [Tailscale](https://tailscale.com) tailnet permanently:
+`UNFUCKARR_BIND_INTERFACE=tailscale0` and it is unreachable except through Tailscale, even from
+the LAN.
+
+The Docker catch: a process can only bind an interface that exists inside its own network
+namespace. In the default bridge network the container cannot see the host's `tailscale0` —
+there, control exposure from the host side instead, by publishing the port on the tailscale
+address (`"100.64.0.5:6969:6969"` in `docker-compose.yml`'s `ports`). `UNFUCKARR_BIND_INTERFACE`
+is for the setups where the interface genuinely is in the container: `network_mode: host`, a
+Tailscale sidecar container sharing the network namespace, Unraid's per-container Tailscale
+toggle (Edit container → enable Tailscale — which runs `tailscaled` inside the container, so
+`tailscale0` is there to bind), or a source install.
 
 **Path mappings are the thing that goes wrong.** Sonarr reports `/tv/Show/S01E01.mkv`; if this
 container mounts the same file at `/media/tv/...`, every lookup misses and the whole library reads
@@ -183,8 +217,9 @@ The suite renders real clips with ffmpeg rather than mocking the probe, because 
 bugs are in what ffmpeg actually says about a file. Tests that need ffmpeg skip cleanly without it.
 The *arr and Emby clients are tested against `httpx.MockTransport`.
 
-To work on the UI without three real servers — this is also how the screenshots above are
-regenerated:
+The screenshots above are captured from a live instance mid-scan of a real library, with
+anything naming real media blurred at capture time. To work on the UI without three real
+servers, there is a demo pipeline — `demo_services.py` stands in for Sonarr, Radarr and Emby:
 
 ```bash
 python scripts/demo_services.py &
@@ -198,8 +233,9 @@ going green means the client code genuinely worked rather than a flag being set.
 ## API
 
 The whole UI runs on the JSON API at `/api`, documented at `/api/docs`. Set an API key in Settings
-to require `X-API-Key` (or `?apikey=`) on every call; unset means no auth, which is the sensible
-default on a LAN.
+to require `X-API-Key` (or `?apikey=`) on every call; unset means no auth, which is only tolerable
+because the service is assumed to be reachable from inside your tailnet and nowhere else. It is a
+brake against accidents, not a security boundary — see the warning at the top.
 
 ## Licence
 

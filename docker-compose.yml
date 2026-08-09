@@ -19,6 +19,14 @@ services:
       # UNFUCKARR_EMBY_URL: "http://emby:8096"
       # UNFUCKARR_EMBY_API_KEY: ""
       # UNFUCKARR_WATCH_FOLDERS: "/media/downloads/complete"
+      #
+      # Bind to one interface — e.g. keep the service tailnet-only. Only
+      # works when the interface exists INSIDE the container's network
+      # namespace (network_mode: host, a tailscale sidecar, or Unraid's
+      # per-container Tailscale). On the default bridge network, restrict
+      # from the host side instead: publish on the tailscale address, e.g.
+      # ports: ["100.64.0.5:6969:6969"].
+      # UNFUCKARR_BIND_INTERFACE: "tailscale0"
     volumes:
       - ./config:/config
       # Mount media at the SAME path the *arrs use, or set path mappings in
