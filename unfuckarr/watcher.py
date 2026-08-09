@@ -24,6 +24,7 @@ from watchdog.observers.polling import PollingObserver
 from . import db
 from .config import VIDEO_EXTENSIONS, Settings, WatchFolder
 from .state import bus, state
+from .transcode import is_temp_output
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,10 @@ class _Handler(FileSystemEventHandler):
         if p.suffix.lower() not in VIDEO_EXTENSIONS:
             return
         if p.name.startswith("."):
+            return
+        # A watch folder over the library sees our own transcode output being
+        # written; settling on it would start a second job racing the first.
+        if is_temp_output(p.name):
             return
         self.touch(str(p))
 

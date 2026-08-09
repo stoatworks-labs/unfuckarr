@@ -42,6 +42,16 @@ ENCODERS = {
     ("hevc", "videotoolbox"): "hevc_videotoolbox",
 }
 
+# Names an in-flight output. Everything that enumerates media must skip these:
+# a half-written output looks like a media file, carries the same findings as
+# its source, and checking or transcoding it races the job that owns it.
+TEMP_MARKER = ".unfuckarr."
+
+
+def is_temp_output(path: str) -> bool:
+    return TEMP_MARKER in Path(path).name
+
+
 # Subtitle codecs each container will accept. Copying a PGS track into MP4
 # fails the whole job, so those get dropped instead.
 CONTAINER_SUBTITLES = {
@@ -337,8 +347,8 @@ def output_path(src: str, container: str, work_dir: str | None = None) -> str:
     if work_dir:
         d = Path(work_dir)
         d.mkdir(parents=True, exist_ok=True)
-        return str(d / f"{p.stem}.unfuckarr.{container}")
-    return str(p.with_name(f"{p.stem}.unfuckarr.{container}"))
+        return str(d / f"{p.stem}{TEMP_MARKER}{container}")
+    return str(p.with_name(f"{p.stem}{TEMP_MARKER}{container}"))
 
 
 def replace(src: str, new: str) -> str:

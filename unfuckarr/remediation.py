@@ -115,6 +115,13 @@ class Remediator:
     def apply(self, file_row: dict[str, Any], result: CheckResult,
               info: MediaInfo | None, decision: Decision) -> dict[str, Any]:
         path = file_row["path"]
+        if transcode.is_temp_output(path):
+            # Our own in-flight output, reached through a watch event, a scan,
+            # or the UI before the owning job renamed it into place. Acting on
+            # it means racing that job for the file.
+            db.log("own_temp_skipped", "info", path, decision.reason)
+            return {"action": "none", "ok": True,
+                    "message": "unfuckarr's own temporary output — not touched"}
         job_id = db.ex(
             "INSERT INTO jobs (kind, path, state, message, created) VALUES (?,?,?,?,?)",
             (decision.action, path, "queued", decision.reason, time.time()),
@@ -219,7 +226,13 @@ class Remediator:
         if not ok:
             Path(dst).unlink(missing_ok=True)
             self._set_job(job_id, "failed", 0, message, error=message)
-            db.log("transcode_failed", "error", path, message)
+            detail: dict[str, Any] = {"message": message}
+            if not cancel.is_set():
+                # A cancel says nothing about the file. Anything else counts
+                # against the cap — a failure that repeats deterministically
+                # would otherwise be retried on every scan, for ever.
+                detail["attempts"] = self._count_attempt(path, file_row)
+            db.log("transcode_failed", "error", path, detail)
             # A repair that failed means the damage is real. Fall through to a
             # redownload rather than leaving a broken file flagged as "tried".
             if repair and s.policy.corrupt_action == "redownload":
@@ -232,7 +245,9 @@ class Remediator:
         if verify is not None:
             Path(dst).unlink(missing_ok=True)
             self._set_job(job_id, "failed", 0, f"output failed verification: {verify}")
-            db.log("transcode_output_bad", "error", path, verify)
+            db.log("transcode_output_bad", "error", path,
+                   {"message": verify,
+                    "attempts": self._count_attempt(path, file_row)})
             if repair and s.policy.corrupt_action == "redownload":
                 return self._redownload_row(file_row, f"remux produced a bad file: {verify}")
             return {"action": "flag", "ok": False, "message": verify}
@@ -240,17 +255,29 @@ class Remediator:
         final = dst
         if s.transcode.replace_original:
             try:
-                recycle.store(path, f"replaced by transcode ({plan.describe})",
-                              s.policy.recycle_bin_path, s.policy.recycle_bin_days)
+                recycled = recycle.store(
+                    path, f"replaced by transcode ({plan.describe})",
+                    s.policy.recycle_bin_path, s.policy.recycle_bin_days)
             except OSError as exc:
                 Path(dst).unlink(missing_ok=True)
                 msg = f"could not recycle the original: {exc}"
                 self._set_job(job_id, "failed", 0, msg, error=msg)
                 return {"action": "flag", "ok": False, "message": msg}
-            final = transcode.replace(path, dst)
+            try:
+                final = transcode.replace(path, dst)
+            except OSError as exc:
+                # The verified output vanished before the swap — something
+                # else (an *arr import, another process) took it.
+                self._restore_original(path, recycled)
+                msg = f"output disappeared before it could replace the original: {exc}"
+                self._set_job(job_id, "failed", 0, msg, error=msg)
+                db.log("transcode_output_bad", "error", path,
+                       {"message": msg,
+                        "attempts": self._count_attempt(path, file_row)})
+                return {"action": "flag", "ok": False, "message": msg}
             self._move_db_row(path, final)
             self._notify_arr_rescan(file_row)
-            self._confirm_fixed(path, final, file_row)
+            self._confirm_fixed(path, final, file_row, decision)
 
         self._set_job(job_id, "done", 1.0, f"{plan.describe} → {Path(final).name}")
         db.log("transcode_done", "info", final,
@@ -282,8 +309,21 @@ class Remediator:
             return f"output is only {out.size} bytes"
         return None
 
-    def _confirm_fixed(self, old: str, final: str,
-                       file_row: dict[str, Any]) -> None:
+    def _count_attempt(self, path: str, file_row: dict[str, Any]) -> int:
+        """One more transcode that did not leave a verified fix behind.
+
+        The counter is the brake: at MAX_FIX_ATTEMPTS `_transcode` refuses to
+        run again. Every path that ends a transcode without a confirmed fix
+        must come through here — an attempt that is never counted is retried
+        on every scan, for ever.
+        """
+        attempts = (file_row.get("fix_attempts") or 0) + 1
+        file_row["fix_attempts"] = attempts
+        db.ex("UPDATE files SET fix_attempts=? WHERE path=?", (attempts, path))
+        return attempts
+
+    def _confirm_fixed(self, old: str, final: str, file_row: dict[str, Any],
+                       decision: Decision) -> None:
         """Re-check the replacement and record the result.
 
         Two reasons this is not optional. The UI would otherwise show a file
@@ -307,21 +347,36 @@ class Remediator:
             log.warning("post-transcode check failed for %s: %s", final, exc)
             return
 
-        if result.status in ("ok", "hygiene"):
+        # "hygiene" is only success when hygiene was not what we were fixing.
+        # A hygiene-triggered remux whose warnings survive has fixed nothing,
+        # and calling it fixed is exactly the infinite loop this method exists
+        # to prevent.
+        still_open = set(decision.findings) & {f.code for f in result.findings}
+        if result.status in ("ok", "hygiene") and not still_open:
             return
 
-        # Carry the attempt count across the rename and increment it. Once it
-        # hits MAX_FIX_ATTEMPTS, `_transcode` refuses to try again.
-        attempts = (file_row.get("fix_attempts") or 0) + 1
-        db.ex("UPDATE files SET fix_attempts=? WHERE path=?", (attempts, final))
+        attempts = self._count_attempt(final, file_row)
         db.log("transcode_did_not_fix", "warn", final, {
             "was": old,
             "status": result.status,
-            "findings": [f.code for f in result.errors],
+            "findings": sorted({f.code for f in result.errors} | still_open),
             "attempts": attempts,
             "note": ("giving up on transcoding this file" if attempts >= MAX_FIX_ATTEMPTS
                      else "will be retried on the next scan"),
         })
+
+    def _restore_original(self, path: str, recycled: str | None) -> None:
+        """Undo the recycle when the swap could not go through."""
+        if not recycled or os.path.exists(path):
+            return
+        row = db.q1("SELECT id FROM recycle WHERE stored=? ORDER BY id DESC LIMIT 1",
+                    (recycled,))
+        if row is None:
+            return
+        try:
+            recycle.restore(row["id"])
+        except (OSError, FileNotFoundError) as exc:
+            log.error("could not put %s back after a failed swap: %s", path, exc)
 
     def _move_db_row(self, old: str, new: str) -> None:
         if old == new:
@@ -422,8 +477,10 @@ class Remediator:
                     db.log("arr_search_failed", "error", path, str(exc))
                     steps.append(f"search failed: {exc}")
 
-        db.ex("UPDATE files SET status='missing', last_checked=? WHERE path=?",
-              (time.time(), path))
+        # The replacement the *arr fetches is a different file; it deserves a
+        # fresh set of fix attempts.
+        db.ex("UPDATE files SET status='missing', last_checked=?, fix_attempts=0 "
+              "WHERE path=?", (time.time(), path))
         message = "; ".join(steps) or "nothing to do"
         db.log("redownload", "warn", path, {"reason": reason, "steps": steps})
         return {"action": "redownload", "ok": True, "message": message,

@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import db, recycle
+from . import db, recycle, transcode
 from .checks import CheckResult, Finding
 from .checks import compat as compat_checks
 from .checks import hygiene as hygiene_checks
@@ -39,8 +39,9 @@ log = logging.getLogger(__name__)
 def walk_video_files(root: str) -> Iterable[str]:
     """Every video file under ``root``, skipping the noise.
 
-    ``.grab``/``incomplete`` hold partial downloads, and Emby/Plex metadata
-    directories hold trailers and theme videos that are not library items.
+    ``.grab``/``incomplete`` hold partial downloads, Emby/Plex metadata
+    directories hold trailers and theme videos that are not library items, and
+    ``*.unfuckarr.*`` is our own in-flight transcode output.
     """
     skip_dirs = {"@eaDir", ".grab", "incomplete", "extrafanart", "extrathumbs",
                  ".unfuckarr", "lost+found", ".Trash", ".recycle", "recycle"}
@@ -48,7 +49,7 @@ def walk_video_files(root: str) -> Iterable[str]:
         dirnames[:] = [d for d in dirnames
                        if d not in skip_dirs and not d.startswith(".")]
         for name in filenames:
-            if name.startswith("."):
+            if name.startswith(".") or transcode.is_temp_output(name):
                 continue
             if Path(name).suffix.lower() in VIDEO_EXTENSIONS:
                 yield os.path.join(dirpath, name)
