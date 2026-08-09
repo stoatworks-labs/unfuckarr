@@ -65,8 +65,7 @@ VOLUME ["/config"]
 EXPOSE 6969
 
 HEALTHCHECK --interval=60s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request,os,sys; \
-sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"UNFUCKARR_PORT\",\"6969\")}/health', timeout=4).status==200 else 1)"
+    CMD python -m unfuckarr.healthcheck
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
 CMD ["python", "-m", "unfuckarr"]

@@ -34,3 +34,15 @@ def test_missing_interface_fails_rather_than_binding_everywhere(monkeypatch):
     monkeypatch.setenv("UNFUCKARR_BIND_WAIT", "0")
     with pytest.raises(SystemExit, match="no-such-if0"):
         resolve_host()
+
+
+def test_healthcheck_probes_the_bound_address(monkeypatch):
+    from unfuckarr.healthcheck import target_url
+
+    monkeypatch.delenv("UNFUCKARR_BIND_INTERFACE", raising=False)
+    monkeypatch.delenv("UNFUCKARR_HOST", raising=False)
+    monkeypatch.setenv("UNFUCKARR_PORT", "7171")
+    assert target_url() == "http://127.0.0.1:7171/health"
+
+    monkeypatch.setenv("UNFUCKARR_BIND_INTERFACE", LOOPBACK)
+    assert target_url() == "http://127.0.0.1:7171/health"

@@ -125,8 +125,11 @@ against a live library. Keep this paragraph honest if the claims below change.
   confirmed to complete.
 - **Performance on a very large library is unmeasured.** `sample` depth should be a few seconds
   per file, but 10,000-file behaviour is still arithmetic, not measurement.
-- **Interface binding (`UNFUCKARR_BIND_INTERFACE`) is tested against loopback**, on Linux and
-  macOS, plus the fail-closed path — not yet observed against a real `tailscale0`.
+- ~~Interface binding not yet observed against a real `tailscale0`~~ — it now is: the live
+  container runs `UNFUCKARR_BIND_INTERFACE=tailscale0` under Unraid's per-container Tailscale,
+  bound to the tailnet address with the LAN refusing connections. That first live run also found
+  the healthcheck bug (a hard-coded 127.0.0.1 probe reports a healthy tailnet-bound server as
+  dead) — hence `unfuckarr/healthcheck.py` probes the address `resolve_host` returns.
 
 ## Layout
 
