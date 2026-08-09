@@ -51,10 +51,15 @@ Break any of these and the failure is quiet and expensive.
 8. **Only `/config` is chowned at start.** Recursively chowning a 40 TB media mount on every
    container start is how someone loses an evening.
 9. **A transcode must be confirmed to have fixed the finding.** `_confirm_fixed` re-checks the
-   replacement, and increments `files.fix_attempts` when it still fails. At `MAX_FIX_ATTEMPTS`
-   (2) `_transcode` refuses. Without this, a transcode that does not clear the finding is redone
-   on *every* scan, for ever, with nothing in the log saying why — an unattended service burning
-   a CPU indefinitely on one file.
+   replacement, and *every* outcome short of a verified fix goes through
+   `Remediator._count_attempt`: a run that fails, an output that fails verification or vanishes
+   before the swap, and a re-check that still shows the findings the transcode was meant to
+   clear — hygiene included, because a hygiene-triggered remux whose warnings survive has fixed
+   nothing. Only a user cancel does not count, and a redownload resets the counter (the
+   replacement is a different file). At `MAX_FIX_ATTEMPTS` (2) `_transcode` refuses. Without
+   this, a transcode that does not clear the finding is redone on *every* scan, for ever, with
+   nothing in the log saying why — live proof: 86 identical remuxes of one film (2026-08),
+   because the hygiene path and the failure paths never counted.
 10. **The tailnet-only stance is policy, not decoration.** The README warning (private
     network/tailnet only, never the public internet, no independent human security review) stays,
     because the service deletes media unattended and has no auth until a key is set. In the same
@@ -83,6 +88,13 @@ Break any of these and the failure is quiet and expensive.
   the expensive half, and it works whatever the decoder did.
 - **`-ss` before `-i`** so ffmpeg seeks rather than decoding up to the point. Sampling the middle
   of a 40 GB file takes seconds this way and minutes the other way.
+- **unfuckarr's own `*.unfuckarr.*` temp outputs look exactly like media files.** A watch folder
+  covering the library, or a scan running during a long remux, would pick up the half-written
+  output, check it (it carries the same findings as its source — it is a copy of the streams),
+  and start a second job that loses the race with the first one's rename into place. Live, that
+  paired every remux with a spurious `transcode_failed: No such file or directory` on the temp
+  path. `transcode.is_temp_output` is the single test; the walker, the watcher and
+  `Remediator.apply` all use it.
 - **Unraid user shares are SMB/NFS and produce no inotify events.** `WatchManager._needs_polling`
   reads `/proc/mounts` and falls back to `PollingObserver`. When it cannot tell, it polls, because
   a missed event is silent and polling only costs a stat.
@@ -115,7 +127,10 @@ against a live library. Keep this paragraph honest if the claims below change.
 - The transcode planner's copy-vs-encode decisions, and one full end-to-end run
   (MPEG-2 AVI → detected → H.264/MKV → output verified → original recycled → re-check passes).
 - Both safety brakes, the action cap, that flag-only findings do not consume it, and that a
-  transcode which fails to fix the file is not repeated for ever.
+  transcode which fails to fix the file is not repeated for ever — including a run whose output
+  is missing at verify, and a hygiene-triggered remux that leaves its warnings in place.
+- That `*.unfuckarr.*` temp outputs are invisible to the walker and the watcher, and that the
+  remediator refuses to act on one.
 - The `fix_attempts` schema migration against a database created in the 1.0.0 shape.
 - Recycle store/restore/sweep, including two files with the same basename.
 - Path mapping, including that `/tv` does not rewrite `/tvshows`.

@@ -185,6 +185,9 @@ def test_a_failed_repair_falls_through_to_redownload(video_factory, settings,
     assert out["action"] == "redownload"
     assert not path.exists()
     assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 1
+    # The replacement is a different file: attempts start over.
+    assert db.q1("SELECT fix_attempts FROM files WHERE path=?",
+                 (str(path),))["fix_attempts"] == 0
 
 
 @needs_ffmpeg
@@ -226,6 +229,119 @@ def test_a_transcode_that_does_not_fix_it_is_not_repeated_for_ever(
     out = rem.apply(row, result, info, Decision("transcode", "incompatible"))
     assert out["action"] == "flag"
     assert "not trying again" in out["message"]
+
+
+@needs_ffmpeg
+def test_output_missing_at_verify_counts_attempts_and_stops(
+        video_factory, settings, monkeypatch):
+    """The live loop of 2026-08: the remux 'completes', the temp output is
+    gone by verify time, and nothing counted the attempt — so the cycle
+    re-ran on every scan, for ever."""
+    from unfuckarr.remediation import MAX_FIX_ATTEMPTS
+
+    path = video_factory("gone.mkv", seconds=6)
+    db.ex("INSERT INTO files (path, title) VALUES (?,?)", (str(path), "Gone"))
+
+    # ffmpeg reports success but the output is not there any more — what a
+    # race with another job, or an *arr moving files, looks like.
+    monkeypatch.setattr(transcode, "run", lambda *a, **k: (True, "completed in 1s"))
+
+    rem = Remediator(lambda: settings)
+    result, info = check_file(str(path), settings)
+    result.add(Finding("compat", "bad_container", "error", ""))
+
+    def row():
+        return {"path": str(path), "source": "folder", "title": "Gone",
+                "arr_id": None, "arr_parent_id": None,
+                "fix_attempts": db.q1("SELECT fix_attempts FROM files WHERE path=?",
+                                      (str(path),))["fix_attempts"]}
+
+    for expected in range(1, MAX_FIX_ATTEMPTS + 1):
+        out = rem.apply(row(), result, info, Decision("transcode", "incompatible"))
+        assert not out["ok"]
+        assert path.exists(), "the source must be untouched"
+        assert row()["fix_attempts"] == expected
+
+    # The cap is reached, so the next attempt refuses rather than running.
+    out = rem.apply(row(), result, info, Decision("transcode", "incompatible"))
+    assert out["action"] == "flag"
+    assert "not trying again" in out["message"]
+
+
+@needs_ffmpeg
+def test_hygiene_remux_that_leaves_its_warning_counts_attempts(
+        video_factory, settings, monkeypatch):
+    """hygiene_action=transcode plus a warning a remux cannot clear (image-only
+    subtitles, an odd frame rate). The re-check coming back 'hygiene' is not
+    success when hygiene was the reason for the transcode — treating it as
+    success is the other half of the 2026-08 loop."""
+    from unfuckarr.remediation import MAX_FIX_ATTEMPTS
+
+    from unfuckarr import scanner as scanner_mod
+    real_check = scanner_mod.check_file
+
+    def still_grubby(p, s, **kw):
+        result, info = real_check(p, s, **kw)
+        result.add(Finding("hygiene", "image_subtitles_only", "warning", ""))
+        return result, info
+    monkeypatch.setattr(scanner_mod, "check_file", still_grubby)
+
+    path = video_factory("tidy.mkv", seconds=6)
+    db.ex("INSERT INTO files (path, title) VALUES (?,?)", (str(path), "Tidy"))
+    rem = Remediator(lambda: settings)
+
+    result, info = check_file(str(path), settings)
+    result.add(Finding("hygiene", "image_subtitles_only", "warning", ""))
+    decision = Decision("transcode", "stream metadata needs tidying",
+                        ["image_subtitles_only"])
+
+    current = str(path)
+    for expected in range(1, MAX_FIX_ATTEMPTS + 1):
+        row = {"path": current, "source": "folder", "title": "Tidy",
+               "arr_id": None, "arr_parent_id": None,
+               "fix_attempts": db.q1("SELECT fix_attempts FROM files WHERE path=?",
+                                     (current,))["fix_attempts"]}
+        out = rem.apply(row, result, info, decision)
+        assert out["ok"], out
+        current = out["path"]
+        assert db.q1("SELECT fix_attempts FROM files WHERE path=?",
+                     (current,))["fix_attempts"] == expected
+
+    row = {"path": current, "source": "folder", "title": "Tidy",
+           "arr_id": None, "arr_parent_id": None,
+           "fix_attempts": MAX_FIX_ATTEMPTS}
+    out = rem.apply(row, result, info, decision)
+    assert out["action"] == "flag"
+    assert "not trying again" in out["message"]
+
+
+def test_own_temp_outputs_are_not_library_files(tmp_path):
+    """A scan or a watch event during a long remux sees the half-written
+    *.unfuckarr.mkv next to its source. Treating it as media spawns a second
+    job that races the first for the same file."""
+    from unfuckarr.config import WatchFolder
+    from unfuckarr.scanner import walk_video_files
+    from unfuckarr.watcher import _Handler
+
+    (tmp_path / "m").mkdir()
+    (tmp_path / "m" / "film.mkv").write_bytes(b"x")
+    (tmp_path / "m" / "film.unfuckarr.mkv").write_bytes(b"x")
+
+    assert [Path(p).name for p in walk_video_files(str(tmp_path))] == ["film.mkv"]
+
+    touched: list[str] = []
+    handler = _Handler(WatchFolder(path=str(tmp_path)), touched.append)
+    handler._consider(str(tmp_path / "m" / "film.unfuckarr.mkv"))
+    handler._consider(str(tmp_path / "m" / "film.mkv"))
+    assert [Path(p).name for p in touched] == ["film.mkv"]
+
+
+def test_remediator_refuses_to_act_on_its_own_temp_output(settings):
+    out = Remediator(lambda: settings).apply(
+        {"path": "/media/film.unfuckarr.mkv"}, CheckResult(path="x"), None,
+        Decision("transcode", "stream metadata needs tidying"))
+    assert out["action"] == "none"
+    assert db.q1("SELECT COUNT(*) n FROM jobs")["n"] == 0
 
 
 def test_fix_attempts_column_is_added_to_an_existing_database(tmp_path):
