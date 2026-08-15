@@ -69,9 +69,14 @@ class IntegrityConfig(BaseModel):
     # "full"    – decode every frame. Correct, and very slow.
     depth: Literal["quick", "sample", "full"] = "sample"
     sample_seconds: int = 20
-    # A file whose ffprobe duration disagrees with the *arr's expected runtime
-    # by more than this is treated as truncated.
+    # The *arr's runtime is nominal, not measured — for TV it is the broadcast
+    # slot from TVDB, which includes the ad breaks the file does not have. So
+    # two thresholds: past `duration_tolerance_pct` short the gap is worth
+    # showing, but only past `duration_truncated_pct` is it worth acting on.
+    # A 22 min sitcom in a 25 min slot and a 44 min drama in a 60 min one are
+    # both healthy; a file short of *half* its runtime is not.
     duration_tolerance_pct: float = 10.0
+    duration_truncated_pct: float = 50.0
     min_duration_seconds: int = 30
     # Decode errors below this count are noise (a few damaged macroblocks in an
     # otherwise fine file); at or above it the file is called broken.
