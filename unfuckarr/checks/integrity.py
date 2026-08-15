@@ -76,16 +76,28 @@ def check(
             "integrity", "too_short", "error",
             f"only {info.duration:.0f}s long", {"duration": info.duration},
         ))
-    elif expected_runtime and expected_runtime > 0:
-        # The *arr knows how long this should be. A file well short of that is
-        # truncated even though every byte present decodes fine.
-        drift = abs(info.duration - expected_runtime) / expected_runtime * 100
-        if drift > cfg.duration_tolerance_pct and info.duration < expected_runtime:
+    elif expected_runtime and expected_runtime > 0 and info.duration < expected_runtime:
+        # The *arr's runtime is nominal, not measured: for TV it is the
+        # broadcast slot, which counts the ad breaks the file does not have.
+        # A 22 min sitcom against a 25 min slot, or a 44 min drama against a
+        # 60 min one, is a perfectly healthy file — calling either truncated
+        # sends a pristine remux to be deleted and re-searched. Only a file
+        # short of half its runtime is unambiguously cut off; between the two
+        # thresholds the gap is worth showing and not worth acting on.
+        short = (expected_runtime - info.duration) / expected_runtime * 100
+        detail = (f"{info.duration / 60:.0f} min on disk vs "
+                  f"{expected_runtime / 60:.0f} min expected ({short:.0f}% short)")
+        data = {"duration": info.duration, "expected": expected_runtime,
+                "short_pct": short}
+        if short >= cfg.duration_truncated_pct:
             result.add(Finding(
-                "integrity", "duration_mismatch", "error",
-                f"{info.duration / 60:.0f} min on disk vs "
-                f"{expected_runtime / 60:.0f} min expected ({drift:.0f}% short)",
-                {"duration": info.duration, "expected": expected_runtime},
+                "integrity", "duration_mismatch", "error", detail, data))
+        elif short > cfg.duration_tolerance_pct:
+            result.add(Finding(
+                "integrity", "duration_below_expected", "info",
+                f"{detail} — the expected runtime is nominal, so this is "
+                "usually ad breaks rather than a truncated file",
+                data,
             ))
 
     # Already failing on structure — a decode pass adds cost, not information.

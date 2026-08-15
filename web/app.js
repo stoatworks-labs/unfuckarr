@@ -702,7 +702,8 @@ async function viewRecycle() {
 
 const FIELD_HELP = {
   'integrity.depth': 'quick = ffprobe only (seconds per file). sample = decode the start, middle and end. full = decode every frame; correct but very slow.',
-  'integrity.duration_tolerance_pct': 'A file more than this much shorter than the runtime Sonarr/Radarr expects is treated as truncated.',
+  'integrity.duration_tolerance_pct': 'A file more than this much shorter than the runtime Sonarr/Radarr expects is reported — but only reported. That runtime is nominal (for TV it is the broadcast slot, ad breaks included), so a normal episode sits well under it.',
+  'integrity.duration_truncated_pct': 'A file this much shorter than its expected runtime is treated as truncated, and the corrupt action applies. Keep it high: a 44 min drama in a 60 min slot is 27% short and perfectly healthy.',
   'emby_compat.target_profile': 'modern = a current Emby app (HEVC, 10-bit). conservative = Chromecast-class hardware (H.264 8-bit only). permissive = only reject what nothing plays.',
   'policy.corrupt_action': 'What to do with a file that is genuinely broken.',
   'policy.incompatible_action': 'What to do with an intact file Emby would have to transcode.',
@@ -807,6 +808,7 @@ async function viewSettings() {
       settingField('integrity.depth', s.integrity.depth, { options: ['quick', 'sample', 'full'] }),
       settingField('integrity.sample_seconds', s.integrity.sample_seconds),
       settingField('integrity.duration_tolerance_pct', s.integrity.duration_tolerance_pct),
+      settingField('integrity.duration_truncated_pct', s.integrity.duration_truncated_pct),
       settingField('integrity.min_duration_seconds', s.integrity.min_duration_seconds),
       settingField('integrity.max_decode_errors', s.integrity.max_decode_errors)),
     settingField('integrity.fail_on_missing_audio', s.integrity.fail_on_missing_audio)));

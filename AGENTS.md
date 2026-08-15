@@ -40,6 +40,13 @@ Break any of these and the failure is quiet and expensive.
 4. **The two brakes in `Scanner._remediate` are the point of the whole design.** An unmounted
    array makes every file fail every check. `abort_if_failure_ratio_over` catches that;
    `max_actions_per_scan` caps the damage if it does not. Do not "optimise" them away.
+   **The abort ratio is measured against the library, not the worklist** — `_remediate` takes a
+   `population` (every file the pass knows the state of), because `needs_check` deliberately
+   re-queues known-bad files. Divide by the re-probed count and the brake becomes self-locking:
+   the pass after a scan that found real problems consists of almost nothing *but* known-bad
+   files, so the ratio reads 100% and every scan aborts for ever. That is not theoretical —
+   live it ran 8 scans and took **zero** actions, escalating 62% → 100% as the worklist shrank
+   to exactly the files it had already flagged.
 5. **Hygiene findings can never delete.** `Policy.hygiene_action` is typed `none|flag|transcode`
    — the literal type is the enforcement, and `test_hygiene_never_deletes` asserts it.
 6. **`CheckResult.status` priority is deliberate**: corrupt > incompatible > hygiene. A file that
@@ -74,6 +81,14 @@ Break any of these and the failure is quiet and expensive.
 - **A size floor cannot detect a "sample instead of the movie".** `TINY_FILE_BYTES` is 128 KB and
   only catches stubs; the real detection is `duration_mismatch` against the *arr's runtime, and
   `too_short`. A floor high enough to catch a 20 MB fake would condemn every legitimate short extra.
+- **The *arr's expected runtime is nominal, not measured.** For TV it is the broadcast slot from
+  TVDB, ad breaks included, so a healthy 22 min sitcom reads 12% short of its 25 min slot and a
+  healthy 44 min US drama reads 27% short of its 60 min one. Treating that gap as truncation
+  flagged **2,924 of 3,153** TV files on the live library as corrupt — Blu-ray remuxes queued for
+  delete-and-re-search. Hence two thresholds: `duration_tolerance_pct` only produces an *info*
+  `duration_below_expected`, and `duration_truncated_pct` (50%) is what raises the *error*
+  `duration_mismatch`. Do not lower the second one to catch "more" — below half its runtime is the
+  only shortfall a nominal runtime cannot explain.
 - **`ffprobe` reports format *families*.** `format_name` is `"matroska,webm"`, not `"mkv"`.
   `_container_from` reconciles that against the extension.
 - **PGS subtitles cannot be copied into MP4** — it fails the whole job. `_subtitles_to_drop`
@@ -114,11 +129,26 @@ kind of thing only hardware finds: Debian stable's Mesa cannot initialise any AM
 RDNA2 (hence bookworm-backports in the Dockerfile), and the command asked the GPU to filter
 frames it had never decoded (see the trap below).
 
-**Verified in live use (since 1.0.0):** a real Sonarr, Radarr and Emby setup has been connected
-and used against a ~17,000-file library. That covers the half that used to be assumed: real
-library enumeration, Emby's actual `PlaybackInfo`/`TranscodeReasons` responses, and real repairs
-— remuxes completed and verified, originals recycled, delete-and-re-search triggered — executed
-against a live library. Keep this paragraph honest if the claims below change.
+**Verified in live use (since 1.0.0), and the limits of it:** a real Sonarr, Radarr and Emby
+setup has been connected and used against a ~17,000-file library. Genuinely exercised: library
+enumeration from both *arrs, the settle timer on real arrivals, and real repairs — remuxes
+completed and verified, originals recycled, delete-and-re-search triggered.
+
+What that does **not** cover, found by auditing the live instance on 2026-08-15 rather than by
+any test:
+
+- **No scan has ever applied an action.** Eight scans, `actions=0` on every one, all stopped by
+  the abort ratio (invariant 4). Every repair in the live activity log came from the watch
+  folder, and 415 of its 505 action rows were one film looping against its own temp output
+  (fixed in 5427095). The distinct-file count is 22.
+- **Emby's `PlaybackInfo` is barely exercised.** `emby/not_in_emby` covers 17,569 of 17,715
+  files — the path mapping does not resolve, so invariant 7 almost never fires and compat
+  decisions come from the local codec table. The *connection* works; the lookup does not.
+- Still untested: hardware *encode* against the live library (every observed repair was a
+  stream-copy remux), the CA template install path, and large-library scan performance.
+
+Keep this section honest. "It is running in production" is not the same claim as "the code path
+has run", and this project has now been wrong about that once.
 
 **Verified in CI** — the test suite, green, run against real ffmpeg output on every push:
 
@@ -126,7 +156,9 @@ against a live library. Keep this paragraph honest if the claims below change.
   MPEG-2/AVI, HEVC, dual-audio, faststart vs not.
 - The transcode planner's copy-vs-encode decisions, and one full end-to-end run
   (MPEG-2 AVI → detected → H.264/MKV → output verified → original recycled → re-check passes).
-- Both safety brakes, the action cap, that flag-only findings do not consume it, and that a
+- Both safety brakes — including that the abort ratio is measured against the library rather
+  than the worklist, and that it still trips when the whole library fails — the action cap,
+  that flag-only findings do not consume it, and that a
   transcode which fails to fix the file is not repeated for ever — including a run whose output
   is missing at verify, and a hygiene-triggered remux that leaves its warnings in place.
 - That `*.unfuckarr.*` temp outputs are invisible to the walker and the watcher, and that the

@@ -106,6 +106,56 @@ def test_scan_aborts_when_most_of_the_library_fails(settings, monkeypatch):
     assert not applied, "nothing may be touched once the abort trips"
 
 
+def test_abort_ratio_is_measured_against_the_library_not_the_worklist(
+        settings, monkeypatch):
+    """`needs_check` re-queues every known-bad file, so the pass after a scan
+    that found real problems is made of almost nothing else. Dividing by the
+    re-probed count reads that as 100% and aborts for ever — live, this left
+    unfuckarr taking zero actions across every scan it ever ran. The skipped
+    files were checked before and were fine, so they belong in the
+    denominator."""
+    from unfuckarr.remediation import Decision, Remediator
+    from unfuckarr.scanner import Scanner
+    from unfuckarr.state import ScanProgress, state
+
+    applied = []
+    rem = Remediator(lambda: settings)
+    monkeypatch.setattr(rem, "apply",
+                        lambda *a, **k: applied.append(a[0]["path"]) or {"ok": True})
+    scanner = Scanner(lambda: settings, rem)
+
+    # Nine known-bad files re-probed out of a hundred-file library.
+    state.scan = ScanProgress(running=True, checked=9)
+    pending = [({"path": f"/media/{i}.mkv"}, corrupt(), None,
+                Decision("redownload", "corrupt")) for i in range(9)]
+    out = scanner._remediate(settings, pending, population=100)
+
+    assert "aborted" not in out, "9% of the library is not a broken mount"
+    assert len(applied) == 9
+
+
+def test_abort_still_trips_when_the_whole_library_fails(settings, monkeypatch):
+    """The brake's actual purpose: an unmounted array fails every file, and
+    the library-sized denominator must not soften that."""
+    from unfuckarr.remediation import Decision, Remediator
+    from unfuckarr.scanner import Scanner
+    from unfuckarr.state import ScanProgress, state
+
+    applied = []
+    rem = Remediator(lambda: settings)
+    monkeypatch.setattr(rem, "apply",
+                        lambda *a, **k: applied.append(a[0]["path"]) or {"ok": True})
+    scanner = Scanner(lambda: settings, rem)
+
+    state.scan = ScanProgress(running=True, checked=100)
+    pending = [({"path": f"/media/{i}.mkv"}, corrupt(), None,
+                Decision("redownload", "corrupt")) for i in range(100)]
+    out = scanner._remediate(settings, pending, population=100)
+
+    assert "aborted" in out
+    assert not applied
+
+
 def test_abort_needs_more_than_a_handful_of_failures(settings, monkeypatch):
     """Three bad files out of four is a small library, not a broken mount."""
     from unfuckarr.remediation import Decision, Remediator

@@ -90,6 +90,36 @@ def test_duration_mismatch_against_arr_runtime(video_factory, settings):
 
 
 @needs_ffmpeg
+def test_nominal_runtime_gap_is_not_corruption(video_factory, settings):
+    """The *arr's runtime is the broadcast slot, not the content length. A
+    22 min sitcom against a 25 min slot is the single most common file in a
+    TV library — calling it corrupt sends a pristine remux to be deleted and
+    re-searched, which is what happened live against 2,924 TV files."""
+    settings.integrity.min_duration_seconds = 5
+    path = video_factory("nominal.mkv", seconds=20)
+    result, _ = integrity.check(str(path), settings.integrity,
+                                settings.ffprobe_path, settings.ffmpeg_path,
+                                expected_runtime=25)
+    assert "duration_mismatch" not in {f.code for f in result.errors}
+    assert result.status == "ok", "a normal episode must not read as corrupt"
+    codes = {f.code for f in result.findings}
+    assert "duration_below_expected" in codes, "but the gap is still reported"
+
+
+@needs_ffmpeg
+def test_file_short_of_half_its_runtime_is_still_truncated(video_factory, settings):
+    """The relaxation must not blind the check: below half the expected
+    runtime nothing explains the gap but truncation."""
+    settings.integrity.min_duration_seconds = 5
+    path = video_factory("cut.mkv", seconds=10)
+    result, _ = integrity.check(str(path), settings.integrity,
+                                settings.ffprobe_path, settings.ffmpeg_path,
+                                expected_runtime=25)
+    assert "duration_mismatch" in {f.code for f in result.errors}
+    assert result.status == "corrupt"
+
+
+@needs_ffmpeg
 def test_longer_than_expected_is_not_a_mismatch(video_factory, settings):
     """An extended cut is longer than the *arr's runtime and is not broken."""
     path = video_factory("long.mkv", seconds=20)

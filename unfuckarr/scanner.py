@@ -259,6 +259,9 @@ class Scanner:
 
         todo = [r for r in candidates if needs_check(r, s)]
         state.scan.total = len(todo)
+        # The abort ratio is measured against everything this pass knows the
+        # state of, not just the files it re-probed — see `_remediate`.
+        population = len(candidates)
         publish_scan()
 
         emby = EmbyClient(s.emby) if s.emby.enabled else None
@@ -297,7 +300,7 @@ class Scanner:
         if state.scan.aborted:
             return {"aborted": state.scan.aborted}
 
-        return self._remediate(s, pending)
+        return self._remediate(s, pending, population)
 
     def _check_one(self, row: Any, s: Settings,
                    emby: EmbyClient | None) -> tuple[dict[str, Any], CheckResult, MediaInfo | None]:
@@ -333,15 +336,24 @@ class Scanner:
 
     def _remediate(self, s: Settings,
                    pending: list[tuple[dict[str, Any], CheckResult,
-                                       MediaInfo | None, Decision]]) -> dict[str, Any]:
-        checked = max(1, state.scan.checked)
+                                       MediaInfo | None, Decision]],
+                   population: int = 0) -> dict[str, Any]:
+        # The brake asks "has most of the *library* just broken?", so the
+        # denominator is every file whose state this pass knows — the ones it
+        # re-probed plus the ones `needs_check` skipped because they were
+        # checked before, are unchanged, and were fine. Dividing by the
+        # re-probed count instead makes the brake self-locking: `needs_check`
+        # re-queues every known-bad file, so the pass after a scan that found
+        # real problems consists of almost nothing else, the ratio reads 100%,
+        # and the scan aborts for ever without touching a thing.
+        denominator = max(1, population or state.scan.checked)
         destructive = [p for p in pending
                        if p[3].action in ("redownload", "transcode", "repair")]
-        ratio = len(destructive) / checked
+        ratio = len(destructive) / denominator
 
         if ratio > s.policy.abort_if_failure_ratio_over and len(destructive) > 3:
             state.scan.aborted = (
-                f"{len(destructive)} of {checked} files failed "
+                f"{len(destructive)} of {denominator} files failed "
                 f"({ratio:.0%}) — that is a mount or configuration problem, "
                 "not a media problem. Nothing was changed."
             )
