@@ -1,6 +1,6 @@
 [project]
 name = "unfuckarr"
-version = "1.0.0"
+version = "1.1.0"
 description = "Validates a Sonarr/Radarr library against Emby, then transcodes or re-downloads what is broken."
 readme = "README.md"
 requires-python = ">=3.11"
