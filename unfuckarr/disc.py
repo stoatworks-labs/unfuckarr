@@ -33,7 +33,6 @@ distinction has already cost real media.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import struct
 import subprocess

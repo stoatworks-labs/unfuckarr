@@ -23,11 +23,29 @@ from unfuckarr.scanner import check_file
 
 from .conftest import FFMPEG, needs_ffmpeg
 
-HAS_VMAF = bool(FFMPEG) and "libvmaf" in quality.filters_for(FFMPEG or "ffmpeg")
-needs_vmaf = pytest.mark.skipif(
-    not HAS_VMAF, reason="this ffmpeg was not built with libvmaf")
+def _vmaf_binary() -> str | None:
+    """Find a libvmaf-capable ffmpeg the same way the application does.
 
-VMAF = Metric("vmaf", FFMPEG or "ffmpeg", target=92.0, tolerance=3.0)
+    Not `filters_for(FFMPEG)`: no distro ffmpeg has libvmaf, so checking only
+    the one on PATH skips these tests everywhere — including CI, which then
+    cannot exercise the part of the application that decides whether a
+    re-encode may replace someone's file. CI installs the same static
+    `ffmpeg-vmaf` the image ships, and this finds it.
+    """
+    for binary in quality.VMAF_BINARIES + ((FFMPEG,) if FFMPEG else ()):
+        if not (binary and shutil.which(binary)):
+            continue
+        if "libvmaf" in quality.filters_for(binary):
+            return binary
+    return None
+
+
+VMAF_BINARY = _vmaf_binary()
+HAS_VMAF = VMAF_BINARY is not None
+needs_vmaf = pytest.mark.skipif(
+    not HAS_VMAF, reason="no ffmpeg on this machine was built with libvmaf")
+
+VMAF = Metric("vmaf", VMAF_BINARY or "ffmpeg", target=92.0, tolerance=3.0)
 
 
 # -- sampling -------------------------------------------------------------
