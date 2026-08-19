@@ -87,7 +87,29 @@ Break any of these and the failure is quiet and expensive.
     settings may have changed; it never reopens a *shrunk* one, because generation loss does not
     become untrue.
 
-12. **Efficiency findings are carried separately from everything else, and each separation is
+12. **The measurement is the gate — nothing decides in advance which files are "too big".**
+    An earlier version of `checks/efficiency.py` selected candidates by video bitrate against a
+    target for their resolution. That is a guess about how an encoder will behave on content it
+    has not seen, and it is wrong in both directions: it condemns grain-heavy 35mm that will not
+    compress and waves through a lazy encode that would halve. `EfficiencyConfig` now decides
+    only whether the *search is worth spending* (size floor, duration floor, HDR, a codec skip
+    list that is purely a cost optimisation); `min_saving_pct` and the quality target decide
+    everything else. `target_mbps` survives only to **order** the backlog fattest-first, because
+    the per-scan cap means the order decides which savings land this month and which land next
+    year. Do not reintroduce it as a filter.
+
+13. **`unmeasured` is a state, not a claim, and it has to drain.** The finding is `not_measured`
+    at info severity: nothing is wrong with the file, it simply has not been priced. Every file
+    ends in one of two terminal states on the row — `shrunk` or `shrink_skipped`, both permanent
+    — and `checks/efficiency.check` then returns nothing for it. That is what makes the count a
+    progress figure rather than a permanent pill on the whole library. `CheckResult.unmeasured`
+    is deliberately narrower than `.efficiency` for the same reason: an HDR file being skipped is
+    an efficiency finding but a *terminal* one, so it reads as `ok` with an explanation rather
+    than sitting in a backlog it will never leave. `needs_check` also treats `unmeasured` like
+    `ok` — the backlog is the whole library at the start, and re-probing all of it nightly buys
+    nothing.
+
+14. **Efficiency findings are carried separately from everything else, and each separation is
     load-bearing.** They are excluded from `CheckResult`'s hygiene warning set (so
     `hygiene_action` cannot be what decides to re-encode a 40 GB file), they are last in the
     status precedence (a corrupt file that is also large is corrupt), `oversize_action` is typed
@@ -98,7 +120,7 @@ Break any of these and the failure is quiet and expensive.
     there would disable the scanner permanently on almost every real library. They get
     `max_shrinks_per_scan` instead, and are applied *after* every repair.
 
-13. **"I cannot read this" and "this is broken" are different sentences.** `probe` raises
+15. **"I cannot read this" and "this is broken" are different sentences.** `probe` raises
     `DiscUnreadable` (a `ProbeError` subclass) for a disc image no available route can open, and
     the integrity check turns that into an *info* `disc_not_inspectable` — never `probe_failed`,
     which is in `REPAIRABLE_CODES` and leads to a remux and then a redownload. This is not a
@@ -106,7 +128,7 @@ Break any of these and the failure is quiet and expensive.
     delete-and-re-search, and three 42 GB images are recoverable only because the recycle bin
     caught them. Any new "cannot open" path must land on the info finding, not the error one.
 
-14. **The tailnet-only stance is policy, not decoration.** The README warning (private
+16. **The tailnet-only stance is policy, not decoration.** The README warning (private
     network/tailnet only, never the public internet, no independent human security review) stays,
     because the service deletes media unattended and has no auth until a key is set. In the same
     spirit, `__main__.resolve_host` **fails the start** when `UNFUCKARR_BIND_INTERFACE` names an
@@ -233,6 +255,10 @@ has run", and this project has now been wrong about that once.
 
 **Verified in CI** — the test suite, green, run against real ffmpeg output on every push:
 
+- That the measurement decides, not a bitrate guess: a modest HEVC file and a fat MPEG-2 one
+  both queue for measurement, the fattest is ordered first, a skip-listed codec is excluded only
+  as a cost optimisation and included again when the list is emptied, and an HDR skip reads as a
+  terminal `ok` rather than sitting in a backlog it will never leave.
 - The whole check engine against files ffmpeg actually renders: good, garbage, truncated,
   MPEG-2/AVI, HEVC, dual-audio, faststart vs not.
 - The transcode planner's copy-vs-encode decisions, and one full end-to-end run

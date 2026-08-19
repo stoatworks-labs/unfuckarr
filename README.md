@@ -73,13 +73,21 @@ error, and no policy acts on it. Being unable to read a file is not evidence tha
 and this is the one place in the application where confusing those two has already cost real
 media.
 
-**Efficiency — is it far bigger than it needs to be?**
+**Efficiency — how small could this be, really?**
 A 38 Mbps H.264 Blu-ray remux is a perfectly good file; the only thing to be said against it is
-that it is four times the size of an HEVC encode nobody could tell apart from it. Files whose
-video bitrate is well above a target for their resolution, or that are in an older codec at a
-size worth the CPU, are flagged as *oversized*. This is the one check that is not looking for a
-fault, and it is carried separately all the way through: nothing it raises is ever an error, it
-can never reach a policy that deletes, and it is excluded from the failure-ratio abort below.
+that it is four times the size of an HEVC encode nobody could tell apart from it. So every file
+above a worthwhile-size floor is *measured* — there is no bitrate threshold deciding in advance
+which ones are "too big", because a threshold is a guess about how an encoder will behave on
+content it has not seen, and it is wrong in both directions: it condemns grain-heavy 35mm that
+will not compress at all, and waves through a lazily-encoded 1080p whose picture fits in a third
+of the space.
+
+Files awaiting that measurement read as *not yet measured* — a statement about what has been
+checked, not a claim about the file. Every one ends in one of two terminal states (shrunk, or
+measured and left alone), both recorded permanently, so the backlog drains and the count is real
+progress. This is the one check that is not looking for a fault, and it is carried separately all
+the way through: nothing it raises is ever an error, it can never reach a policy that deletes,
+and it is excluded from the failure-ratio abort below.
 
 **Emby's activity log.** Real playback failures the server recorded, for files that otherwise
 look fine.
@@ -101,7 +109,7 @@ hand:
 | Genuinely corrupt | Delete, blocklist the release, trigger a new search |
 | Intact but Emby would transcode | Transcode, copying every stream that already passes |
 | Hygiene | Flag only |
-| Intact, playable, and much larger than it needs to be | Shrink — re-encode to a *measured* quality target |
+| Not yet measured for a saving | Measure it, and re-encode only if the result is smaller *and* still scores at the quality target |
 | A disc image nothing can open | Report it, and do nothing |
 
 Everything is configurable per class, including turning it off.
@@ -112,10 +120,10 @@ that actually fails gets re-encoded. Output is verified (streams present, durati
 the source) before it is allowed to replace anything.
 
 **Shrinking is measured, not guessed.** This is the only thing unfuckarr does to a file that
-nothing is wrong with, so it is not allowed to guess. CRF is not a quality level — it is a
-rate-control knob whose meaning depends entirely on the content, and the CRF 22 that is visually
-lossless on a talking-heads documentary is mush on grain-heavy 35mm. So instead of picking a
-number and hoping:
+nothing is wrong with, so it is not allowed to guess — about which files to touch, or about what
+the result looks like. CRF is not a quality level; it is a rate-control knob whose meaning
+depends entirely on the content, and the CRF 22 that is visually lossless on a talking-heads
+documentary is mush on grain-heavy 35mm. So instead of picking a number and hoping:
 
 1. Three short samples are taken from across the file (skipping the head and tail, where logos
    and credits compress unlike anything else).
@@ -131,6 +139,11 @@ number and hoping:
    alone is not reassessed — both are recorded permanently. Re-encoding an encode is a second
    generation of loss for a fraction of the saving, and re-deciding "not worth it" costs hours
    of CPU to reach the same answer.
+
+The saving is whatever the measurement finds. A file that halves because H.264 became HEVC and
+a file that halves because it was over-encoded to begin with are the same outcome as far as this
+is concerned — the only questions asked are "is it meaningfully smaller" and "does it still score
+at the target".
 
 Quality tiers are VMAF 85 (*acceptable*), 92 (*good*, the default) and 95 (*excellent*). Only
 HEVC is produced: Emby direct play is the premise of this whole application, and shrinking into

@@ -1,25 +1,27 @@
-"""Files that are intact, playable, and far bigger than they need to be.
+"""Which files are worth measuring for a saving.
 
-Every other check in this package is looking for something wrong. This one is
-not: a 38 Mbps H.264 Blu-ray remux is a perfectly good file, and the only
-thing to be said against it is that it is four times the size of an HEVC
-encode nobody could tell apart from it.
+Every other check in this package asks whether something is wrong. This one
+asks whether a question has been *answered* yet: has this file been measured
+to see how small it can be at full perceptual quality?
 
-That difference in kind is why nothing here is ever an ``error`` and why the
-category is carried separately all the way through:
+That distinction is the whole design. An earlier version of this module tried
+to decide up front which files were "too big", from their bitrate against a
+target for their resolution. That is a guess about how an encoder will behave
+on content it has not seen, and it is wrong in both directions — it condemns a
+grain-heavy 30 Mbps remux that will not compress at all, and it waves through
+a lazily-encoded 6 Mbps 1080p whose picture fits in 2. The quality search
+answers the question properly, per file, by measuring. So nothing here
+pre-judges the answer; it only decides whether spending the search is
+worthwhile, which is a question about *size and running time*, not quality.
 
-* it can never make ``CheckResult.status`` read ``corrupt`` or
-  ``incompatible``, so it can never reach a policy that deletes;
-* it is excluded from the hygiene warning set, so ``hygiene_action`` cannot
-  act on it either;
-* and it is excluded from the scan's abort ratio, because "most of this
-  library is large" is not what an unmounted array looks like — an unmounted
-  array produces integrity failures, and a file that ffprobe cannot read never
-  gets this far.
+What comes out is `not_measured`: an info-severity finding meaning exactly
+what it says. Every file ends in one of two terminal states recorded on the
+row — shrunk, or measured and left alone — and the finding stops being raised
+for it. The backlog therefore drains, and the count of unmeasured files is a
+real progress figure rather than a claim about anyone's library.
 
-The thresholds are deliberately generous. The target is the remux and the
-MPEG-2 rip, not an argument about whether a well-encoded 10 Mbps 1080p could
-have been 8.
+Nothing here is ever an error, and nothing here can reach a policy that
+deletes.
 """
 
 from __future__ import annotations
@@ -35,8 +37,8 @@ def audio_bytes(info: MediaInfo) -> int:
     """What a shrink copies through untouched.
 
     A shrink re-encodes video and stream-copies everything else, so the audio
-    is the floor under the output size. Left out of the bitrate sum, a 30 GB
-    remux with 4 GB of TrueHD looks far more compressible than it is.
+    is the floor under the output size. Left out of the projection, a 30 GB
+    remux carrying 4 GB of TrueHD looks far more compressible than it is.
     """
     if info.duration <= 0:
         return 0
@@ -61,11 +63,12 @@ def video_mbps(info: MediaInfo) -> float:
 
 
 def target_for_height(height: int, targets: dict[str, float]) -> float:
-    """The bitrate ceiling for a resolution.
+    """The reference bitrate for a resolution.
 
-    The largest bucket at or below the file's height wins, so an unusual
-    height (1600p, a cropped 2.39:1 4K) lands on the bucket below it rather
-    than falling through to nothing.
+    Used for ordering the backlog, not for deciding what goes into it. The
+    largest bucket at or below the file's height wins, so an unusual height
+    (1600p, a cropped 2.39:1 4K) lands on the bucket below rather than falling
+    through to nothing.
     """
     buckets = sorted(((int(k), v) for k, v in targets.items()), reverse=True)
     if not buckets:
@@ -76,6 +79,20 @@ def target_for_height(height: int, targets: dict[str, float]) -> float:
     return buckets[-1][1]
 
 
+def priority(info: MediaInfo, cfg: EfficiencyConfig) -> float:
+    """How far above its reference bitrate this file sits.
+
+    The backlog is worked fattest-first, because the per-scan cap means the
+    order decides which savings land this month and which land next year. A
+    file below its reference still gets measured — just later.
+    """
+    v = info.video if info is not None else None
+    if v is None:
+        return 0.0
+    target = target_for_height(v.height, cfg.target_mbps)
+    return video_mbps(info) / target if target > 0 else 0.0
+
+
 def check(info: MediaInfo, cfg: EfficiencyConfig, result: CheckResult,
           already_shrunk: bool = False) -> None:
     if not cfg.enabled or info is None:
@@ -84,10 +101,10 @@ def check(info: MediaInfo, cfg: EfficiencyConfig, result: CheckResult,
     if v is None or info.duration <= 0 or info.size <= 0:
         return
 
-    # A file this application has already shrunk is never a candidate again.
-    # Re-encoding an encode is a generation of loss for a fraction of the
-    # saving, and a check that kept saying "oversized" about a file nothing
-    # will ever act on is just noise in the UI.
+    # Already shrunk, or already measured and found not worth it. Both are
+    # permanent: re-encoding an encode is a second generation of loss for a
+    # fraction of the saving, and re-measuring a file the search has already
+    # priced costs hours of CPU to reach the same answer.
     if already_shrunk:
         return
 
@@ -95,49 +112,36 @@ def check(info: MediaInfo, cfg: EfficiencyConfig, result: CheckResult,
         return
     if info.duration < cfg.min_duration_seconds:
         return
-    if v.codec_name in cfg.efficient_codecs:
+    if v.codec_name in cfg.skip_codecs:
         return
 
     mbps = video_mbps(info)
     target = target_for_height(v.height, cfg.target_mbps)
-    if target <= 0:
-        return
-
-    over_bitrate = mbps > target
-    old_codec = (v.codec_name in cfg.inefficient_codecs
-                 and mbps > target * cfg.codec_bitrate_ratio)
-    if not (over_bitrate or old_codec):
-        return
-
-    if info.is_hdr and not cfg.allow_hdr:
-        # Worth saying out loud rather than staying silent: "why is this 60 GB
-        # file not being shrunk" is otherwise unanswerable from the UI.
-        result.add(Finding(
-            "efficiency", "hdr_not_shrunk", "info",
-            f"{mbps:.1f} Mbps at {v.height}p, but this is HDR — re-encoding it "
-            "risks losing the metadata, which produces a washed-out file that "
-            "still plays. Enable allow_hdr to include it.",
-            {"mbps": round(mbps, 2), "target_mbps": target, "hdr": True},
-        ))
-        return
-
     data = {
-        "mbps": round(mbps, 2), "target_mbps": target,
+        "mbps": round(mbps, 2), "reference_mbps": target,
+        "ratio": round(priority(info, cfg), 2),
         "codec": v.codec_name, "height": v.height,
         "size": info.size, "duration": round(info.duration),
     }
-    if over_bitrate:
+
+    if info.is_hdr and not cfg.allow_hdr:
+        # Worth saying out loud rather than staying silent: "why is this 60 GB
+        # file never measured" is otherwise unanswerable from the UI.
         result.add(Finding(
-            "efficiency", "bitrate_above_target", "warning",
-            f"{mbps:.1f} Mbps of video at {v.height}p, against a "
-            f"{target:g} Mbps target — a measured re-encode should be much "
-            "smaller with no visible difference",
-            data,
+            "efficiency", "hdr_not_shrunk", "info",
+            f"{mbps:.1f} Mbps at {v.height}p, but this is HDR — re-encoding it "
+            "risks losing the mastering metadata, which produces a washed-out "
+            "file that still plays. Enable allow_hdr to include it.",
+            {**data, "hdr": True},
         ))
-    else:
-        result.add(Finding(
-            "efficiency", "inefficient_codec", "warning",
-            f"{v.codec_name} at {mbps:.1f} Mbps — an HEVC encode of the same "
-            "picture is typically far smaller",
-            data,
-        ))
+        return
+
+    headline = (f"{v.codec_name} at {mbps:.1f} Mbps, {v.height}p"
+                if mbps else f"{v.codec_name}, {v.height}p")
+    result.add(Finding(
+        "efficiency", "not_measured", "info",
+        f"{headline} — not yet measured to see how small it can be at full "
+        "perceptual quality. The encode only replaces the file if the result "
+        "is both meaningfully smaller and still scores at the quality target.",
+        data,
+    ))

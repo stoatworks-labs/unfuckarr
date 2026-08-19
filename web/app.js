@@ -94,7 +94,7 @@ function toast(msg, kind = '') {
 
 const STATUS_LABEL = {
   ok: 'OK', corrupt: 'Corrupt', incompatible: 'Incompatible',
-  hygiene: 'Needs tidying', oversized: 'Larger than needed',
+  hygiene: 'Needs tidying', unmeasured: 'Not yet measured',
   missing: 'Awaiting replacement',
   unknown: 'Not checked', error: 'Check failed',
 };
@@ -278,7 +278,7 @@ function viewDashboard() {
     ['bad', c.corrupt || 0, 'Corrupt'],
     ['warn', c.incompatible || 0, 'Incompatible'],
     ['info', c.hygiene || 0, 'Needs tidying'],
-    ['', c.oversized || 0, 'Larger than needed'],
+    ['', c.unmeasured || 0, 'Not yet measured'],
     ['', (c.unknown || 0) + (c.error || 0), 'Not checked'],
   ];
   v.append(el('div', { class: 'grid grid-stats' },
@@ -288,7 +288,7 @@ function viewDashboard() {
         onclick: () => {
           const map = {
             Corrupt: 'corrupt', Incompatible: 'incompatible',
-            'Needs tidying': 'hygiene', 'Larger than needed': 'oversized',
+            'Needs tidying': 'hygiene', 'Not yet measured': 'unmeasured',
             Playable: 'ok',
           };
           location.hash = `#/files${map[label] ? `?status=${map[label]}` : ''}`;
@@ -355,9 +355,9 @@ function buildLibrariesCard() {
         l.corrupt ? el('span', { class: 'pill pill-corrupt', style: 'margin-right:4px' }, `${l.corrupt} corrupt`) : null,
         l.incompatible ? el('span', { class: 'pill pill-incompatible', style: 'margin-right:4px' }, `${l.incompatible} incompatible`) : null,
         l.hygiene ? el('span', { class: 'pill pill-hygiene', style: 'margin-right:4px' }, `${l.hygiene} tidy`) : null,
-        l.oversized ? el('span', { class: 'pill pill-oversized', style: 'margin-right:4px' }, `${l.oversized} oversized`) : null,
+        l.unmeasured ? el('span', { class: 'pill pill-unmeasured', style: 'margin-right:4px' }, `${l.unmeasured} to measure`) : null,
         l.missing ? el('span', { class: 'pill pill-missing', style: 'margin-right:4px' }, `${l.missing} replacing`) : null,
-        (!l.corrupt && !l.incompatible && !l.hygiene && !l.oversized && !l.missing)
+        (!l.corrupt && !l.incompatible && !l.hygiene && !l.unmeasured && !l.missing)
           ? el('span', { class: 'muted small' }, 'none') : null),
       el('td', {}, el('button', {
         class: 'btn btn-sm',
@@ -448,7 +448,7 @@ function viewFiles() {
   if (params.get('status')) filesQuery.status = params.get('status');
 
   const statusSel = el('select', { onchange: (e) => { filesQuery.status = e.target.value; filesQuery.offset = 0; loadFiles(); } },
-    ...['all', 'corrupt', 'incompatible', 'hygiene', 'oversized', 'missing', 'error', 'unknown', 'ok']
+    ...['all', 'corrupt', 'incompatible', 'hygiene', 'unmeasured', 'missing', 'error', 'unknown', 'ok']
       .map((s) => el('option', { value: s, selected: filesQuery.status === s },
         s === 'all' ? 'All statuses' : (STATUS_LABEL[s] || s))));
 
@@ -803,11 +803,12 @@ const FIELD_HELP = {
   'policy.hygiene_action': 'What to do about missing language tags, default-track flags and similar. These never justify deleting a file.',
   'policy.recycle_bin_days': 'Deleted files are kept this long so an automatic decision can be undone. 0 deletes immediately.',
   'policy.recycle_bin_path': 'Where deleted and replaced files are kept. Point it at a path INSIDE your media mount and on the same share \u2014 e.g. /media/.recycle. Then recycling is a rename and costs nothing; anywhere else it is a full copy of every file, and on Unraid the default (/config/recycle) is appdata on the cache, which a handful of 40 GB remuxes will fill. Usually set by UNFUCKARR_RECYCLE_BIN_PATH alongside the volume mappings.',
-  'policy.oversize_action': 'What to do with a file that is intact and playable but far larger than it needs to be. This can never delete: the worst it can do is re-encode, and only when a measured quality check says the result is indistinguishable.',
+  'policy.oversize_action': 'What to do with a file that has not been measured for a saving yet. This can never delete: the worst it can do is re-encode, and only when a measured quality check says the result is indistinguishable from the original.',
   'policy.max_actions_per_scan': 'Hard cap on how many files one scan may transcode or delete. Shrinks are counted separately, below.',
   'policy.max_shrinks_per_scan': 'Shrinks have their own, much smaller cap. One shrink is a quality search plus a full re-encode — hours, not the seconds a remux takes — and nothing is broken while a large file waits for the next scan.',
-  'efficiency.target_mbps': 'Video bitrate, in Mbps, above which a file of a given height is worth looking at. Keyed by height; the largest entry at or below the file\u2019s height wins. Generous on purpose — the target is the 40 Mbps remux, not a well-encoded 8 Mbps 1080p.',
-  'efficiency.codec_bitrate_ratio': 'A file in an inefficient codec is a candidate once it passes this fraction of its height\u2019s target, rather than the whole target.',
+  'efficiency.target_mbps': 'Not a threshold \u2014 nothing is excluded for being under it. It only sets the ORDER the backlog is worked through: files furthest above the reference for their height are measured first, because the per-scan cap means the order decides which savings land this month and which land next year.',
+  'efficiency.min_size_mb': 'Do not spend a quality search on a file smaller than this. A question about worthwhileness, not quality.',
+  'efficiency.skip_codecs': 'A cost optimisation, not a quality judgement. A search on a file already in one of these almost always fails the saving floor, and takes minutes per file to say so. Empty the list to measure them anyway.',
   'efficiency.allow_hdr': 'Off by default, and worth leaving off for now. The colour description (transfer function, primaries, matrix) is carried onto the encode, but mastering-display and MaxCLL metadata are not yet, and this has never been checked against a real HDR file. A re-encode that loses HDR metadata produces a grey, washed-out file that still plays — a failure nothing reports.',
   'shrink.quality': 'The quality the result must measure at: acceptable = VMAF 85, good = 92, excellent = 95. Nothing is replaced unless the finished file actually scores this.',
   'shrink.min_saving_pct': 'Do not touch the file unless this much is really saved. Checked twice: against the search\u2019s projection before encoding starts, and against the finished file before it is allowed to replace anything.',
@@ -1028,29 +1029,33 @@ async function viewSettings() {
     settingField('shrink.vmaf_ffmpeg_path', s.shrink.vmaf_ffmpeg_path,
       { placeholder: 'ffmpeg-vmaf' })));
 
-  // Which files count as oversized
+  // Which files get measured
   v.append(el('div', { class: 'card' },
-    el('h3', {}, 'What counts as oversized'),
+    el('h3', {}, 'Which files get measured'),
+    el('div', { class: 'hint', style: 'margin-bottom:12px' },
+      'Every file above these floors is measured to see how small it can be at '
+      + 'full perceptual quality. There is no bitrate threshold deciding that in '
+      + 'advance, because a threshold is a guess about how an encoder will behave '
+      + 'on content it has not seen \u2014 it condemns grain that will not '
+      + 'compress and waves through a lazy encode that would halve. These '
+      + 'settings only decide whether spending the search is worthwhile.'),
     settingField('efficiency.enabled', s.efficiency.enabled,
-      { label: 'Look for files that are bigger than they need to be' }),
+      { label: 'Measure files for possible savings' }),
     el('div', { class: 'cols' },
       settingField('efficiency.min_size_mb', s.efficiency.min_size_mb),
-      settingField('efficiency.min_duration_seconds', s.efficiency.min_duration_seconds),
-      settingField('efficiency.codec_bitrate_ratio', s.efficiency.codec_bitrate_ratio)),
+      settingField('efficiency.min_duration_seconds', s.efficiency.min_duration_seconds)),
+    settingField('efficiency.skip_codecs', s.efficiency.skip_codecs, { list: true }),
+    settingField('efficiency.allow_hdr', s.efficiency.allow_hdr,
+      { label: 'Include HDR files' }),
     el('div', { class: 'field' },
-      el('label', {}, 'Target Mbps by height'),
+      el('label', {}, 'Reference Mbps by height (ordering only)'),
       el('input', {
         type: 'text', 'data-path': 'efficiency.target_mbps', 'data-map': '1',
         value: Object.entries(s.efficiency.target_mbps)
           .sort((a, b) => Number(b[0]) - Number(a[0]))
           .map(([k, mv]) => `${k}=${mv}`).join(', '),
       }),
-      el('div', { class: 'hint' }, FIELD_HELP['efficiency.target_mbps'])),
-    el('div', { class: 'cols' },
-      settingField('efficiency.inefficient_codecs', s.efficiency.inefficient_codecs, { list: true }),
-      settingField('efficiency.efficient_codecs', s.efficiency.efficient_codecs, { list: true })),
-    settingField('efficiency.allow_hdr', s.efficiency.allow_hdr,
-      { label: 'Include HDR files' })));
+      el('div', { class: 'hint' }, FIELD_HELP['efficiency.target_mbps']))));
 
   // Schedule
   v.append(el('div', { class: 'card' },

@@ -266,7 +266,7 @@ def test_a_whole_shrink_runs_against_real_media(video_factory, settings,
     before = path.stat().st_size
 
     out = Remediator(lambda: settings).apply(
-        row, result, info, Decision("shrink", "oversized"))
+        row, result, info, Decision("shrink", "unmeasured"))
     assert out["ok"], out
 
     final = Path(out["path"])
@@ -337,7 +337,7 @@ def test_a_file_is_never_shrunk_twice(video_factory, settings, monkeypatch):
     result, info = check_file(str(path), settings)
 
     out = Remediator(lambda: settings).apply(
-        row, result, info, Decision("shrink", "oversized"))
+        row, result, info, Decision("shrink", "unmeasured"))
     assert out["action"] == "flag"
     assert "already shrunk" in out["message"]
     assert not ran, "nothing should have been encoded"
@@ -354,7 +354,7 @@ def test_a_file_already_assessed_is_not_reassessed(video_factory, settings,
     result, info = check_file(str(path), settings)
 
     out = Remediator(lambda: settings).apply(
-        row, result, info, Decision("shrink", "oversized"))
+        row, result, info, Decision("shrink", "unmeasured"))
     assert out["action"] == "flag" and not ran
 
 
@@ -385,7 +385,7 @@ def test_a_projection_below_the_floor_never_starts_an_encode(
     before = path.read_bytes()
 
     out = Remediator(lambda: settings).apply(
-        row, result, info, Decision("shrink", "oversized"))
+        row, result, info, Decision("shrink", "unmeasured"))
     assert not ran, "10% is under the 25% floor"
     assert path.read_bytes() == before
     skipped = db.q1("SELECT shrink_skipped FROM files WHERE path=?",
@@ -404,7 +404,7 @@ def test_a_result_that_is_not_actually_smaller_is_discarded(
     result, info = check_file(str(path), settings)
 
     out = Remediator(lambda: settings).apply(
-        row, result, info, Decision("shrink", "oversized"))
+        row, result, info, Decision("shrink", "unmeasured"))
     assert out["action"] == "flag"
     assert path.exists(), "the original must survive"
     assert not list(path.parent.glob("*.unfuckarr.*"))
@@ -421,7 +421,7 @@ def test_a_result_that_measures_worse_than_the_target_is_discarded(
     result, info = check_file(str(path), settings)
 
     out = Remediator(lambda: settings).apply(
-        row, result, info, Decision("shrink", "oversized"))
+        row, result, info, Decision("shrink", "unmeasured"))
     assert out["action"] == "flag"
     assert path.exists()
     assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 0
@@ -439,7 +439,7 @@ def test_one_bad_sample_discards_a_passing_mean(video_factory, settings,
     result, info = check_file(str(path), settings)
 
     out = Remediator(lambda: settings).apply(
-        row, result, info, Decision("shrink", "oversized"))
+        row, result, info, Decision("shrink", "unmeasured"))
     assert out["action"] == "flag" and path.exists()
 
 
@@ -456,7 +456,7 @@ def test_an_unverifiable_result_is_discarded(video_factory, settings,
     result, info = check_file(str(path), settings)
 
     out = Remediator(lambda: settings).apply(
-        row, result, info, Decision("shrink", "oversized"))
+        row, result, info, Decision("shrink", "unmeasured"))
     assert not out["ok"] and path.exists()
     assert db.q1("SELECT shrink_attempts FROM files WHERE path=?",
                  (str(path),))["shrink_attempts"] == 1
@@ -471,7 +471,7 @@ def test_hdr_is_left_alone(video_factory, settings, monkeypatch):
     monkeypatch.setattr(type(info), "is_hdr", property(lambda self: True))
 
     out = Remediator(lambda: settings).apply(
-        row, result, info, Decision("shrink", "oversized"))
+        row, result, info, Decision("shrink", "unmeasured"))
     assert out["action"] == "flag" and not ran
     assert "HDR" in db.q1("SELECT shrink_skipped FROM files WHERE path=?",
                           (str(path),))["shrink_skipped"]
@@ -488,7 +488,7 @@ def test_no_metric_means_nothing_is_shrunk_and_nothing_is_written_off(
     result, info = check_file(str(path), settings)
 
     out = Remediator(lambda: settings).apply(
-        row, result, info, Decision("shrink", "oversized"))
+        row, result, info, Decision("shrink", "unmeasured"))
     assert out["action"] == "flag"
     assert db.q1("SELECT shrink_skipped FROM files WHERE path=?",
                  (str(path),))["shrink_skipped"] is None
@@ -505,7 +505,7 @@ def test_shrinking_waits_for_its_window(video_factory, settings, monkeypatch):
     result, info = check_file(str(path), settings)
 
     out = Remediator(lambda: settings).apply(
-        row, result, info, Decision("shrink", "oversized"))
+        row, result, info, Decision("shrink", "unmeasured"))
     assert out["action"] == "flag" and not ran
     assert db.q1("SELECT shrink_skipped FROM files WHERE path=?",
                  (str(path),))["shrink_skipped"] is None, \
@@ -553,7 +553,7 @@ def test_shrinks_do_not_count_towards_the_abort_ratio(settings, monkeypatch):
     state.scan = ScanProgress(running=True, checked=90)
     result = run_check(media(size_mb=30000), settings)
     pending = [({"path": f"/media/{i}.mkv"}, result, None,
-                Decision("shrink", "oversized")) for i in range(90)]
+                Decision("shrink", "unmeasured")) for i in range(90)]
     out = scanner._remediate(settings, pending, population=100)
 
     assert "aborted" not in out, "90% of a library being large is not a fault"
@@ -576,7 +576,7 @@ def test_shrinks_have_their_own_much_smaller_cap(settings, monkeypatch):
     from .test_efficiency import media, run as run_check
     result = run_check(media(size_mb=30000), settings)
     pending = [({"path": f"/media/{i}.mkv"}, result, None,
-                Decision("shrink", "oversized")) for i in range(20)]
+                Decision("shrink", "unmeasured")) for i in range(20)]
     out = scanner._remediate(settings, pending, population=100)
 
     assert len(applied) == 3

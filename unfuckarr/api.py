@@ -89,7 +89,7 @@ def get_status() -> dict[str, Any]:
     libraries = [
         {"library": r["library"] or "Other", "total": r["n"],
          "ok": r["ok"], "corrupt": r["corrupt"], "incompatible": r["incompatible"],
-         "hygiene": r["hygiene"], "oversized": r["oversized"],
+         "hygiene": r["hygiene"], "unmeasured": r["unmeasured"],
          "unknown": r["unknown"], "missing": r["missing"],
          "bytes": r["bytes"] or 0}
         for r in db.q(
@@ -99,7 +99,7 @@ def get_status() -> dict[str, Any]:
                       SUM(status='corrupt') corrupt,
                       SUM(status='incompatible') incompatible,
                       SUM(status='hygiene') hygiene,
-                      SUM(status='oversized') oversized,
+                      SUM(status='unmeasured') unmeasured,
                       SUM(status IN ('unknown','error')) unknown,
                       SUM(status='missing') missing,
                       SUM(size) bytes

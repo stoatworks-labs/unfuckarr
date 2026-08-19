@@ -75,7 +75,9 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
     # to re-encode one.
     warnings = [f for f in result.findings
                 if f.severity == "warning" and f.category != "efficiency"]
-    oversized = [f for f in result.efficiency if f.severity == "warning"]
+    # `not_measured` is info severity, not a warning: there is nothing wrong
+    # with the file. It is the *absence of an answer* that drives the action.
+    unmeasured = result.unmeasured
 
     if integrity:
         action = policy.corrupt_action
@@ -98,13 +100,13 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
     # hygiene fixes with it, so letting a flag-only hygiene finding answer
     # first would mask it. When shrinking is not what happens, this falls
     # through and hygiene decides as it always did.
-    if oversized and policy.oversize_action == "shrink":
+    if unmeasured and policy.oversize_action == "shrink":
         blocked = shrink_blocked(settings)
         if blocked is None:
             return Decision("shrink",
-                            "intact and playable, but much larger than it "
-                            "needs to be",
-                            [f.code for f in oversized])
+                            "measuring how small this can be at full "
+                            "perceptual quality",
+                            [f.code for f in unmeasured])
         log.debug("not shrinking %s: %s", result.path, blocked)
 
     if warnings:
@@ -127,9 +129,9 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
             return Decision(action, "stream metadata needs tidying",
                             [f.code for f in warnings])
 
-    if oversized and policy.oversize_action != "none":
-        return Decision("flag", "larger than it needs to be",
-                        [f.code for f in oversized])
+    if unmeasured and policy.oversize_action != "none":
+        return Decision("flag", "not measured for a saving",
+                        [f.code for f in unmeasured])
 
     return Decision("none", "file is fine")
 

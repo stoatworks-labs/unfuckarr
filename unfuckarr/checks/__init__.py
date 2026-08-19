@@ -56,6 +56,18 @@ class CheckResult:
         return [f for f in self.findings if f.category == "efficiency"]
 
     @property
+    def unmeasured(self) -> list[Finding]:
+        """Findings that mean "this file is waiting for a quality search".
+
+        Narrower than ``efficiency`` on purpose. An HDR file that is being
+        skipped is also an efficiency finding, but it is a *terminal* one —
+        it will never be measured while ``allow_hdr`` is off, so counting it
+        as unmeasured would leave a number that never drains and a progress
+        figure that lies.
+        """
+        return [f for f in self.findings if f.code == "not_measured"]
+
+    @property
     def status(self) -> str:
         """Single word for the file list.
 
@@ -72,11 +84,12 @@ class CheckResult:
         if any(f.severity == "warning" and f.category != "efficiency"
                for f in self.findings):
             return "hygiene"
-        # Last, and deliberately: a file that is merely large is otherwise
-        # perfectly good, and reading "oversized" next to a corrupt file in
-        # the same column would flatten a real difference in what happens next.
-        if self.efficiency:
-            return "oversized"
+        # Last, and deliberately: nothing is wrong with these files. The
+        # status says what is true — the file has not been measured for a
+        # saving yet — rather than "oversized", which would be a claim about
+        # every file in the library that nothing has actually checked.
+        if self.unmeasured:
+            return "unmeasured"
         return "ok"
 
     def as_dict(self) -> dict[str, Any]:

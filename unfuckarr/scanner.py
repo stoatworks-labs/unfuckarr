@@ -199,7 +199,12 @@ def needs_check(row: Any, s: Settings) -> bool:
     signature = f"{stat.st_size}:{stat.st_mtime}"
     if row["checked_signature"] != signature:
         return True
-    if row["status"] not in ("ok",):
+    # "unmeasured" belongs with "ok" here, not with the faults. Nothing is
+    # wrong with the file; it is waiting for a quality search that the
+    # per-scan cap doles out slowly. Re-probing every one of them on every
+    # pass would mean probing the entire library nightly for ever, because the
+    # backlog is the whole library to begin with.
+    if row["status"] not in ("ok", "unmeasured"):
         return True                      # keep re-reporting a known-bad file
     age_days = (time.time() - row["last_checked"]) / 86400
     return age_days >= s.schedule.recheck_after_days
@@ -377,10 +382,22 @@ class Scanner:
         shrinks = 0
         capped_shrinks = False
         # Repairs first, shrinks last. A broken file is urgent and a remux
-        # takes seconds; a large file is neither urgent nor cheap, and one
-        # multi-hour shrink must never consume the pass that a corrupt file is
-        # waiting on.
-        ordered = sorted(pending, key=lambda p: p[3].action == "shrink")
+        # takes seconds; an unmeasured file is neither urgent nor cheap, and
+        # one multi-hour shrink must never consume the pass that a corrupt
+        # file is waiting on.
+        #
+        # Within the shrinks, fattest first. The cap means the order decides
+        # which savings land this month and which land next year, so the
+        # files furthest above the reference bitrate for their resolution go
+        # first — that is where the measurement is most likely to pay, and
+        # where it pays most when it does.
+        def order(item: tuple) -> tuple[bool, float]:
+            _, _, item_info, item_decision = item
+            if item_decision.action != "shrink":
+                return (False, 0.0)
+            return (True, -efficiency_checks.priority(item_info, s.efficiency))
+
+        ordered = sorted(pending, key=order)
         for row, result, info, decision in ordered:
             if self._stop:
                 break

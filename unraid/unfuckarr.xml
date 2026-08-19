@@ -27,12 +27,14 @@
     re-searches genuinely broken files (blocklisting the release so the same
     bad copy is not grabbed again).
 
-    It can also reclaim space: files that are intact and playable but far
-    larger than they need to be are re-encoded to a MEASURED quality target -
-    short samples are scored against the original with VMAF to find the
-    smallest file that still looks the same, and nothing replaces anything
-    unless the finished file is both meaningfully smaller and still scores at
-    the target. A file is only ever shrunk once.
+    It can also reclaim space. Every file worth the CPU is MEASURED to see how
+    small it can be at full perceptual quality: short samples are encoded at
+    candidate settings and scored against the original with VMAF, and nothing
+    replaces anything unless the finished file is both meaningfully smaller
+    and still scores at the target. There is no bitrate threshold guessing
+    which files are too big - the measurement decides, per file. A file is
+    only ever shrunk once, and one that is measured and left alone is not
+    measured again.
 
     Watch folders check new downloads the moment they land, before the *arr
     imports them. Everything deleted or replaced goes to a recycle bin with a

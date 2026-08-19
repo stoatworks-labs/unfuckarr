@@ -166,7 +166,7 @@ tbody tr.click { cursor: pointer; }
 .pill-corrupt      { background: rgba(240,82,82,.14);  color: var(--bad);  border-color: rgba(240,82,82,.3); }
 .pill-incompatible { background: rgba(210,153,34,.14); color: var(--warn); border-color: rgba(210,153,34,.3); }
 .pill-hygiene      { background: rgba(163,113,247,.14);color: var(--info); border-color: rgba(163,113,247,.3); }
-.pill-oversized    { background: rgba(78,161,255,.14); color: var(--accent); border-color: rgba(78,161,255,.3); }
+.pill-unmeasured   { background: rgba(78,161,255,.14); color: var(--accent); border-color: rgba(78,161,255,.3); }
 .pill-missing,
 .pill-error,
 .pill-unknown      { background: var(--bg-3); color: var(--muted); border-color: var(--line); }

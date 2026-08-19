@@ -121,42 +121,43 @@ class HygieneConfig(BaseModel):
 
 
 class EfficiencyConfig(BaseModel):
-    """Finding files that are intact, playable, and far bigger than they need
-    to be.
+    """Which files are worth *measuring* for a saving.
 
-    This is the only check that is not looking for a fault. Nothing it raises
-    is ever an error, and nothing it raises can lead to a delete — the worst
-    that can come of it is a re-encode, guarded by
-    ``Policy.oversize_action`` and everything in ``ShrinkConfig``.
+    Deliberately not "which files are too big". A bitrate threshold is a guess
+    about what an encoder will manage on content it has not seen, and it is
+    wrong in both directions: it condemns a well-encoded 30 Mbps remux of
+    grain-heavy 35mm that will not compress, and it lets a lazily-encoded
+    6 Mbps 1080p through when the same picture fits in 2. The quality search
+    already answers the question properly, per file, by measuring — so these
+    settings decide only whether spending that search is *worthwhile*, and the
+    measurement decides everything else.
+
+    Nothing raised here is ever an error, and nothing raised here can lead to
+    a delete: the worst outcome is a re-encode, guarded by
+    ``Policy.oversize_action`` and every gate in ``ShrinkConfig``.
     """
 
     enabled: bool = True
-    # Video bitrate, in Mbps, above which a file of a given height is worth
-    # looking at. Keyed by height as a string so the settings JSON stays
-    # readable; the largest bucket at or below the file's height wins.
-    # These are deliberately generous — the point is to catch the 40 Mbps
-    # remux, not to argue about a well-encoded 10 Mbps 1080p.
-    target_mbps: dict[str, float] = Field(default_factory=lambda: {
-        "2160": 25.0, "1440": 14.0, "1080": 8.0, "720": 4.0, "480": 2.5,
-    })
-    # Codecs that cost size for nothing on a modern library. A file in one of
-    # these is worth re-encoding at a lower bitrate than the table above.
-    inefficient_codecs: list[str] = Field(default_factory=lambda: [
-        "mpeg2video", "mpeg4", "msmpeg4v3", "vc1", "wmv3", "h264",
-    ])
-    # An inefficient codec still has to be reasonably large before it is worth
-    # hours of CPU: this is the fraction of the height's target it must exceed.
-    codec_bitrate_ratio: float = 0.6
-    # Codecs already about as small as they get. Re-encoding these is a
-    # generation of loss for very little.
-    efficient_codecs: list[str] = Field(default_factory=lambda: ["av1", "vp9"])
-    # Floors. A saving is only worth an encode if there is something to save.
+    # Floors, in the sense of "is there anything here worth hours of CPU".
     min_size_mb: int = 500
     min_duration_seconds: int = 300
-    # HDR survives a re-encode only if the metadata does, and getting that
+    # A cost optimisation and nothing more. A search on a file already in one
+    # of these will almost always fail `min_saving_pct` — and take minutes to
+    # say so, per file, across a whole library. Empty the list to measure them
+    # anyway; a genuinely bloated AV1 does exist, it is just rare enough not
+    # to be worth the sweep.
+    skip_codecs: list[str] = Field(default_factory=lambda: ["av1"])
+    # HDR survives a re-encode only if its metadata does, and getting that
     # wrong produces a grey, washed-out file that still plays — the worst kind
     # of failure, because nothing reports it. Off until asked for.
     allow_hdr: bool = False
+    # NOT a gate. The backlog is worked through fattest-first so the biggest
+    # wins land first, and this is what "fattest" is measured against: the
+    # ratio of a file's video bitrate to the target for its height. A file
+    # under its target is still assessed, just later.
+    target_mbps: dict[str, float] = Field(default_factory=lambda: {
+        "2160": 25.0, "1440": 14.0, "1080": 8.0, "720": 4.0, "480": 2.5,
+    })
 
 
 class ShrinkConfig(BaseModel):

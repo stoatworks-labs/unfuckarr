@@ -66,25 +66,40 @@ def test_an_unusual_height_lands_on_the_bucket_below_it():
 
 # -- what is flagged ------------------------------------------------------
 
-def test_a_high_bitrate_remux_is_flagged(settings):
+def test_a_file_is_queued_for_measurement(settings):
     result = run(media(size_mb=30000, duration=7200), settings)
-    assert [f.code for f in result.findings] == ["bitrate_above_target"]
-    assert result.status == "oversized"
+    assert [f.code for f in result.findings] == ["not_measured"]
+    assert result.status == "unmeasured"
+    assert all(f.severity == "info" for f in result.findings)
 
 
-def test_an_old_codec_is_flagged_below_the_bitrate_target(settings):
-    """MPEG-2 at 6 Mbps is under the 1080p target and still worth re-encoding;
-    the same 6 Mbps in HEVC is not."""
-    old = run(media(codec="mpeg2video", size_mb=5600, duration=7200), settings)
-    assert [f.code for f in old.findings] == ["inefficient_codec"]
+def test_bitrate_does_not_decide_what_gets_measured(settings):
+    """The measurement is the gate. A bitrate threshold is a guess about how
+    an encoder will behave on content it has not seen, and it is wrong both
+    ways — it condemns grain that will not compress and waves through a lazy
+    encode that would halve."""
+    modest = run(media(codec="hevc", size_mb=3000, duration=7200), settings)
+    fat = run(media(codec="mpeg2video", size_mb=30000, duration=7200), settings)
+    assert [f.code for f in modest.findings] == ["not_measured"]
+    assert [f.code for f in fat.findings] == ["not_measured"]
 
-    modern = run(media(codec="hevc", size_mb=5600, duration=7200), settings)
-    assert modern.findings == []
+
+def test_the_fattest_files_are_measured_first(settings):
+    """The per-scan cap means the order decides which savings land this month
+    and which land next year."""
+    fat = media(codec="h264", size_mb=30000, duration=7200)
+    lean = media(codec="hevc", size_mb=3000, duration=7200)
+    assert efficiency.priority(fat, settings.efficiency) > \
+        efficiency.priority(lean, settings.efficiency)
 
 
-def test_an_already_efficient_codec_is_left_alone(settings):
-    """Re-encoding AV1 is a generation of loss for very little."""
+def test_a_codec_that_will_not_win_is_skipped_to_save_the_search(settings):
+    """Not a quality judgement — a cost one. A search on AV1 almost always
+    fails the saving floor, and takes minutes per file to say so."""
     assert run(media(codec="av1", size_mb=30000), settings).findings == []
+    settings.efficiency.skip_codecs = []
+    assert [f.code for f in run(media(codec="av1", size_mb=30000), settings).findings] \
+        == ["not_measured"]
 
 
 def test_small_and_short_files_are_not_worth_the_cpu(settings):
@@ -93,8 +108,9 @@ def test_small_and_short_files_are_not_worth_the_cpu(settings):
 
 
 def test_a_file_already_shrunk_is_never_a_candidate_again(settings):
-    """Not just "do not act" — do not keep saying it, either. A permanent
-    "oversized" pill on a file nothing will ever touch is noise."""
+    """Not just "do not act" — do not keep saying it, either. Every file ends
+    in one of two terminal states, so the unmeasured count is a real progress
+    figure that drains rather than a permanent pill."""
     assert run(media(size_mb=30000), settings, already_shrunk=True).findings == []
 
 
@@ -106,10 +122,12 @@ def test_hdr_is_reported_rather_than_silently_skipped(settings):
     result = run(info, settings)
     assert [f.code for f in result.findings] == ["hdr_not_shrunk"]
     assert all(f.severity == "info" for f in result.findings)
-    assert result.status == "oversized"
+    # Terminal, not pending: it will never be measured while allow_hdr is off,
+    # so it must not sit in a backlog count that is supposed to drain.
+    assert result.status == "ok"
 
     settings.efficiency.allow_hdr = True
-    assert [f.code for f in run(info, settings).findings] == ["bitrate_above_target"]
+    assert [f.code for f in run(info, settings).findings] == ["not_measured"]
 
 
 def test_hlg_and_dolby_vision_are_hdr_too():
@@ -127,7 +145,7 @@ def test_the_check_can_be_switched_off(settings):
 # -- status and policy ----------------------------------------------------
 
 def test_a_real_fault_outranks_being_large(settings):
-    """A corrupt file that is also oversized is corrupt: that is the finding
+    """A corrupt file that is also unmeasured is corrupt: that is the finding
     that decides what happens to it."""
     result = run(media(size_mb=30000), settings)
     result.add(Finding("integrity", "decode_errors", "error", ""))
@@ -148,10 +166,10 @@ def test_efficiency_findings_are_not_hygiene(settings):
     assert decide(run(media(size_mb=30000), settings), settings).action == "none"
 
 
-def test_the_default_policy_shrinks(settings):
+def test_the_default_policy_measures(settings):
     d = decide(run(media(size_mb=30000), settings), settings)
     assert d.action == "shrink"
-    assert d.findings == ["bitrate_above_target"]
+    assert d.findings == ["not_measured"]
 
 
 def test_oversize_action_can_never_delete():
