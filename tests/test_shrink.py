@@ -8,9 +8,11 @@ been shrunk once already. A shrink that goes ahead is the easy case.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import sqlite3
+import time
 import subprocess
 from pathlib import Path
 
@@ -603,6 +605,57 @@ def test_repairs_are_applied_before_shrinks(settings, monkeypatch):
     ]
     scanner._remediate(settings, pending, population=100)
     assert applied == ["redownload", "shrink"]
+
+
+# -- the estimate ---------------------------------------------------------
+
+@needs_ffmpeg
+def test_an_estimate_measures_and_changes_nothing(video_factory, settings,
+                                                  monkeypatch):
+    """The entire point of "estimate": it answers "what would this save" with
+    the same search the real action uses, and leaves the file alone."""
+    from unfuckarr import config
+    from unfuckarr.service import Service
+
+    path = video_factory("ask.mkv", seconds=4)
+    before = path.read_bytes()
+    monkeypatch.setattr(config, "get", lambda: settings)
+    monkeypatch.setattr(quality, "resolve_metric", lambda *a, **k: VMAF)
+    monkeypatch.setattr(quality, "search", lambda *a, **k: good_plan())
+
+    service = Service()
+    assert service.estimate_shrink(str(path))
+    for _ in range(100):
+        row = db.q1("SELECT detail FROM activity WHERE event='shrink_estimate'")
+        if row:
+            break
+        time.sleep(0.05)
+    assert row is not None, "the estimate never reported"
+
+    reported = json.loads(row["detail"])
+    assert reported["ok"] and reported["crf"] == 24
+    assert path.read_bytes() == before, "an estimate must not touch the file"
+    assert db.q1("SELECT COUNT(*) n FROM jobs")["n"] == 0
+    assert db.q1("SELECT shrunk, shrink_skipped FROM files WHERE path=?",
+                 (str(path),)) is None
+
+
+@needs_ffmpeg
+def test_only_one_estimate_runs_at_a_time(video_factory, settings, monkeypatch):
+    """Each one is minutes of encoding; two at once on a media server is not a
+    service anyone wants."""
+    from unfuckarr import config
+    from unfuckarr.service import Service
+
+    path = video_factory("busy.mkv", seconds=4)
+    monkeypatch.setattr(config, "get", lambda: settings)
+    monkeypatch.setattr(quality, "resolve_metric", lambda *a, **k: VMAF)
+    monkeypatch.setattr(quality, "search",
+                        lambda *a, **k: time.sleep(0.5) or good_plan())
+
+    service = Service()
+    assert service.estimate_shrink(str(path))
+    assert not service.estimate_shrink(str(path))
 
 
 # -- schema ---------------------------------------------------------------
