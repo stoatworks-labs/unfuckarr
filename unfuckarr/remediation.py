@@ -109,6 +109,20 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
 
     if warnings:
         action = policy.hygiene_action
+        if action == "transcode" and _is_disc(result):
+            # Hygiene findings on a disc image are real — a Blu-ray playlist
+            # genuinely has no language tags and no default audio track — but
+            # the cheap fix is not available. Tidying metadata on an ordinary
+            # file is a remux measured in seconds; on a 90 GB disc image it is
+            # a full conversion of the whole disc, and doing that to fix a
+            # language tag is a bad trade nobody asked for. Flag it, and let
+            # the shrink path be what converts a disc, since that at least
+            # reclaims the space to pay for the work.
+            return Decision("flag",
+                            "stream metadata needs tidying, but this is a disc "
+                            "image and rewriting one to fix tags is not worth "
+                            "the work — shrinking it would fix both",
+                            [f.code for f in warnings])
         if action != "none":
             return Decision(action, "stream metadata needs tidying",
                             [f.code for f in warnings])
@@ -118,6 +132,17 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
                         [f.code for f in oversized])
 
     return Decision("none", "file is fine")
+
+
+def _is_disc(result: CheckResult) -> bool:
+    """Whether the checked file was a disc image.
+
+    Read off the stored probe summary rather than plumbing MediaInfo into
+    `decide`, which is deliberately a pure function of the result and the
+    policy so it can be tested without a filesystem.
+    """
+    probe = result.probe or {}
+    return bool(probe.get("disc"))
 
 
 def shrink_blocked(settings: Settings) -> str | None:
@@ -131,6 +156,14 @@ def shrink_blocked(settings: Settings) -> str | None:
         return "shrinking is switched off"
     if not settings.transcode.enabled:
         return "transcoding is switched off, and a shrink is a transcode"
+    if not settings.transcode.replace_original:
+        # `replace_original` off means "leave the new file beside the old
+        # one", which for a repair is a reasonable way to keep a human in the
+        # loop. For a shrink it is self-defeating: the point is to use less
+        # space, and two copies uses more. Refuse rather than quietly ignore
+        # the setting and swap the file out anyway.
+        return ("replace_original is off, and a shrink that leaves both files "
+                "in place uses more space than it saves")
     codec = settings.shrink.codec
     profile = resolve_profile(settings.emby_compat)
     if settings.emby_compat.enabled and codec not in profile.video:

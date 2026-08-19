@@ -248,10 +248,18 @@ has run", and this project has now been wrong about that once.
 - Recycle store/restore/sweep, including two files with the same basename.
 - Path mapping, including that `/tv` does not rewrite `/tvshows`.
 - The full API surface, settings round-trip, API-key gating, and the settle timer.
+- **The quality search runs in CI**, not just locally: the runner installs the same static
+  `ffmpeg-vmaf` the image ships, so the real-media shrink and the VMAF discrimination tests
+  execute there rather than skipping. Before that, the part of the application that decides
+  whether a re-encode may replace someone's file was the one thing CI could not exercise.
 - The web UI: dashboard, files list, file drawer, and a settings round-trip driven through the
   real page in a browser, persisted to disk.
-- **The Docker image builds and runs.** CI boots it and asserts `/health`, `/api/status`, the
-  served UI and `ffmpeg -version`; the log shows the PUID/PGID drop working
+- **The Docker image builds and runs, with both ffmpegs.** CI boots it and asserts `/health`,
+  `/api/status`, the served UI, and — since 2026-08-19 — that the image really carries both
+  halves of the transcoding stack: Debian's ffmpeg 5.1.9 for encoding, the static `ffmpeg-vmaf`
+  with a working `libvmaf` filter for scoring, and the `bluray` and `subfile` protocols the disc
+  reader needs. Build-time greps prove the layer; the smoke test proves the image. Also
+  `ffmpeg -version`; the log shows the PUID/PGID drop working
   (`unfuckarr starting as unfuckarr:unfuckarr (1000:1000)`). Multi-arch amd64 + arm64 on tags.
   This is the only container proof available — there is no runtime on the dev machine.
 - That the scheduled-scan time survives a restart.
@@ -307,9 +315,6 @@ container's own ffmpeg:
   with the hardware encoder — so the timings are arithmetic, and `hevc_vaapi`'s `-qp` scale has
   never been through the search at all. Expect the first live run to want `crf_min`/`crf_max`
   adjusting for VAAPI, whose QP numbers do not mean what libx265's CRF numbers mean.
-- **`ffmpeg-vmaf` has never been in a built image.** There is no container runtime on the dev
-  machine; the Dockerfile's own grep is the only thing standing behind the claim that it lands
-  with libvmaf enabled, and that only runs in CI.
 - **No Unraid server has installed the CA template.** It is written against the CA conventions
   used elsewhere in this fleet (root `<Container version="2">`, no trailing colon on subcategory
   tokens, per-image `<Registry>` URL) and `scripts/validate_template.py` checks those in CI, but

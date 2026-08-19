@@ -176,11 +176,50 @@ def test_shrinking_wins_over_a_hygiene_flag(settings):
     assert decide(result, settings).action == "shrink"
 
 
+def test_hygiene_alone_never_rewrites_a_whole_disc(settings):
+    """A Blu-ray playlist genuinely has no language tags, and `hygiene_action`
+    is set to `transcode` on the live instance. Without this guard, deploying
+    disc support would remux every 90 GB disc in the library to fix a tag."""
+    result = run(media(size_mb=60000, raw={"color_transfer": "smpte2084"}),
+                 settings)
+    result.probe = {"disc": "bluray"}
+    result.add(Finding("hygiene", "audio_missing_language", "warning", ""))
+    settings.policy.hygiene_action = "transcode"
+
+    d = decide(result, settings)
+    assert d.action == "flag"
+    assert "disc image" in d.reason
+
+    # An ordinary file with the same finding is still remuxed.
+    ordinary = run(media(size_mb=100), settings)
+    ordinary.add(Finding("hygiene", "audio_missing_language", "warning", ""))
+    assert decide(ordinary, settings).action == "transcode"
+
+
+def test_a_disc_worth_shrinking_still_shrinks(settings):
+    """The guard above must not stop the action that does pay for itself."""
+    result = run(media(size_mb=60000), settings)     # SDR, so shrinkable
+    result.probe = {"disc": "bluray"}
+    result.add(Finding("hygiene", "audio_missing_language", "warning", ""))
+    settings.policy.hygiene_action = "transcode"
+    assert decide(result, settings).action == "shrink"
+
+
 def test_shrinking_is_blocked_when_the_target_profile_rejects_hevc(settings):
     """Shrinking into a codec the library's own profile rejects trades a size
     win for a file Emby has to transcode on every play."""
     settings.emby_compat.target_profile = "conservative"   # H.264 only
     assert "not in the target Emby profile" in (shrink_blocked(settings) or "")
+    assert decide(run(media(size_mb=30000), settings), settings).action == "flag"
+
+
+def test_shrinking_is_blocked_when_it_would_leave_both_copies(settings):
+    """`replace_original` off is a reasonable way to keep a human in the loop
+    for a repair. For a shrink it is self-defeating — two copies use more space
+    than one, which is the opposite of the point — so refuse rather than
+    quietly ignore the setting and swap the file out anyway."""
+    settings.transcode.replace_original = False
+    assert "uses more space than it saves" in (shrink_blocked(settings) or "")
     assert decide(run(media(size_mb=30000), settings), settings).action == "flag"
 
 
