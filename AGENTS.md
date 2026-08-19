@@ -188,6 +188,12 @@ Break any of these and the failure is quiet and expensive.
 - **Unraid user shares are SMB/NFS and produce no inotify events.** `WatchManager._needs_polling`
   reads `/proc/mounts` and falls back to `PollingObserver`. When it cannot tell, it polls, because
   a missed event is silent and polling only costs a stat.
+- **A trailing `-- comment` on a column line breaks `ALTER TABLE ... DROP COLUMN` on older
+  SQLite.** DROP COLUMN rewrites the stored `CREATE TABLE` text, and the comment then swallows
+  the line after the removed one: *"error in table files after drop column: incomplete input"*.
+  Newer SQLite handles it, so this passes locally and fails on the CI runner. Production never
+  drops a column — the migration only ever ADDs — so it is only ever a problem for tests that
+  synthesise an old schema, which strip the comments first.
 - **SQLite objects are per-thread.** `db.connect()` uses `threading.local`. Scan workers, transcode
   workers and the async web layer are all different threads.
 - **The event bus crosses the thread/async boundary** via `loop.call_soon_threadsafe`, with the

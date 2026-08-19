@@ -8,6 +8,7 @@ been shrunk once already. A shrink that goes ahead is the easy case.
 
 from __future__ import annotations
 
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -610,7 +611,14 @@ def test_shrink_columns_are_added_to_an_existing_database(tmp_path):
     """The live instance has a 1.0.0-shaped database with 17,000 rows in it."""
     old = tmp_path / "old.db"
     conn = sqlite3.connect(old)
-    conn.executescript(db.SCHEMA)
+    # Comments stripped before the schema is created, because SQLite's DROP
+    # COLUMN rewrites the stored CREATE TABLE text and a trailing `-- ...`
+    # then swallows the line after the one it removed: "error in table files
+    # after drop column: incomplete input". Fixed in newer SQLite, so this
+    # passes on a modern local build and fails on the CI runner's older one.
+    # Nothing in production drops a column — the migration only ever ADDs —
+    # so this is the test's problem to avoid, not the schema's.
+    conn.executescript(re.sub(r"--[^\n]*", "", db.SCHEMA))
     for column in ("shrunk", "shrunk_from", "shrink_score", "shrink_metric",
                    "shrink_skipped", "shrink_attempts"):
         conn.execute(f"ALTER TABLE files DROP COLUMN {column}")
