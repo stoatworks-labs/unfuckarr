@@ -19,8 +19,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import db, recycle, transcode
+from . import db, quality, recycle, transcode
 from .checks import CheckResult
+from .checks.compat import resolve as resolve_profile
 from .checks.integrity import looks_repairable
 from .clients.arr import ArrClient, ArrError
 from .config import Settings
@@ -29,11 +30,17 @@ from .state import bus, clear_task, set_task
 
 log = logging.getLogger(__name__)
 
-Action = str  # none | flag | transcode | repair | redownload
+Action = str  # none | flag | transcode | repair | shrink | redownload
 
 # A transcode that does not clear the finding would otherwise be repeated on
 # every scan for ever. Two goes, then the file is flagged and left alone.
 MAX_FIX_ATTEMPTS = 2
+
+# A shrink gets one attempt, not two. Nothing is wrong with the file, so a
+# failure costs nothing to leave alone — and the failure modes here (the search
+# cannot reach the target, the saving is not there) are properties of the
+# content and will be just as true next time, for another few hours of CPU.
+MAX_SHRINK_ATTEMPTS = 1
 
 
 @dataclass
@@ -41,6 +48,11 @@ class Decision:
     action: Action
     reason: str
     findings: list[str] = field(default_factory=list)
+    # Set only by an explicit request from the UI. It reopens a file the
+    # shrink search has already written off — the settings may have changed
+    # since — but it never overrides the "already shrunk once" refusal, which
+    # is about generation loss and does not become untrue.
+    force: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {"action": self.action, "reason": self.reason,
@@ -58,7 +70,12 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
 
     integrity = [f for f in errors if f.category == "integrity"]
     compat = [f for f in errors if f.category in ("compat", "emby")]
-    warnings = [f for f in result.findings if f.severity == "warning"]
+    # Efficiency findings are warnings, but they are not hygiene: a large file
+    # is not untidy metadata, and `hygiene_action` must never be what decides
+    # to re-encode one.
+    warnings = [f for f in result.findings
+                if f.severity == "warning" and f.category != "efficiency"]
+    oversized = [f for f in result.efficiency if f.severity == "warning"]
 
     if integrity:
         action = policy.corrupt_action
@@ -77,13 +94,69 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
         action = policy.incompatible_action
         return Decision(action, "Emby cannot direct play this", codes)
 
+    # Before hygiene: a shrink re-encodes the whole file and carries the
+    # hygiene fixes with it, so letting a flag-only hygiene finding answer
+    # first would mask it. When shrinking is not what happens, this falls
+    # through and hygiene decides as it always did.
+    if oversized and policy.oversize_action == "shrink":
+        blocked = shrink_blocked(settings)
+        if blocked is None:
+            return Decision("shrink",
+                            "intact and playable, but much larger than it "
+                            "needs to be",
+                            [f.code for f in oversized])
+        log.debug("not shrinking %s: %s", result.path, blocked)
+
     if warnings:
         action = policy.hygiene_action
         if action != "none":
             return Decision(action, "stream metadata needs tidying",
                             [f.code for f in warnings])
 
+    if oversized and policy.oversize_action != "none":
+        return Decision("flag", "larger than it needs to be",
+                        [f.code for f in oversized])
+
     return Decision("none", "file is fine")
+
+
+def shrink_blocked(settings: Settings) -> str | None:
+    """Why a shrink cannot go ahead, or None when it can.
+
+    Separate from ``decide`` so the settings page and the file drawer can say
+    *why* nothing is being shrunk, which is otherwise invisible: the finding is
+    raised, the policy says shrink, and nothing happens.
+    """
+    if not settings.shrink.enabled:
+        return "shrinking is switched off"
+    if not settings.transcode.enabled:
+        return "transcoding is switched off, and a shrink is a transcode"
+    codec = settings.shrink.codec
+    profile = resolve_profile(settings.emby_compat)
+    if settings.emby_compat.enabled and codec not in profile.video:
+        # Shrinking into a codec the library's own target profile rejects
+        # trades a size win for a file Emby has to transcode on every play,
+        # which the compat check would then, correctly, flag as a fault.
+        return (f"{codec} is not in the target Emby profile "
+                f"({', '.join(sorted(profile.video))}) — shrinking into it "
+                "would make the file incompatible")
+    return None
+
+
+def _window_wait(window: str) -> str | None:
+    """None when now is inside the configured shrink window."""
+    if not window:
+        return None
+    try:
+        start_s, _, end_s = window.partition("-")
+        start, end = int(start_s), int(end_s)
+    except ValueError:
+        return None
+    hour = time.localtime().tm_hour
+    inside = start <= hour < end if start < end else (hour >= start or hour < end)
+    if inside:
+        return None
+    return f"outside the {window} shrink window (it is {hour:02d}:00)"
 
 
 class Remediator:
@@ -133,6 +206,8 @@ class Remediator:
                         "message": decision.reason}
             if decision.action in ("transcode", "repair"):
                 return self._transcode(job_id, file_row, result, info, decision)
+            if decision.action == "shrink":
+                return self._shrink(job_id, file_row, result, info, decision)
             if decision.action == "redownload":
                 return self._redownload(job_id, file_row, decision.reason)
             self._set_job(job_id, "failed", 0, f"unknown action {decision.action}")
@@ -397,6 +472,329 @@ class Remediator:
             client.rescan(int(parent))
         except ArrError as exc:
             db.log("arr_rescan_failed", "warn", file_row["path"], str(exc))
+
+    # -- shrink -----------------------------------------------------------
+
+    def _shrink(self, job_id: int, file_row: dict[str, Any],
+                result: CheckResult, info: MediaInfo | None,
+                decision: Decision) -> dict[str, Any]:
+        """Re-encode an intact file to a measured quality target.
+
+        The shape is the same as ``_transcode`` — plan, run, verify, recycle,
+        replace — with two extra gates that exist only here, because here
+        nothing is wrong with the file and the only justification for touching
+        it is that the result is both smaller *and* indistinguishable:
+
+        1. the quality search must find a CRF that meets the target, and its
+           projected saving must clear ``min_saving_pct``, before a single
+           frame of the real encode is run; and
+        2. the finished file must actually be that much smaller *and* still
+           score at the target when measured against the original.
+
+        Anything short of both, the output is deleted and the original is left
+        exactly as it was. That is the normal, expected outcome for a lot of
+        files and is not a failure.
+        """
+        s = self._settings()
+        path = file_row["path"]
+
+        blocked = shrink_blocked(s)
+        if blocked is not None:
+            self._set_job(job_id, "done", 1.0, blocked)
+            return {"action": "flag", "ok": True, "message": blocked}
+
+        if file_row.get("shrunk"):
+            msg = "already shrunk once — re-encoding an encode is a second "\
+                  "generation of loss for a fraction of the saving"
+            self._set_job(job_id, "done", 1.0, msg)
+            return {"action": "flag", "ok": True, "message": msg}
+        if file_row.get("shrink_skipped") and not decision.force:
+            msg = f"already assessed and left alone: {file_row['shrink_skipped']}"
+            self._set_job(job_id, "done", 1.0, msg)
+            return {"action": "flag", "ok": True, "message": msg}
+        if decision.force:
+            db.ex("UPDATE files SET shrink_skipped=NULL, shrink_attempts=0 "
+                  "WHERE path=?", (path,))
+            file_row["shrink_skipped"] = None
+            file_row["shrink_attempts"] = 0
+        if (file_row.get("shrink_attempts") or 0) >= MAX_SHRINK_ATTEMPTS:
+            msg = "a previous shrink of this file failed — not trying again"
+            self._set_job(job_id, "done", 1.0, msg)
+            return {"action": "flag", "ok": True, "message": msg}
+
+        window = _window_wait(s.shrink.only_between_hours)
+        if window is not None:
+            # Deliberately not recorded as a skip: nothing has been decided
+            # about this file, it is simply not the right time of day.
+            self._set_job(job_id, "done", 1.0, window)
+            return {"action": "flag", "ok": True, "message": window}
+
+        if info is None:
+            try:
+                info = probe(path, s.ffprobe_path)
+            except ProbeError as exc:
+                msg = f"cannot probe: {exc}"
+                self._set_job(job_id, "failed", 0, msg)
+                return {"action": "flag", "ok": False, "message": msg}
+
+        if info.is_hdr and not s.efficiency.allow_hdr:
+            return self._skip_shrink(job_id, path,
+                                     "HDR, and allow_hdr is off")
+
+        metric = quality.resolve_metric(s.shrink, s.ffmpeg_path)
+        if metric is None:
+            # A configuration problem, not a property of the file: do not
+            # write it off permanently, because installing an ffmpeg with
+            # libvmaf should be enough to make it work on the next scan.
+            msg = ("no quality metric available — neither libvmaf nor ssim "
+                   "could be found, so there is no way to prove a re-encode "
+                   "still looks like the original")
+            self._set_job(job_id, "done", 1.0, msg)
+            db.log("shrink_no_metric", "warn", path, msg)
+            return {"action": "flag", "ok": True, "message": msg}
+
+        cancel = threading.Event()
+        self._cancel[path] = cancel
+        sema = self._semaphore(max(1, s.transcode.max_concurrent))
+        title = file_row.get("title") or Path(path).name
+
+        with sema:
+            self._set_job(job_id, "running", 0.0,
+                          f"measuring how far {metric.name.upper()} allows")
+            set_task(f"remediate:{path}", kind="analysing", path=path,
+                     title=title, progress=-1, started=time.time(),
+                     detail=f"searching CRF {s.shrink.crf_min}–{s.shrink.crf_max} "
+                            f"for {metric.name.upper()} {metric.target:g}")
+            db.log("shrink_search_started", "info", path, {
+                "metric": metric.name, "target": metric.target,
+                "size": info.size,
+            })
+
+            qplan = quality.search(info, s.shrink, s.transcode,
+                                   ffmpeg=s.ffmpeg_path, metric=metric,
+                                   cancel=cancel)
+            if not qplan.ok:
+                self._cancel.pop(path, None)
+                if cancel.is_set():
+                    self._set_job(job_id, "cancelled", 0, "cancelled")
+                    return {"action": "flag", "ok": False, "message": "cancelled"}
+                db.log("shrink_declined", "info", path, qplan.as_dict())
+                return self._skip_shrink(job_id, path, qplan.reason)
+
+            if qplan.saving_pct < s.shrink.min_saving_pct:
+                self._cancel.pop(path, None)
+                reason = (
+                    f"only about {qplan.saving_pct:.0f}% smaller at "
+                    f"{metric.name.upper()} {metric.target:g} "
+                    f"({quality.human_size(info.size)} → "
+                    f"{quality.human_size(qplan.projected_size)}), "
+                    f"under the {s.shrink.min_saving_pct:g}% worth re-encoding for"
+                )
+                db.log("shrink_declined", "info", path,
+                       {**qplan.as_dict(), "reason": reason})
+                return self._skip_shrink(job_id, path, reason)
+
+            # ffmpeg is rewriting every byte of this file anyway, so the
+            # hygiene tidying rides along for free rather than being left for
+            # a second full pass later.
+            codes = {f.code for f in result.findings}
+            default_audio = None
+            if "no_default_audio" in codes and info.audio:
+                best = max(info.audio, key=lambda a: (a.channels, -a.index))
+                default_audio = info.audio.index(best)
+            plan = transcode.TranscodePlan(
+                reason="shrink",
+                video_action="encode",
+                audio_action="copy",
+                container=s.transcode.container,
+                codec=qplan.codec,
+                crf=qplan.crf,
+                pix_fmt=quality.pix_fmt_for(info),
+                is_shrink=True,
+                faststart=s.transcode.container == "mp4",
+                drop_subtitles=transcode._subtitles_to_drop(
+                    info, s.transcode.container),
+                fix_language_tags=bool(codes & {"audio_missing_language",
+                                                "subtitle_missing_language"}),
+                set_default_audio=default_audio,
+            )
+            dst = transcode.output_path(path, plan.container)
+            if not transcode.free_space_ok(dst, qplan.projected_size):
+                self._cancel.pop(path, None)
+                msg = "not enough free space for the output"
+                self._set_job(job_id, "failed", 0, msg)
+                db.log("shrink_skipped", "warn", path, msg)
+                return {"action": "flag", "ok": False, "message": msg}
+
+            cmd = transcode.build_command(path, dst, info, plan, s.transcode,
+                                          ffmpeg=s.ffmpeg_path)
+            self._set_job(job_id, "running", 0.0, plan.describe)
+            set_task(f"remediate:{path}", kind="shrinking", detail=plan.describe,
+                     progress=0.0)
+            db.log("shrink_started", "info", path, {
+                "plan": plan.describe, **qplan.as_dict(),
+            })
+
+            def on_progress(frac: float, eta: float | None) -> None:
+                set_task(f"remediate:{path}", progress=frac, eta=eta)
+                db.ex("UPDATE jobs SET progress=? WHERE id=?", (frac, job_id))
+
+            ok, message = transcode.run(
+                cmd, info.duration, on_progress=on_progress,
+                stall_timeout=s.transcode.stall_timeout_seconds,
+                nice_level=s.transcode.nice_level, cancel=cancel,
+            )
+            self._cancel.pop(path, None)
+
+        if not ok:
+            Path(dst).unlink(missing_ok=True)
+            self._set_job(job_id, "failed", 0, message, error=message)
+            detail: dict[str, Any] = {"message": message}
+            if not cancel.is_set():
+                detail["attempts"] = self._count_shrink_attempt(path, file_row)
+            db.log("shrink_failed", "error", path, detail)
+            return {"action": "flag", "ok": False, "message": message}
+
+        # The same structural verification a repair gets: the streams have to
+        # still be there and the duration has to match.
+        bad = self._verify_output(dst, info, s)
+        if bad is not None:
+            Path(dst).unlink(missing_ok=True)
+            self._set_job(job_id, "failed", 0, f"output failed verification: {bad}")
+            db.log("shrink_output_bad", "error", path, {
+                "message": bad, "attempts": self._count_shrink_attempt(path, file_row),
+            })
+            return {"action": "flag", "ok": False, "message": bad}
+
+        try:
+            new_size = os.path.getsize(dst)
+        except OSError as exc:
+            Path(dst).unlink(missing_ok=True)
+            self._set_job(job_id, "failed", 0, str(exc), error=str(exc))
+            return {"action": "flag", "ok": False, "message": str(exc)}
+
+        realised = (1 - new_size / info.size) * 100 if info.size else 0.0
+        if realised < s.shrink.min_saving_pct:
+            # The projection came from short samples; rate control over two
+            # hours does not have to agree with it. When it does not, the
+            # original wins — there is nothing wrong with it.
+            Path(dst).unlink(missing_ok=True)
+            reason = (f"finished only {realised:.0f}% smaller "
+                      f"({quality.human_size(info.size)} → "
+                      f"{quality.human_size(new_size)}), against a projected "
+                      f"{qplan.saving_pct:.0f}% — original kept")
+            db.log("shrink_declined", "warn", path,
+                   {**qplan.as_dict(), "realised_pct": round(realised, 1),
+                    "reason": reason})
+            return self._skip_shrink(job_id, path, reason)
+
+        set_task(f"remediate:{path}", kind="analysing", progress=-1,
+                 detail="checking the result against the original")
+        try:
+            mean, worst = quality.verify(info.source, dst, info, s.shrink,
+                                         metric, cancel=cancel)
+        except quality.QualityError as exc:
+            # Unable to prove the output is good is not the same as knowing it
+            # is bad, but it is not a licence to replace the original either.
+            Path(dst).unlink(missing_ok=True)
+            msg = f"could not verify the result: {exc}"
+            self._set_job(job_id, "failed", 0, msg, error=msg)
+            db.log("shrink_output_bad", "error", path, {
+                "message": msg, "attempts": self._count_shrink_attempt(path, file_row),
+            })
+            return {"action": "flag", "ok": False, "message": msg}
+
+        if mean < metric.target or worst < metric.target - metric.tolerance:
+            Path(dst).unlink(missing_ok=True)
+            reason = (f"finished file measured {metric.name.upper()} "
+                      f"{mean:.1f} (worst sample {worst:.1f}) against a target "
+                      f"of {metric.target:g} — original kept")
+            db.log("shrink_declined", "warn", path,
+                   {**qplan.as_dict(), "measured": round(mean, 2),
+                    "worst": round(worst, 2), "reason": reason})
+            return self._skip_shrink(job_id, path, reason)
+
+        # Only now is the original allowed to go.
+        try:
+            recycled = recycle.store(
+                path, f"replaced by shrink ({plan.describe}, "
+                      f"{metric.name.upper()} {mean:.1f})",
+                s.policy.recycle_bin_path, s.policy.recycle_bin_days)
+        except OSError as exc:
+            Path(dst).unlink(missing_ok=True)
+            msg = f"could not recycle the original: {exc}"
+            self._set_job(job_id, "failed", 0, msg, error=msg)
+            return {"action": "flag", "ok": False, "message": msg}
+
+        try:
+            final = transcode.replace(path, dst)
+        except OSError as exc:
+            self._restore_original(path, recycled)
+            msg = f"output disappeared before it could replace the original: {exc}"
+            self._set_job(job_id, "failed", 0, msg, error=msg)
+            return {"action": "flag", "ok": False, "message": msg}
+
+        self._move_db_row(path, final)
+        # Written before the re-check, so that the re-check — and every scan
+        # after it — already knows this file is finished with.
+        db.ex("UPDATE files SET shrunk=?, shrunk_from=?, shrink_score=?, "
+              "shrink_metric=?, shrink_skipped=NULL WHERE path=?",
+              (time.time(), info.size, mean, metric.name, final))
+        self._notify_arr_rescan(file_row)
+        self._recheck_after_shrink(final, file_row)
+
+        saved = info.size - new_size
+        summary = (f"{quality.human_size(info.size)} → "
+                   f"{quality.human_size(new_size)} "
+                   f"({realised:.0f}% smaller), {metric.name.upper()} "
+                   f"{mean:.1f} at CRF {qplan.crf}")
+        self._set_job(job_id, "done", 1.0, summary)
+        db.log("shrink_done", "info", final, {
+            "from": path, "saved": saved, "realised_pct": round(realised, 1),
+            "crf": qplan.crf, "metric": metric.name, "score": round(mean, 2),
+            "worst": round(worst, 2), "estimated_metric": metric.is_estimate,
+            "search_seconds": round(qplan.seconds),
+        })
+        return {"action": "shrink", "ok": True, "path": final,
+                "saved": saved, "message": summary}
+
+    def _skip_shrink(self, job_id: int, path: str, reason: str) -> dict[str, Any]:
+        """Record, permanently, that this file is not worth shrinking.
+
+        Permanent because the reasons are properties of the content — this
+        much grain does not compress, this file is already efficient — and
+        they will be just as true on the next scan, after another few hours of
+        CPU spent finding that out again.
+        """
+        db.ex("UPDATE files SET shrink_skipped=? WHERE path=?", (reason, path))
+        self._set_job(job_id, "done", 1.0, reason)
+        return {"action": "flag", "ok": True, "message": reason}
+
+    def _count_shrink_attempt(self, path: str, file_row: dict[str, Any]) -> int:
+        attempts = (file_row.get("shrink_attempts") or 0) + 1
+        file_row["shrink_attempts"] = attempts
+        db.ex("UPDATE files SET shrink_attempts=? WHERE path=?", (attempts, path))
+        return attempts
+
+    def _recheck_after_shrink(self, final: str, file_row: dict[str, Any]) -> None:
+        """Re-check the replacement so the UI is not left showing 'unknown'.
+
+        Unlike ``_confirm_fixed`` there is nothing here to confirm — the
+        quality and the saving were both measured before the swap, and the
+        `shrunk` marker already guarantees the file is never revisited. This
+        exists purely so the file list is honest immediately afterwards.
+        """
+        from .scanner import check_file, persist_result
+
+        s = self._settings()
+        try:
+            result, info = check_file(
+                final, s, expected_runtime=file_row.get("expected_runtime"),
+                already_shrunk=True)
+            stat = os.stat(final)
+            persist_result(final, result, info, stat.st_size, stat.st_mtime)
+        except Exception as exc:  # noqa: BLE001 - never fail the job over this
+            log.warning("post-shrink check failed for %s: %s", final, exc)
 
     # -- redownload -------------------------------------------------------
 

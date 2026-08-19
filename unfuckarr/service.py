@@ -8,15 +8,17 @@ running" has exactly one answer.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
-from . import config, db, recycle
+from . import config, db, quality, recycle, transcode
 from .clients.arr import ArrClient, ArrError
 from .clients.emby import EmbyClient, EmbyError
 from .config import Settings, WatchFolder
+from .probe import probe
 from .remediation import Remediator, decide
 from .scanner import Scanner, check_file, persist_result
 from .state import bus, clear_task, set_task, state
@@ -35,6 +37,7 @@ class Service:
         self._sched_stop = threading.Event()
         self._sched_thread: threading.Thread | None = None
         self._watch_pool = threading.Semaphore(2)
+        self._estimate_lock = threading.Lock()
 
     # -- lifecycle --------------------------------------------------------
 
@@ -42,6 +45,7 @@ class Service:
         db.init()
         config.load()
         self._restore_last_scan()
+        self._reconcile_interrupted_work()
         self.watcher.start()
         self._sched_stop.clear()
         self._sched_thread = threading.Thread(target=self._scheduler, daemon=True,
@@ -60,6 +64,49 @@ class Service:
         if self._sched_thread is not None:
             self._sched_thread.join(timeout=5)
         db.log("service_stopped", "info")
+
+    def _reconcile_interrupted_work(self) -> None:
+        """Clear up after a transcode that was killed part-way.
+
+        Nothing can be in flight at startup — the process has only just begun —
+        so any job still marked running, and any ``*.unfuckarr.*`` left beside
+        a known media file, is a leftover by definition. That is a safe rule
+        and it needs to exist: `is_temp_output` deliberately makes the scanner
+        and the watcher ignore these files, which stops them being acted on and
+        equally stops anyone noticing them. Live, four had accumulated to
+        **199 GB** inside the library, and Emby had indexed each as a separate
+        film and pulled artwork for it.
+        """
+        stale = db.q("SELECT id, kind, path FROM jobs WHERE state IN "
+                     "('running','queued')")
+        for job in stale:
+            db.ex("UPDATE jobs SET state='failed', finished=?, error=? WHERE id=?",
+                  (time.time(), "interrupted by a restart", job["id"]))
+        if stale:
+            db.log("jobs_reconciled", "warn",
+                   detail={"interrupted": len(stale),
+                           "paths": [j["path"] for j in stale if j["path"]][:10]})
+
+        def sweep() -> None:
+            paths = [r["path"] for r in db.q("SELECT path FROM files")]
+            leftovers = transcode.abandoned_outputs(paths)
+            freed = 0
+            for path in leftovers:
+                try:
+                    freed += os.path.getsize(path)
+                    os.unlink(path)
+                except OSError as exc:
+                    log.warning("could not remove leftover %s: %s", path, exc)
+            if leftovers:
+                db.log("abandoned_outputs_removed", "warn", detail={
+                    "count": len(leftovers), "bytes": freed,
+                    "paths": leftovers[:10],
+                })
+
+        # On a background thread: it is a listdir per media directory, and a
+        # slow array must not hold up the web server coming back.
+        threading.Thread(target=sweep, daemon=True,
+                         name="unfuckarr-leftovers").start()
 
     def _restore_last_scan(self) -> None:
         """Carry the last scan time across a restart.
@@ -201,9 +248,9 @@ class Service:
         record = ({k: row[k] for k in row.keys()} if row
                   else {"path": path, "source": "folder", "title": Path(path).name})
         emby = EmbyClient(s.emby) if s.emby.enabled else None
-        result, info = check_file(path, s,
-                                  expected_runtime=record.get("expected_runtime"),
-                                  emby=emby)
+        result, info = check_file(
+            path, s, expected_runtime=record.get("expected_runtime"), emby=emby,
+            already_shrunk=bool(record.get("shrunk") or record.get("shrink_skipped")))
         try:
             stat = Path(path).stat()
             persist_result(path, result, info, stat.st_size, stat.st_mtime)
@@ -225,12 +272,59 @@ class Service:
         if row is None:
             raise FileNotFoundError(path)
         record = {k: row[k] for k in row.keys()}
-        result, info = check_file(path, s,
-                                  expected_runtime=record.get("expected_runtime"))
+        result, info = check_file(
+            path, s, expected_runtime=record.get("expected_runtime"),
+            # An explicit request should see the file as it is, not as the
+            # shrink bookkeeping has already labelled it.
+            already_shrunk=action != "shrink" and bool(record.get("shrunk")))
         return self.remediator.apply(
             record, result, info,
-            Decision(action, f"{action} requested from the web UI"),
+            Decision(action, f"{action} requested from the web UI", force=True),
         )
+
+    def estimate_shrink(self, path: str) -> bool:
+        """Measure what a shrink would save, and change nothing.
+
+        This is the honest answer to "what would automatic shrinking do to my
+        library" — it runs the same search the real action runs, on one file,
+        and reports the CRF, the score and the projected saving without
+        encoding anything. It costs the same minutes the search always costs,
+        so it runs on a background thread and reports through the event
+        stream rather than holding an HTTP request open for them.
+        """
+        if not self._estimate_lock.acquire(blocking=False):
+            return False
+
+        def run() -> None:
+            s = config.get()
+            key = f"estimate:{path}"
+            try:
+                set_task(key, kind="analysing", path=path,
+                         title=Path(path).name, progress=-1,
+                         started=time.time(), detail="measuring a shrink")
+                info = probe(path, s.ffprobe_path)
+                metric = quality.resolve_metric(s.shrink, s.ffmpeg_path)
+                if metric is None:
+                    payload = {"path": path, "ok": False,
+                               "reason": "no quality metric available — "
+                                         "neither libvmaf nor ssim was found"}
+                else:
+                    plan = quality.search(info, s.shrink, s.transcode,
+                                          ffmpeg=s.ffmpeg_path, metric=metric)
+                    payload = {"path": path, **plan.as_dict()}
+                db.log("shrink_estimate", "info", path, payload)
+            except Exception as exc:  # noqa: BLE001 - a worker must not die
+                log.exception("shrink estimate failed for %s", path)
+                payload = {"path": path, "ok": False, "reason": str(exc)}
+                db.log("shrink_estimate", "warn", path, payload)
+            finally:
+                clear_task(key)
+                self._estimate_lock.release()
+            bus.publish("shrink_estimate", payload)
+
+        threading.Thread(target=run, daemon=True,
+                         name="unfuckarr-estimate").start()
+        return True
 
     # -- service health ---------------------------------------------------
 

@@ -22,6 +22,7 @@ from typing import Any, Iterable
 from . import db, recycle, transcode
 from .checks import CheckResult, Finding
 from .checks import compat as compat_checks
+from .checks import efficiency as efficiency_checks
 from .checks import hygiene as hygiene_checks
 from .checks import integrity as integrity_checks
 from .clients.arr import ArrClient, ArrError
@@ -134,7 +135,8 @@ def sync_inventory(rows: list[dict[str, Any]]) -> tuple[int, int]:
 # -- per-file check -------------------------------------------------------
 
 def check_file(path: str, s: Settings, expected_runtime: int | None = None,
-               emby: EmbyClient | None = None) -> tuple[CheckResult, MediaInfo | None]:
+               emby: EmbyClient | None = None,
+               already_shrunk: bool = False) -> tuple[CheckResult, MediaInfo | None]:
     """Run every enabled check against one file."""
     result, info = integrity_checks.check(
         path, s.integrity, ffprobe=s.ffprobe_path, ffmpeg=s.ffmpeg_path,
@@ -161,6 +163,8 @@ def check_file(path: str, s: Settings, expected_runtime: int | None = None,
         compat_checks.check(info, s.emby_compat, result)
 
     hygiene_checks.check(info, s.hygiene, result)
+    efficiency_checks.check(info, s.efficiency, result,
+                            already_shrunk=already_shrunk)
     return result, info
 
 
@@ -312,7 +316,8 @@ class Scanner:
                  if state.scan.total else -1)
         try:
             result, info = check_file(
-                path, s, expected_runtime=row["expected_runtime"], emby=emby)
+                path, s, expected_runtime=row["expected_runtime"], emby=emby,
+                already_shrunk=bool(row["shrunk"] or row["shrink_skipped"]))
         except ProbeError as exc:
             result, info = CheckResult(path=path, error=str(exc)), None
         except Exception as exc:  # noqa: BLE001
@@ -346,6 +351,13 @@ class Scanner:
         # re-queues every known-bad file, so the pass after a scan that found
         # real problems consists of almost nothing else, the ratio reads 100%,
         # and the scan aborts for ever without touching a thing.
+        # `shrink` is deliberately not in this list. The brake exists to
+        # notice a library that has just broken, and "most of this library is
+        # large" is not that: an unmounted array produces integrity failures,
+        # and a file ffprobe cannot read never reaches the efficiency check at
+        # all. Counting shrinks here would also trip the brake permanently on
+        # any library that is mostly H.264 — which is most libraries. Shrinks
+        # have their own, much smaller cap below instead.
         denominator = max(1, population or state.scan.checked)
         destructive = [p for p in pending
                        if p[3].action in ("redownload", "transcode", "repair")]
@@ -362,24 +374,41 @@ class Scanner:
             return {"aborted": state.scan.aborted, "flagged": len(pending)}
 
         applied = 0
-        for row, result, info, decision in pending:
+        shrinks = 0
+        capped_shrinks = False
+        # Repairs first, shrinks last. A broken file is urgent and a remux
+        # takes seconds; a large file is neither urgent nor cheap, and one
+        # multi-hour shrink must never consume the pass that a corrupt file is
+        # waiting on.
+        ordered = sorted(pending, key=lambda p: p[3].action == "shrink")
+        for row, result, info, decision in ordered:
             if self._stop:
                 break
-            if decision.action != "flag" and applied >= s.policy.max_actions_per_scan:
+            if decision.action == "shrink":
+                if shrinks >= s.policy.max_shrinks_per_scan:
+                    if not capped_shrinks:
+                        db.log("shrink_cap_reached", "info", row["path"],
+                               {"cap": s.policy.max_shrinks_per_scan})
+                        capped_shrinks = True
+                    continue
+            elif decision.action != "flag" and applied >= s.policy.max_actions_per_scan:
                 db.log("action_cap_reached", "warn", row["path"],
                        {"cap": s.policy.max_actions_per_scan})
                 break
             outcome = self.remediator.apply(row, result, info, decision)
-            if decision.action != "flag":
+            if decision.action == "shrink":
+                shrinks += 1
+            elif decision.action != "flag":
                 applied += 1
-                state.scan.actions = applied
+            if decision.action != "flag":
+                state.scan.actions = applied + shrinks
                 publish_scan()
             bus.publish("remediated", {"path": row["path"], **outcome})
 
-        recycle.sweep(s.policy.recycle_bin_days)
+        recycle.sweep(s.policy.recycle_bin_days, s.policy.recycle_bin_path)
         db.log("scan_finished", "info", detail={
             "checked": state.scan.checked, "failed": state.scan.failed,
-            "actions": applied,
+            "actions": applied, "shrinks": shrinks,
         })
         return {"checked": state.scan.checked, "failed": state.scan.failed,
-                "actions": applied}
+                "actions": applied, "shrinks": shrinks}

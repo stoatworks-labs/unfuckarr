@@ -97,6 +97,59 @@ def test_browse_rejects_a_non_directory(client, tmp_path):
     assert client.get(f"/api/browse?path={p}").status_code == 404
 
 
+def test_shrink_settings_round_trip(client):
+    body = client.get("/api/settings").json()
+    body["shrink"]["quality"] = "excellent"
+    body["shrink"]["only_between_hours"] = "22-06"
+    body["efficiency"]["target_mbps"] = {"2160": 30.0, "1080": 9.0}
+    body["policy"]["oversize_action"] = "flag"
+    assert client.put("/api/settings", json=body).status_code == 200
+    assert config.get().shrink.quality == "excellent"
+    assert config.get().efficiency.target_mbps["1080"] == 9.0
+    assert config.get().policy.oversize_action == "flag"
+
+
+def test_a_malformed_shrink_window_is_rejected(client):
+    """"22:00-06:00" is the obvious thing to type and would silently never
+    match, so it has to fail loudly at the settings page instead."""
+    body = client.get("/api/settings").json()
+    body["shrink"]["only_between_hours"] = "10pm-6am"
+    assert client.put("/api/settings", json=body).status_code == 422
+
+
+def test_status_reports_what_shrinking_has_saved(client):
+    db.ex("INSERT INTO files (path, library, status, size, shrunk, shrunk_from, "
+          "shrink_score, shrink_metric) VALUES (?,?,?,?,?,?,?,?)",
+          ("/media/a.mkv", "Movies", "ok", 1_000, 123.0, 4_000, 96.0, "vmaf"))
+    db.ex("INSERT INTO files (path, library, status, shrink_skipped) "
+          "VALUES (?,?,?,?)", ("/media/b.mkv", "Movies", "ok", "already efficient"))
+
+    sh = client.get("/api/status").json()["shrink"]
+    assert sh["files"] == 1 and sh["saved"] == 3_000
+    assert sh["assessed_and_left"] == 1
+    assert sh["action"] == "shrink"
+
+
+def test_status_says_why_nothing_is_being_shrunk(client):
+    """Otherwise it is invisible: the finding is raised, the policy says
+    shrink, and nothing happens."""
+    s = config.get()
+    s.emby_compat.target_profile = "conservative"      # H.264 only
+    assert "not in the target Emby profile" in \
+        client.get("/api/status").json()["shrink"]["blocked"]
+
+
+def test_shrink_estimate_needs_a_file_on_disk(client):
+    r = client.post("/api/shrink/estimate?path=/media/gone.mkv")
+    assert r.status_code == 404
+
+
+def test_shrink_is_an_action_the_api_accepts(client):
+    """A 404 for the unknown *file* means the action itself got through."""
+    r = client.post("/api/files/action?path=/media/x.mkv&action=shrink")
+    assert r.status_code == 404
+
+
 def test_unknown_action_is_rejected(client):
     r = client.post("/api/files/action?path=/x.mkv&action=rm-rf")
     assert r.status_code == 400

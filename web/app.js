@@ -94,7 +94,8 @@ function toast(msg, kind = '') {
 
 const STATUS_LABEL = {
   ok: 'OK', corrupt: 'Corrupt', incompatible: 'Incompatible',
-  hygiene: 'Needs tidying', missing: 'Awaiting replacement',
+  hygiene: 'Needs tidying', oversized: 'Larger than needed',
+  missing: 'Awaiting replacement',
   unknown: 'Not checked', error: 'Check failed',
 };
 
@@ -157,6 +158,9 @@ function handleEvent(event, data) {
       toast(`${data.action}: ${basename(data.path)} — ${data.message || ''}`,
         data.ok ? 'ok' : 'bad');
       scheduleRefresh();
+      break;
+    case 'shrink_estimate':
+      showShrinkEstimate(data);
       break;
     case 'job':
       if (ROUTE === '/activity') scheduleRefresh(1500);
@@ -274,6 +278,7 @@ function viewDashboard() {
     ['bad', c.corrupt || 0, 'Corrupt'],
     ['warn', c.incompatible || 0, 'Incompatible'],
     ['info', c.hygiene || 0, 'Needs tidying'],
+    ['', c.oversized || 0, 'Larger than needed'],
     ['', (c.unknown || 0) + (c.error || 0), 'Not checked'],
   ];
   v.append(el('div', { class: 'grid grid-stats' },
@@ -281,17 +286,51 @@ function viewDashboard() {
       el('div', {
         class: `stat ${kind}`, style: 'cursor:pointer',
         onclick: () => {
-          const map = { Corrupt: 'corrupt', Incompatible: 'incompatible', 'Needs tidying': 'hygiene', Playable: 'ok' };
+          const map = {
+            Corrupt: 'corrupt', Incompatible: 'incompatible',
+            'Needs tidying': 'hygiene', 'Larger than needed': 'oversized',
+            Playable: 'ok',
+          };
           location.hash = `#/files${map[label] ? `?status=${map[label]}` : ''}`;
         },
       },
         el('div', { class: 'n' }, n.toLocaleString()),
         el('div', { class: 'l' }, label)))));
 
+  // `append` on a real node stringifies null, so the "nothing to say yet"
+  // case has to be dropped here rather than returned into it.
+  const shrinkLine = buildShrinkLine();
+  if (shrinkLine) v.append(shrinkLine);
+
   v.append(el('div', { class: 'grid grid-2' },
     buildLibrariesCard(), buildServicesCard()));
 
   v.append(buildRecentCard());
+}
+
+function buildShrinkLine() {
+  const sh = STATUS.shrink;
+  if (!sh) return null;
+  if (sh.blocked) {
+    return el('div', { class: 'card' },
+      el('div', { class: 'muted small' },
+        `Space saving is idle: ${sh.blocked}`));
+  }
+  if (!sh.files && !sh.assessed_and_left) return null;
+  const parts = [];
+  if (sh.files) {
+    parts.push(`${sh.files.toLocaleString()} file${sh.files === 1 ? '' : 's'} shrunk, `
+      + `${bytes(sh.saved)} reclaimed`);
+  }
+  if (sh.assessed_and_left) {
+    parts.push(`${sh.assessed_and_left.toLocaleString()} measured and left alone`);
+  }
+  if (sh.metric) {
+    parts.push(`measuring with ${sh.metric.toUpperCase()} at ${sh.target}`
+      + (sh.metric_is_estimate ? ' (an SSIM approximation \u2014 no libvmaf found)' : ''));
+  }
+  return el('div', { class: 'card' },
+    el('div', { class: 'muted small' }, parts.join(' \u00b7 ')));
 }
 
 function buildLibrariesCard() {
@@ -316,8 +355,9 @@ function buildLibrariesCard() {
         l.corrupt ? el('span', { class: 'pill pill-corrupt', style: 'margin-right:4px' }, `${l.corrupt} corrupt`) : null,
         l.incompatible ? el('span', { class: 'pill pill-incompatible', style: 'margin-right:4px' }, `${l.incompatible} incompatible`) : null,
         l.hygiene ? el('span', { class: 'pill pill-hygiene', style: 'margin-right:4px' }, `${l.hygiene} tidy`) : null,
+        l.oversized ? el('span', { class: 'pill pill-oversized', style: 'margin-right:4px' }, `${l.oversized} oversized`) : null,
         l.missing ? el('span', { class: 'pill pill-missing', style: 'margin-right:4px' }, `${l.missing} replacing`) : null,
-        (!l.corrupt && !l.incompatible && !l.hygiene && !l.missing)
+        (!l.corrupt && !l.incompatible && !l.hygiene && !l.oversized && !l.missing)
           ? el('span', { class: 'muted small' }, 'none') : null),
       el('td', {}, el('button', {
         class: 'btn btn-sm',
@@ -358,8 +398,15 @@ function buildServicesCard() {
   }
   const rb = STATUS.recycle || {};
   card.append(el('div', { class: 'small muted', style: 'margin-top:10px' },
-    `Recycle bin: ${rb.count || 0} file(s), ${bytes(rb.bytes)} — `,
+    `Recycle bin: ${rb.count || 0} file(s), ${bytes(rb.bytes)} in ${rb.path || '—'}`
+    + `${rb.free ? `, ${bytes(rb.free)} free` : ''} — `,
     el('a', { href: '#/recycle' }, 'review')));
+  if (rb.path && rb.writable === false) {
+    // The first delete is the worst possible moment to discover this.
+    card.append(el('div', { class: 'small sev-warning', style: 'margin-top:4px' },
+      `${rb.path} is not writable — nothing can be recycled, so nothing will be `
+      + 'deleted or replaced either. Check the volume mapping.'));
+  }
   return card;
 }
 
@@ -401,7 +448,7 @@ function viewFiles() {
   if (params.get('status')) filesQuery.status = params.get('status');
 
   const statusSel = el('select', { onchange: (e) => { filesQuery.status = e.target.value; filesQuery.offset = 0; loadFiles(); } },
-    ...['all', 'corrupt', 'incompatible', 'hygiene', 'missing', 'error', 'unknown', 'ok']
+    ...['all', 'corrupt', 'incompatible', 'hygiene', 'oversized', 'missing', 'error', 'unknown', 'ok']
       .map((s) => el('option', { value: s, selected: filesQuery.status === s },
         s === 'all' ? 'All statuses' : (STATUS_LABEL[s] || s))));
 
@@ -510,6 +557,19 @@ async function openDrawer(path) {
 
   body.append(el('div', { class: 'path', style: 'margin-bottom:14px' }, f.path));
 
+  if (f.shrunk) {
+    const saved = (f.shrunk_from || 0) - (f.size || 0);
+    body.append(el('div', { class: 'hint', style: 'margin-bottom:14px' },
+      `Shrunk ${ago(f.shrunk)}: ${bytes(f.shrunk_from)} \u2192 ${bytes(f.size)} `
+      + `(${bytes(saved)} saved), measured `
+      + `${(f.shrink_metric || '').toUpperCase()} ${Number(f.shrink_score || 0).toFixed(1)}. `
+      + 'It will not be shrunk again \u2014 re-encoding an encode is a second '
+      + 'generation of loss for a fraction of the saving.'));
+  } else if (f.shrink_skipped) {
+    body.append(el('div', { class: 'hint', style: 'margin-bottom:14px' },
+      `Assessed for shrinking and left alone: ${f.shrink_skipped}`));
+  }
+
   const findings = (f.last_result?.findings || []);
   if (findings.length) {
     body.append(el('h3', {}, 'Findings'));
@@ -552,6 +612,26 @@ async function openDrawer(path) {
     el('button', { class: 'btn', onclick: () => fileAction(path, 'repair') }, 'Remux / repair'),
     el('button', { class: 'btn', onclick: () => fileAction(path, 'transcode') }, 'Transcode'),
     el('button', {
+      class: 'btn',
+      onclick: async () => {
+        try {
+          await api(`/shrink/estimate?path=${encodeURIComponent(path)}`, { method: 'POST' });
+          toast('Measuring what a shrink would save. This takes a few minutes; '
+            + 'the result appears here and in Activity.', 'ok');
+        } catch (e) { toast(e.message, 'bad'); }
+      },
+    }, 'Estimate shrink'),
+    el('button', {
+      class: 'btn',
+      onclick: () => {
+        if (!confirm(`Re-encode ${basename(path)} to save space?\n\n`
+          + 'The quality search runs first and nothing is replaced unless the '
+          + 'result is both meaningfully smaller and still measures at the '
+          + 'target. The original goes to the recycle bin.')) return;
+        fileAction(path, 'shrink');
+      },
+    }, 'Shrink'),
+    el('button', {
       class: 'btn btn-danger',
       onclick: () => {
         if (!confirm(`Delete ${basename(path)} and ask the *arr for a replacement?\n\nThe file goes to the recycle bin first.`)) return;
@@ -590,6 +670,18 @@ async function fileAction(path, action) {
   } catch (err) {
     toast(err.message, 'bad');
   }
+}
+
+function showShrinkEstimate(d) {
+  if (!d) return;
+  if (!d.ok) {
+    toast(`Shrink estimate for ${basename(d.path)}: ${d.reason}`, 'bad');
+    return;
+  }
+  toast(`Shrink estimate for ${basename(d.path)}: CRF ${d.crf} at `
+    + `${d.metric.toUpperCase()} ${d.score} would save about ${d.saving_pct}% `
+    + `(${bytes(d.source_size)} \u2192 ${bytes(d.projected_size)}).`, 'ok');
+  if (ROUTE === '/activity') scheduleRefresh(500);
 }
 
 function closeDrawer() {
@@ -667,7 +759,8 @@ async function viewRecycle() {
         },
       }, 'Empty now')),
     el('div', { class: 'muted small', style: 'margin-bottom:12px' },
-      'Files deleted by unfuckarr are kept here until the retention window in Settings expires, so an automatic decision can be undone.'),
+      'Files deleted by unfuckarr are kept here until the retention window in Settings expires, so an automatic decision can be undone. '
+      + `Currently ${(STATUS && STATUS.recycle && STATUS.recycle.path) || 'unknown'}.`),
     el('div', { id: 'recBody', class: 'empty' }, 'Loading…'));
   v.append(card);
 
@@ -709,7 +802,19 @@ const FIELD_HELP = {
   'policy.incompatible_action': 'What to do with an intact file Emby would have to transcode.',
   'policy.hygiene_action': 'What to do about missing language tags, default-track flags and similar. These never justify deleting a file.',
   'policy.recycle_bin_days': 'Deleted files are kept this long so an automatic decision can be undone. 0 deletes immediately.',
-  'policy.max_actions_per_scan': 'Hard cap on how many files one scan may transcode or delete.',
+  'policy.recycle_bin_path': 'Where deleted and replaced files are kept. Point it at a path INSIDE your media mount and on the same share \u2014 e.g. /media/.recycle. Then recycling is a rename and costs nothing; anywhere else it is a full copy of every file, and on Unraid the default (/config/recycle) is appdata on the cache, which a handful of 40 GB remuxes will fill. Usually set by UNFUCKARR_RECYCLE_BIN_PATH alongside the volume mappings.',
+  'policy.oversize_action': 'What to do with a file that is intact and playable but far larger than it needs to be. This can never delete: the worst it can do is re-encode, and only when a measured quality check says the result is indistinguishable.',
+  'policy.max_actions_per_scan': 'Hard cap on how many files one scan may transcode or delete. Shrinks are counted separately, below.',
+  'policy.max_shrinks_per_scan': 'Shrinks have their own, much smaller cap. One shrink is a quality search plus a full re-encode — hours, not the seconds a remux takes — and nothing is broken while a large file waits for the next scan.',
+  'efficiency.target_mbps': 'Video bitrate, in Mbps, above which a file of a given height is worth looking at. Keyed by height; the largest entry at or below the file\u2019s height wins. Generous on purpose — the target is the 40 Mbps remux, not a well-encoded 8 Mbps 1080p.',
+  'efficiency.codec_bitrate_ratio': 'A file in an inefficient codec is a candidate once it passes this fraction of its height\u2019s target, rather than the whole target.',
+  'efficiency.allow_hdr': 'Off by default, and worth leaving off for now. The colour description (transfer function, primaries, matrix) is carried onto the encode, but mastering-display and MaxCLL metadata are not yet, and this has never been checked against a real HDR file. A re-encode that loses HDR metadata produces a grey, washed-out file that still plays — a failure nothing reports.',
+  'shrink.quality': 'The quality the result must measure at: acceptable = VMAF 85, good = 92, excellent = 95. Nothing is replaced unless the finished file actually scores this.',
+  'shrink.min_saving_pct': 'Do not touch the file unless this much is really saved. Checked twice: against the search\u2019s projection before encoding starts, and against the finished file before it is allowed to replace anything.',
+  'shrink.metric': 'vmaf is the real measurement and needs an ffmpeg built with libvmaf — no distro ffmpeg has one, so the container ships a second static binary for scoring only. ssim is the fallback: always available, but a weaker guarantee.',
+  'shrink.search_steps': 'How many CRFs the search may try. The search is a bisection, so 5 steps covers a range of about 32 values.',
+  'shrink.only_between_hours': 'Restrict shrinking to a window of the day, e.g. "22-06". Scans still run at any time; only the shrink waits. Empty means any time.',
+  'shrink.crf_min': 'The best-quality end of the search. If even this CRF cannot reach the target, the file is left alone — it is already about as small as it can be at this quality.',
   'policy.abort_if_failure_ratio_over': 'If more than this fraction of the library fails a scan, stop and change nothing — that is what an unmounted array looks like.',
   'transcode.hwaccel': 'qsv needs /dev/dri passed into the container; nvenc needs the NVIDIA runtime; vaapi needs /dev/dri and the right render node.',
   'transcode.replace_original': 'On: the transcode replaces the file in place (original goes to the recycle bin) and the *arr is told to rescan. Off: the new file is left alongside the old one.',
@@ -851,7 +956,9 @@ async function viewSettings() {
       settingField('policy.incompatible_action', s.policy.incompatible_action,
         { options: ['none', 'flag', 'transcode', 'redownload'] }),
       settingField('policy.hygiene_action', s.policy.hygiene_action,
-        { options: ['none', 'flag', 'transcode'] })),
+        { options: ['none', 'flag', 'transcode'] }),
+      settingField('policy.oversize_action', s.policy.oversize_action,
+        { options: ['none', 'flag', 'shrink'] })),
     settingField('policy.try_repair_before_redownload', s.policy.try_repair_before_redownload,
       { label: 'Try a remux before re-downloading a corrupt file' }),
     settingField('policy.blocklist_on_redownload', s.policy.blocklist_on_redownload,
@@ -859,8 +966,9 @@ async function viewSettings() {
     el('div', { class: 'cols' },
       settingField('policy.recycle_bin_days', s.policy.recycle_bin_days),
       settingField('policy.recycle_bin_path', s.policy.recycle_bin_path,
-        { label: 'Recycle bin path', placeholder: '/config/recycle' }),
+        { label: 'Recycle bin path', placeholder: '/media/.recycle' }),
       settingField('policy.max_actions_per_scan', s.policy.max_actions_per_scan),
+      settingField('policy.max_shrinks_per_scan', s.policy.max_shrinks_per_scan),
       settingField('policy.abort_if_failure_ratio_over', s.policy.abort_if_failure_ratio_over))));
 
   // Transcoding
@@ -884,6 +992,65 @@ async function viewSettings() {
       { label: 'Copy streams that already pass, instead of re-encoding them' }),
     settingField('transcode.keep_subtitles', s.transcode.keep_subtitles),
     settingField('transcode.replace_original', s.transcode.replace_original)));
+
+  // Space saving
+  const sh = STATUS && STATUS.shrink;
+  v.append(el('div', { class: 'card' },
+    el('h3', {}, 'Space saving'),
+    el('div', { class: 'hint', style: 'margin-bottom:12px' },
+      'The only action here that changes a file nothing is wrong with. It is '
+      + 'allowed to, because the result is measured: short samples are encoded '
+      + 'at candidate CRFs and scored against the original, and nothing '
+      + 'replaces anything unless the finished file is both meaningfully '
+      + 'smaller and still scores at the target.'),
+    sh ? el('div', { class: `hint ${sh.blocked ? 'sev-warning' : ''}`, style: 'margin-bottom:12px' },
+      sh.blocked ? `Not shrinking anything: ${sh.blocked}`
+        : sh.metric ? `Measuring with ${sh.metric.toUpperCase()} via ${sh.metric_binary}, target ${sh.target}.`
+          + (sh.metric_is_estimate ? ' SSIM thresholds are a mapping, not the real thing — install an ffmpeg with libvmaf for a proper measurement.' : '')
+          : 'No quality metric available — neither libvmaf nor ssim was found, so nothing can be shrunk.') : null,
+    settingField('shrink.enabled', s.shrink.enabled),
+    el('div', { class: 'cols' },
+      settingField('shrink.quality', s.shrink.quality,
+        { options: ['acceptable', 'good', 'excellent'] }),
+      settingField('shrink.metric', s.shrink.metric, { options: ['auto', 'vmaf', 'ssim'] }),
+      settingField('shrink.min_saving_pct', s.shrink.min_saving_pct),
+      settingField('shrink.only_between_hours', s.shrink.only_between_hours,
+        { placeholder: '22-06' })),
+    el('div', { class: 'cols' },
+      settingField('shrink.crf_min', s.shrink.crf_min),
+      settingField('shrink.crf_max', s.shrink.crf_max),
+      settingField('shrink.search_steps', s.shrink.search_steps),
+      settingField('shrink.sample_count', s.shrink.sample_count),
+      settingField('shrink.sample_seconds', s.shrink.sample_seconds),
+      settingField('shrink.window_tolerance', s.shrink.window_tolerance),
+      settingField('shrink.target_score', s.shrink.target_score),
+      settingField('shrink.metric_threads', s.shrink.metric_threads)),
+    settingField('shrink.vmaf_ffmpeg_path', s.shrink.vmaf_ffmpeg_path,
+      { placeholder: 'ffmpeg-vmaf' })));
+
+  // Which files count as oversized
+  v.append(el('div', { class: 'card' },
+    el('h3', {}, 'What counts as oversized'),
+    settingField('efficiency.enabled', s.efficiency.enabled,
+      { label: 'Look for files that are bigger than they need to be' }),
+    el('div', { class: 'cols' },
+      settingField('efficiency.min_size_mb', s.efficiency.min_size_mb),
+      settingField('efficiency.min_duration_seconds', s.efficiency.min_duration_seconds),
+      settingField('efficiency.codec_bitrate_ratio', s.efficiency.codec_bitrate_ratio)),
+    el('div', { class: 'field' },
+      el('label', {}, 'Target Mbps by height'),
+      el('input', {
+        type: 'text', 'data-path': 'efficiency.target_mbps', 'data-map': '1',
+        value: Object.entries(s.efficiency.target_mbps)
+          .sort((a, b) => Number(b[0]) - Number(a[0]))
+          .map(([k, mv]) => `${k}=${mv}`).join(', '),
+      }),
+      el('div', { class: 'hint' }, FIELD_HELP['efficiency.target_mbps'])),
+    el('div', { class: 'cols' },
+      settingField('efficiency.inefficient_codecs', s.efficiency.inefficient_codecs, { list: true }),
+      settingField('efficiency.efficient_codecs', s.efficiency.efficient_codecs, { list: true })),
+    settingField('efficiency.allow_hdr', s.efficiency.allow_hdr,
+      { label: 'Include HDR files' })));
 
   // Schedule
   v.append(el('div', { class: 'card' },
@@ -1018,6 +1185,16 @@ function collectSettings() {
         const [from, ...rest] = line.split('=');
         return { from: (from || '').trim(), to: rest.join('=').trim() };
       }).filter((m) => m.from && m.to);
+    } else if (input.dataset.map) {
+      // "2160=25, 1080=8" — a height/Mbps table is far more legible on one
+      // line than as eight separate numeric fields.
+      value = {};
+      for (const pair of input.value.split(',')) {
+        const [k, mv] = pair.split('=');
+        const height = parseInt((k || '').trim(), 10);
+        const mbps = parseFloat((mv || '').trim());
+        if (Number.isFinite(height) && Number.isFinite(mbps)) value[String(height)] = mbps;
+      }
     } else if (input.dataset.list) {
       value = input.value.split('\n').map((x) => x.trim()).filter(Boolean);
     } else if (input.type === 'checkbox') {

@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 Severity = Literal["error", "warning", "info"]
-Category = Literal["integrity", "compat", "hygiene", "emby"]
+Category = Literal["integrity", "compat", "hygiene", "emby", "efficiency"]
 
 
 @dataclass
@@ -45,6 +45,17 @@ class CheckResult:
         return [f for f in self.findings if f.severity == "error"]
 
     @property
+    def efficiency(self) -> list[Finding]:
+        """Findings that say the file is bigger than it needs to be.
+
+        Kept apart from ``warnings`` everywhere: an efficiency finding is not
+        a fault, it must never satisfy the hygiene policy, and it must never
+        count towards the abort ratio, which exists to notice a library that
+        has just broken.
+        """
+        return [f for f in self.findings if f.category == "efficiency"]
+
+    @property
     def status(self) -> str:
         """Single word for the file list.
 
@@ -58,8 +69,14 @@ class CheckResult:
             return "corrupt"
         if "compat" in cats or "emby" in cats:
             return "incompatible"
-        if any(f.severity == "warning" for f in self.findings):
+        if any(f.severity == "warning" and f.category != "efficiency"
+               for f in self.findings):
             return "hygiene"
+        # Last, and deliberately: a file that is merely large is otherwise
+        # perfectly good, and reading "oversized" next to a corrupt file in
+        # the same column would flatten a real difference in what happens next.
+        if self.efficiency:
+            return "oversized"
         return "ok"
 
     def as_dict(self) -> dict[str, Any]:

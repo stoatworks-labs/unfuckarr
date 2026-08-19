@@ -265,6 +265,49 @@ def test_corrupt_config_file_does_not_stop_startup(tmp_path):
     assert s.integrity.enabled is True
 
 
+def test_recycle_bin_path_can_be_set_by_env(monkeypatch):
+    """It describes the volume layout, not a preference, so it has to be
+    settable by whoever writes the volume mappings."""
+    monkeypatch.setenv("UNFUCKARR_RECYCLE_BIN_PATH", "/media/.recycle")
+    monkeypatch.setenv("UNFUCKARR_RECYCLE_BIN_DAYS", "7")
+    s = config.load()
+    assert s.policy.recycle_bin_path == "/media/.recycle"
+    assert s.policy.recycle_bin_days == 7
+
+
+def test_a_bin_beside_the_media_is_a_rename_not_a_copy(tmp_path):
+    """The difference between a 40 GB delete costing nothing and it costing as
+    long as writing 40 GB twice."""
+    from unfuckarr import recycle
+
+    media = tmp_path / "media"
+    (media / "Movies").mkdir(parents=True)
+    film = media / "Movies" / "film.mkv"
+    film.write_bytes(b"x" * 1024)
+
+    assert recycle.same_filesystem(str(media / ".recycle"), str(film)) is True
+    # A bin that does not exist yet is judged by the nearest parent that does,
+    # because it is created on first use.
+    assert recycle.same_filesystem(str(media / ".recycle" / "2026-08-19"),
+                                   str(film)) is True
+    assert recycle.same_filesystem("", "/no/such/file") is None
+
+
+def test_the_bin_reports_where_it_is_and_whether_it_can_be_written(tmp_path):
+    """A bin pointed at a share that was never mounted fails at the first
+    delete, and the first delete is the worst time to find out."""
+    from unfuckarr import recycle
+
+    good = tmp_path / "bin"
+    good.mkdir()
+    reported = recycle.usage(str(good))
+    assert reported["path"] == str(good)
+    assert reported["configured"] is True and reported["writable"] is True
+
+    default = recycle.usage("")
+    assert default["configured"] is False
+
+
 def test_env_watch_folders_are_parsed(monkeypatch):
     monkeypatch.setenv("UNFUCKARR_WATCH_FOLDERS", "/a, /b ")
     s = config.load()

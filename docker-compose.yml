@@ -20,6 +20,16 @@ services:
       # UNFUCKARR_EMBY_API_KEY: ""
       # UNFUCKARR_WATCH_FOLDERS: "/media/downloads/complete"
       #
+      # Where deleted and replaced files are kept. Put it INSIDE the media
+      # mount and on the same share: recycling is then a rename and costs
+      # nothing, while a bin on any other filesystem copies every deleted file
+      # in full. The default (/config/recycle) is the wrong place for exactly
+      # that reason — on Unraid /config is appdata on the cache, so a handful
+      # of 40 GB remuxes fills it. Unlike the seeds above this is worth setting
+      # permanently, because it describes the volume layout, not a preference.
+      UNFUCKARR_RECYCLE_BIN_PATH: "/media/.recycle"
+      # UNFUCKARR_RECYCLE_BIN_DAYS: "14"
+      #
       # Bind to one interface — e.g. keep the service tailnet-only. Only
       # works when the interface exists INSIDE the container's network
       # namespace (network_mode: host, a tailscale sidecar, or Unraid's

@@ -15,17 +15,18 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, db, recycle
+from . import config, db, quality, recycle
 from .clients.arr import ArrClient, ArrError
 from .clients.emby import EmbyClient, EmbyError
 from .config import Settings
+from .remediation import shrink_blocked
 from .service import service
 from .state import bus, state
 
 log = logging.getLogger(__name__)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 @asynccontextmanager
@@ -88,7 +89,8 @@ def get_status() -> dict[str, Any]:
     libraries = [
         {"library": r["library"] or "Other", "total": r["n"],
          "ok": r["ok"], "corrupt": r["corrupt"], "incompatible": r["incompatible"],
-         "hygiene": r["hygiene"], "unknown": r["unknown"], "missing": r["missing"],
+         "hygiene": r["hygiene"], "oversized": r["oversized"],
+         "unknown": r["unknown"], "missing": r["missing"],
          "bytes": r["bytes"] or 0}
         for r in db.q(
             """SELECT library,
@@ -97,6 +99,7 @@ def get_status() -> dict[str, Any]:
                       SUM(status='corrupt') corrupt,
                       SUM(status='incompatible') incompatible,
                       SUM(status='hygiene') hygiene,
+                      SUM(status='oversized') oversized,
                       SUM(status IN ('unknown','error')) unknown,
                       SUM(status='missing') missing,
                       SUM(size) bytes
@@ -110,8 +113,35 @@ def get_status() -> dict[str, Any]:
         "libraries": libraries,
         "recycle": recycle.usage(config.get().policy.recycle_bin_path),
         "watch_pending": service.watcher.pending,
+        "shrink": shrink_summary(),
         "configured": bool(config.get().sonarr.enabled or config.get().radarr.enabled
                            or config.get().extra_library_paths),
+    }
+
+
+def shrink_summary() -> dict[str, Any]:
+    """What space saving has actually happened, and whether it can happen.
+
+    ``blocked`` matters more than it looks: the finding is raised, the policy
+    says shrink, and then nothing happens — with no libvmaf, or with HEVC
+    outside the target profile, that is the only place the reason is visible.
+    """
+    s = config.get()
+    row = db.q1("SELECT COUNT(*) n, "
+                "COALESCE(SUM(shrunk_from - size), 0) saved "
+                "FROM files WHERE shrunk IS NOT NULL")
+    skipped = db.q1("SELECT COUNT(*) n FROM files WHERE shrink_skipped IS NOT NULL")
+    metric = quality.resolve_metric(s.shrink, s.ffmpeg_path)
+    return {
+        "enabled": s.shrink.enabled and s.policy.oversize_action == "shrink",
+        "action": s.policy.oversize_action,
+        "files": row["n"], "saved": row["saved"],
+        "assessed_and_left": skipped["n"],
+        "metric": metric.name if metric else None,
+        "metric_binary": metric.binary if metric else None,
+        "metric_is_estimate": bool(metric and metric.is_estimate),
+        "target": metric.target if metric else None,
+        "blocked": shrink_blocked(s),
     }
 
 
@@ -205,7 +235,7 @@ def recheck(path: str, act: bool = False) -> dict[str, Any]:
 
 @api.post("/files/action")
 def force_action(path: str, action: str) -> dict[str, Any]:
-    if action not in ("transcode", "repair", "redownload", "flag"):
+    if action not in ("transcode", "repair", "shrink", "redownload", "flag"):
         raise HTTPException(400, f"unknown action {action}")
     try:
         return service.force_action(path, action)
@@ -216,6 +246,21 @@ def force_action(path: str, action: str) -> dict[str, Any]:
 @api.post("/files/cancel")
 def cancel_action(path: str) -> dict[str, Any]:
     return {"cancelled": service.remediator.cancel(path)}
+
+
+@api.post("/shrink/estimate")
+def shrink_estimate(path: str) -> dict[str, Any]:
+    """Measure what a shrink would save on one file, and change nothing.
+
+    Returns as soon as the search has started; the result arrives on the event
+    stream as ``shrink_estimate`` and is written to the activity log. The
+    search takes minutes, which is too long to hold an HTTP request open for.
+    """
+    if not os.path.exists(path):
+        raise HTTPException(404, "file is not on disk")
+    if not service.estimate_shrink(path):
+        raise HTTPException(409, "an estimate is already running")
+    return {"started": True}
 
 
 # -- scans ----------------------------------------------------------------
@@ -293,7 +338,8 @@ def recycle_restore(id: int) -> dict[str, Any]:
 @api.post("/recycle/empty")
 def recycle_empty() -> dict[str, Any]:
     # Retention of 0 days in the sweep means "everything older than now".
-    return {"removed": recycle.sweep(days=1 / 86400)}
+    return {"removed": recycle.sweep(days=1 / 86400,
+                                     configured_bin=config.get().policy.recycle_bin_path)}
 
 
 # -- settings -------------------------------------------------------------

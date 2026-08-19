@@ -100,6 +100,23 @@ def check(info: MediaInfo, cfg: EmbyCompatConfig, result: CheckResult) -> None:
     """Append compatibility findings to ``result``."""
     if not cfg.enabled or info is None:
         return
+
+    if info.is_disc:
+        # A disc image is reported, not condemned. Emby plays these, so
+        # calling the container unsupported would make `incompatible_action`
+        # remux a 40 GB image for no gain — and would out-rank the shrink that
+        # actually improves it, because compat is decided first. The
+        # efficiency check picks these up instead, and if Emby disagrees its
+        # own verdict still wins (invariant 7).
+        result.add(Finding(
+            "compat", "disc_image", "info",
+            f"{info.disc_kind} disc image, read directly without mounting — "
+            "re-encoding it to a normal file both shrinks it and removes the "
+            "need for any client to understand a disc",
+            {"disc": info.disc_kind},
+        ))
+        return
+
     profile = resolve(cfg)
 
     container = (info.container or "").lower()

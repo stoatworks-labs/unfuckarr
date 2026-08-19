@@ -82,6 +82,13 @@ class IntegrityConfig(BaseModel):
     # otherwise fine file); at or above it the file is called broken.
     max_decode_errors: int = 5
     fail_on_missing_audio: bool = True
+    # Read .iso/.img through libbluray (Blu-ray) or the ISO9660 directory
+    # (DVD) rather than handing the image to ffprobe, which cannot open one
+    # and says "Invalid data found" — indistinguishable, to these checks,
+    # from a genuinely broken file. Switch this off and disc images are
+    # skipped entirely rather than guessed at. Never left to guess: an
+    # image that cannot be opened is reported, not condemned.
+    inspect_disc_images: bool = True
 
 
 class EmbyCompatConfig(BaseModel):
@@ -111,6 +118,99 @@ class HygieneConfig(BaseModel):
     # Anything outside this range confuses client frame-rate matching.
     min_fps: float = 20.0
     max_fps: float = 61.0
+
+
+class EfficiencyConfig(BaseModel):
+    """Finding files that are intact, playable, and far bigger than they need
+    to be.
+
+    This is the only check that is not looking for a fault. Nothing it raises
+    is ever an error, and nothing it raises can lead to a delete — the worst
+    that can come of it is a re-encode, guarded by
+    ``Policy.oversize_action`` and everything in ``ShrinkConfig``.
+    """
+
+    enabled: bool = True
+    # Video bitrate, in Mbps, above which a file of a given height is worth
+    # looking at. Keyed by height as a string so the settings JSON stays
+    # readable; the largest bucket at or below the file's height wins.
+    # These are deliberately generous — the point is to catch the 40 Mbps
+    # remux, not to argue about a well-encoded 10 Mbps 1080p.
+    target_mbps: dict[str, float] = Field(default_factory=lambda: {
+        "2160": 25.0, "1440": 14.0, "1080": 8.0, "720": 4.0, "480": 2.5,
+    })
+    # Codecs that cost size for nothing on a modern library. A file in one of
+    # these is worth re-encoding at a lower bitrate than the table above.
+    inefficient_codecs: list[str] = Field(default_factory=lambda: [
+        "mpeg2video", "mpeg4", "msmpeg4v3", "vc1", "wmv3", "h264",
+    ])
+    # An inefficient codec still has to be reasonably large before it is worth
+    # hours of CPU: this is the fraction of the height's target it must exceed.
+    codec_bitrate_ratio: float = 0.6
+    # Codecs already about as small as they get. Re-encoding these is a
+    # generation of loss for very little.
+    efficient_codecs: list[str] = Field(default_factory=lambda: ["av1", "vp9"])
+    # Floors. A saving is only worth an encode if there is something to save.
+    min_size_mb: int = 500
+    min_duration_seconds: int = 300
+    # HDR survives a re-encode only if the metadata does, and getting that
+    # wrong produces a grey, washed-out file that still plays — the worst kind
+    # of failure, because nothing reports it. Off until asked for.
+    allow_hdr: bool = False
+
+
+class ShrinkConfig(BaseModel):
+    """How a shrink is carried out, and every brake on it.
+
+    The defaults are conservative on purpose. This is the one action in
+    unfuckarr that changes a file nothing is wrong with, so it has to be worth
+    it (``min_saving_pct``), it has to be measured rather than assumed (the
+    quality target), and it must never happen twice to the same file.
+    """
+
+    enabled: bool = True
+    # Only HEVC. Emby direct play is the premise of this whole application and
+    # HEVC is in the default target profile; AV1 is not, and no AMD part before
+    # RDNA3 can encode it, so shrinking to AV1 would risk trading a size win
+    # for a file Emby has to transcode on every play.
+    codec: Literal["hevc"] = "hevc"
+    # Quality tier. See quality.QUALITY_TIERS — 85 / 92 / 95 VMAF.
+    quality: Literal["acceptable", "good", "excellent"] = "good"
+    # Overrides the tier when non-zero, in whatever units `metric` is in.
+    target_score: float = 0.0
+    # How far below the target one sample may sit while the mean still passes,
+    # in VMAF points. One bad scene is exactly what a mean hides.
+    window_tolerance: float = 3.0
+    metric: Literal["auto", "vmaf", "ssim"] = "auto"
+    # An ffmpeg built with libvmaf, if it is not on PATH as ffmpeg-vmaf.
+    vmaf_ffmpeg_path: str = ""
+    metric_threads: int = 0
+    # The search itself.
+    sample_count: int = 3
+    sample_seconds: int = 15
+    crf_min: int = 18
+    crf_max: int = 34
+    search_steps: int = 5
+    # Do not touch the file unless this much is actually saved — checked twice,
+    # once against the search's projection before the encode starts and once
+    # against the finished file before it is allowed to replace anything.
+    min_saving_pct: float = 25.0
+    # Restrict shrinking to a window of the day, e.g. "22-06". Empty = any time.
+    # Scans still run; only the shrink action waits.
+    only_between_hours: str = ""
+
+    @field_validator("only_between_hours")
+    @classmethod
+    def _check_window(cls, v: str) -> str:
+        if not v:
+            return v
+        try:
+            start, _, end = v.partition("-")
+            if not (0 <= int(start) <= 23 and 0 <= int(end) <= 23):
+                raise ValueError
+        except ValueError:
+            raise ValueError('expected "HH-HH", e.g. "22-06"') from None
+        return v
 
 
 class TranscodeConfig(BaseModel):
@@ -150,6 +250,9 @@ class Policy(BaseModel):
     try_repair_before_redownload: bool = True
     incompatible_action: Literal["none", "flag", "transcode", "redownload"] = "transcode"
     hygiene_action: Literal["none", "flag", "transcode"] = "flag"
+    # A file that is merely large is not a fault, so this can never delete —
+    # the literal type is the enforcement, exactly as for hygiene_action.
+    oversize_action: Literal["none", "flag", "shrink"] = "shrink"
     # Blocklist the release in Sonarr/Radarr so the same broken file is not
     # grabbed straight back.
     blocklist_on_redownload: bool = True
@@ -159,6 +262,11 @@ class Policy(BaseModel):
     # Refuse to act on more than this many files in one scan. A mount that
     # disappears mid-scan makes every file look broken; this is the brake.
     max_actions_per_scan: int = 50
+    # Shrinks have their own, much smaller cap and are counted separately.
+    # One shrink is a quality search plus a full re-encode — hours, not the
+    # seconds a remux takes — and unlike a repair, nothing is broken while it
+    # waits for the next scan.
+    max_shrinks_per_scan: int = 5
     # If more than this fraction of a library fails, stop and flag instead of
     # deleting — that is a mount problem, not a media problem.
     abort_if_failure_ratio_over: float = 0.5
@@ -191,7 +299,9 @@ class Settings(BaseModel):
     integrity: IntegrityConfig = Field(default_factory=IntegrityConfig)
     emby_compat: EmbyCompatConfig = Field(default_factory=EmbyCompatConfig)
     hygiene: HygieneConfig = Field(default_factory=HygieneConfig)
+    efficiency: EfficiencyConfig = Field(default_factory=EfficiencyConfig)
     transcode: TranscodeConfig = Field(default_factory=TranscodeConfig)
+    shrink: ShrinkConfig = Field(default_factory=ShrinkConfig)
     policy: Policy = Field(default_factory=Policy)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     watch_folders: list[WatchFolder] = Field(default_factory=list)
@@ -223,6 +333,16 @@ def _env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         "UNFUCKARR_EMBY_API_KEY": ("emby", "api_key"),
         "UNFUCKARR_API_KEY": ("api_key",),
         "UNFUCKARR_LOG_LEVEL": ("log_level",),
+        # Where deleted and replaced files are kept. It belongs with the
+        # volume mappings rather than on the settings page, because it is only
+        # useful pointed at a path that was mounted into the container — and
+        # whoever writes the mapping is the one who knows where that is. It
+        # also wants to be on the same filesystem as the media (see
+        # recycle.same_filesystem): otherwise every recycled file is copied
+        # rather than renamed, which on Unraid means 40 GB remuxes landing on
+        # the cache one at a time.
+        "UNFUCKARR_RECYCLE_BIN_PATH": ("policy", "recycle_bin_path"),
+        "UNFUCKARR_RECYCLE_BIN_DAYS": ("policy", "recycle_bin_days"),
     }
     for env, path in mapping.items():
         val = os.environ.get(env)

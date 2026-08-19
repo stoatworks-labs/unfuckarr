@@ -29,7 +29,7 @@ Runs as a Docker container with a web UI. Packaged for Unraid Community Applicat
 
 ## What it checks
 
-Four independent classes of problem, each with its own remediation policy.
+Five independent classes of problem, each with its own remediation policy.
 
 **Integrity — is the file actually intact?**
 ffprobe refuses it, the container has no duration, there is no video or audio stream, the file is
@@ -51,6 +51,36 @@ video transcode whenever they are switched on), every subtitle flagged forced, o
 None of this is breakage, so hygiene findings can never trigger a delete — the config type does
 not permit it.
 
+**Disc images — .iso and .img are read, not condemned.**
+`ffprobe` cannot open a disc image. Handed one it says *"Invalid data found when processing
+input"*, which is indistinguishable from a genuinely broken file — so a library full of BR-DISKs
+gets queued for delete-and-re-search. unfuckarr opens them instead, without mounting anything and
+without any privilege the container does not already have:
+
+- **Blu-ray** via ffmpeg's `bluray:` protocol. libbluray bundles libudfread and reads the UDF
+  filesystem straight out of the image, then presents the longest playlist. Seeking works, which
+  is what makes the quality search usable on a disc.
+- **DVD** by parsing the ISO9660 directory in Python to find the title VOBs, then handing ffmpeg
+  each one as a byte range of the image through the `subfile` protocol. (Debian's ffmpeg is built
+  without libdvdread, so there is no `dvd:` protocol to use.)
+
+From there a disc behaves like any other file: it is checked for integrity, measured for
+efficiency, and — because an 80 Mbps disc is the best shrink candidate in any library —
+re-encoded to a normal `.mkv` that every client can direct play.
+
+**An image nothing can open is reported, never condemned.** It raises an *info* finding, not an
+error, and no policy acts on it. Being unable to read a file is not evidence that the file is bad,
+and this is the one place in the application where confusing those two has already cost real
+media.
+
+**Efficiency — is it far bigger than it needs to be?**
+A 38 Mbps H.264 Blu-ray remux is a perfectly good file; the only thing to be said against it is
+that it is four times the size of an HEVC encode nobody could tell apart from it. Files whose
+video bitrate is well above a target for their resolution, or that are in an older codec at a
+size worth the CPU, are flagged as *oversized*. This is the one check that is not looking for a
+fault, and it is carried separately all the way through: nothing it raises is ever an error, it
+can never reach a policy that deletes, and it is excluded from the failure-ratio abort below.
+
 **Emby's activity log.** Real playback failures the server recorded, for files that otherwise
 look fine.
 
@@ -71,6 +101,8 @@ hand:
 | Genuinely corrupt | Delete, blocklist the release, trigger a new search |
 | Intact but Emby would transcode | Transcode, copying every stream that already passes |
 | Hygiene | Flag only |
+| Intact, playable, and much larger than it needs to be | Shrink — re-encode to a *measured* quality target |
+| A disc image nothing can open | Report it, and do nothing |
 
 Everything is configurable per class, including turning it off.
 
@@ -78,6 +110,46 @@ Everything is configurable per class, including turning it off.
 not a re-encode — getting that wrong turns twenty seconds of work into six hours. Only the stream
 that actually fails gets re-encoded. Output is verified (streams present, duration within 2% of
 the source) before it is allowed to replace anything.
+
+**Shrinking is measured, not guessed.** This is the only thing unfuckarr does to a file that
+nothing is wrong with, so it is not allowed to guess. CRF is not a quality level — it is a
+rate-control knob whose meaning depends entirely on the content, and the CRF 22 that is visually
+lossless on a talking-heads documentary is mush on grain-heavy 35mm. So instead of picking a
+number and hoping:
+
+1. Three short samples are taken from across the file (skipping the head and tail, where logos
+   and credits compress unlike anything else).
+2. Each is encoded at a candidate CRF and **scored against the source with VMAF**, and a
+   bisection finds the *largest* CRF — the smallest file — that still meets the target. Largest,
+   not safest: a lower CRF always passes and always saves less.
+3. If the projected saving does not clear `min_saving_pct` (default 25%), nothing is encoded.
+4. After the full encode, the finished file is measured again, on the same windows, against the
+   original. If it is not actually that much smaller, or if it does not still score at the
+   target, **the output is deleted and the original is kept**. That is a normal outcome for a
+   lot of files and is not a failure.
+5. A file that has been shrunk is never shrunk again, and one that has been assessed and left
+   alone is not reassessed — both are recorded permanently. Re-encoding an encode is a second
+   generation of loss for a fraction of the saving, and re-deciding "not worth it" costs hours
+   of CPU to reach the same answer.
+
+Quality tiers are VMAF 85 (*acceptable*), 92 (*good*, the default) and 95 (*excellent*). Only
+HEVC is produced: Emby direct play is the premise of this whole application, and shrinking into
+a codec your target profile rejects would trade a size win for a file Emby has to transcode on
+every play. HDR is skipped unless you ask for it — a re-encode that loses the metadata produces
+a grey, washed-out file that still plays, which is the worst kind of failure because nothing
+reports it.
+
+> **VMAF needs an ffmpeg that has it, and no distribution ships one.** Not Debian bookworm, not
+> Debian trixie, not jellyfin-ffmpeg. The container therefore includes a second, static ffmpeg
+> (`ffmpeg-vmaf`) used *only* for scoring — Debian's ffmpeg still does all the encoding, so the
+> hardware path is untouched. Running from source without one, unfuckarr falls back to ffmpeg's
+> built-in SSIM filter and says so in the UI: it does catch gross quality loss, but it correlates
+> less well with what a person sees, so the thresholds are approximate rather than a measurement.
+
+> **Shrinking fills the recycle bin.** The original of every shrunk file is kept for
+> `recycle_bin_days` (default 14). At five shrinks a scan on a library of 40 GB remuxes that is
+> several hundred gigabytes held back from the array at any time. Lower the retention, or the
+> per-scan cap, if that is not room you have.
 
 **Deleting goes through the *arr, not `os.unlink`.** Removing a file behind Sonarr's back leaves
 the episode marked present until its next rescan. unfuckarr deletes via the API, then marks the
@@ -88,13 +160,28 @@ back the same broken file within the hour.
 
 Unattended deletion needs to be wrong safely, so there are three layers:
 
-- **Recycle bin.** Deleted files move to `/config/recycle/<date>/` and are recorded. Retention
-  defaults to 14 days and any entry can be restored from the web UI. Set it to 0 to unlink
-  immediately.
+- **Recycle bin.** Deleted and replaced files move to a dated directory and are recorded.
+  Retention defaults to 14 days and any entry can be restored from the web UI. Set it to 0 to
+  unlink immediately.
+
+  **Put the bin inside your media mount.** Set `UNFUCKARR_RECYCLE_BIN_PATH` (or the Recycle bin
+  field in the Unraid template) to something like `/media/.recycle`. On the same filesystem as
+  the media, recycling a file is a *rename* and costs nothing; anywhere else it is a full copy of
+  every deleted file. The old default, `/config/recycle`, is the wrong place for exactly that
+  reason — on Unraid `/config` is appdata on the cache, so every recycled 40 GB remux is copied
+  onto the cache and kept there for the retention window. unfuckarr never scans its own bin, so
+  it is safe to keep it inside the library. The dashboard shows where the bin actually is, and
+  says so loudly if it is not writable.
 - **Action cap.** No single scan may act on more than `max_actions_per_scan` files (default 50).
+  Shrinks are counted separately and far more tightly (`max_shrinks_per_scan`, default 5): one
+  shrink is a quality search plus a full re-encode, and unlike a repair, nothing is broken while
+  a large file waits for the next scan. Repairs are always applied before shrinks.
 - **Failure-ratio abort.** If more than half a library fails one pass, the scan stops and changes
   *nothing*. That is what an unmounted array looks like, and it is the failure mode that costs
-  people their library.
+  people their library. Shrinks are deliberately *not* counted here: an unmounted array produces
+  integrity failures, a file ffprobe cannot read never reaches the efficiency check at all, and
+  counting them would trip the brake permanently on any library that is mostly H.264 — which is
+  most libraries.
 
 All of it is on one settings page, with every option explaining what it actually does:
 

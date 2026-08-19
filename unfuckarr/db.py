@@ -39,7 +39,18 @@ CREATE TABLE IF NOT EXISTS files (
     checked_signature TEXT,          -- size:mtime at last clean pass
     -- How many times we have transcoded this file and it still failed
     -- afterwards. Guards against transcoding the same file for ever.
-    fix_attempts    INTEGER DEFAULT 0
+    fix_attempts    INTEGER DEFAULT 0,
+    -- Space-saving shrink state. `shrunk` and `shrink_skipped` are both
+    -- permanent: a file that has been shrunk must never be shrunk again
+    -- (that is a second generation of loss for a fraction of the saving),
+    -- and a file the search has already decided is not worth shrinking must
+    -- not have hours of CPU spent re-deciding it on every scan.
+    shrunk          REAL,             -- when it was shrunk
+    shrunk_from     INTEGER,          -- size before, so the saving is reportable
+    shrink_score    REAL,             -- measured quality of the result
+    shrink_metric   TEXT,             -- vmaf | ssim — which number that is
+    shrink_skipped  TEXT,             -- why we will not try this file again
+    shrink_attempts INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_files_status  ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_library ON files(library);
@@ -124,6 +135,12 @@ def connect() -> sqlite3.Connection:
 # a database that already exists, so they are applied by hand.
 MIGRATIONS = [
     ("files", "fix_attempts", "INTEGER DEFAULT 0"),
+    ("files", "shrunk", "REAL"),
+    ("files", "shrunk_from", "INTEGER"),
+    ("files", "shrink_score", "REAL"),
+    ("files", "shrink_metric", "TEXT"),
+    ("files", "shrink_skipped", "TEXT"),
+    ("files", "shrink_attempts", "INTEGER DEFAULT 0"),
 ]
 
 

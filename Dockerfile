@@ -57,6 +57,46 @@ RUN set -eux; \
     ffmpeg -version | head -1; \
     ffprobe -version | head -1
 
+# A second ffmpeg, used for exactly one thing: computing VMAF.
+#
+# No distribution ffmpeg is built with libvmaf. Not Debian bookworm, not Debian
+# trixie, not jellyfin-ffmpeg — check their debian/rules and the flag simply is
+# not there. Without this binary there is no way to measure whether a
+# space-saving re-encode still looks like the original, and `shrink` falls back
+# to SSIM, which is a weaker guarantee.
+#
+# It is deliberately NOT used for encoding. The VAAPI path above took real
+# hardware and two wrong turns to get right (Mesa from backports; software
+# decode plus hwupload), and it is Debian's ffmpeg that was verified doing it.
+# Scoring is pure CPU and cares about none of that, so the two stay separate
+# and a change to one cannot break the other.
+#
+# BtbN's builds are GPL. This image already ships Debian's GPL ffmpeg, so
+# aggregating another changes nothing about unfuckarr's own MIT licence.
+#
+# The grep at the end is the point of the whole block: fail the build rather
+# than ship an image that silently scores with SSIM because a download changed
+# shape.
+ARG FFMPEG_VMAF_RELEASE=latest
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) arch=linux64 ;; \
+        arm64) arch=linuxarm64 ;; \
+        *) echo "no libvmaf build for ${TARGETARCH} - SSIM fallback only"; exit 0 ;; \
+    esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl xz-utils; \
+    name="ffmpeg-master-${FFMPEG_VMAF_RELEASE}-${arch}-gpl"; \
+    curl -fsSL -o /tmp/ff.tar.xz \
+        "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_VMAF_RELEASE}/${name}.tar.xz"; \
+    tar -xJf /tmp/ff.tar.xz -C /tmp; \
+    install -m 0755 "/tmp/${name}/bin/ffmpeg" /usr/local/bin/ffmpeg-vmaf; \
+    rm -rf /tmp/ff.tar.xz "/tmp/${name}"; \
+    apt-get purge -y --auto-remove curl xz-utils; \
+    rm -rf /var/lib/apt/lists/*; \
+    ffmpeg-vmaf -hide_banner -filters | grep -q ' libvmaf '; \
+    ffmpeg-vmaf -version | head -1
+
 WORKDIR /app
 
 COPY requirements.txt .
