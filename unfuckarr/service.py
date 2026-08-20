@@ -339,7 +339,15 @@ class Service:
             try:
                 result, info = check_file(
                     path, s, expected_runtime=record.get("expected_runtime"),
-                    emby=emby)
+                    emby=emby,
+                    # A watch folder covering the library sees the *output* of
+                    # a shrink as an arrival, roughly a minute later. Without
+                    # this the arrival check re-raises `not_measured` and
+                    # overwrites the post-shrink state, so a finished file
+                    # sits in the backlog for ever — observed on the live
+                    # library within two minutes of the first real shrink.
+                    already_shrunk=bool(record.get("shrunk")
+                                        or record.get("shrink_skipped")))
             except Exception as exc:  # noqa: BLE001
                 log.exception("arrival check failed for %s", path)
                 db.log("arrival_check_failed", "error", path, str(exc))

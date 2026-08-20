@@ -821,3 +821,52 @@ def test_the_extracted_window_is_really_lossless(video_factory, settings, tmp_pa
 
     assert frames(window, False) == frames(src, True), \
         "the extracted window is not the frames it claims to be"
+
+
+@needs_ffmpeg
+def test_the_size_on_record_follows_the_file(video_factory, settings):
+    """A file rewritten in place is a different size, and nothing else updates
+    the column until the next full enumeration. Left stale, the first live
+    shrink reported a saving of zero — 10.71 GiB became 3.45 GiB on disk while
+    `files.size` still said 10.71, and the reclaimed total is
+    `shrunk_from - size`."""
+    from unfuckarr.scanner import check_file, persist_result
+
+    path = video_factory("resized.mkv", seconds=4)
+    db.ex("INSERT INTO files (path, status, size) VALUES (?,?,?)",
+          (str(path), "unknown", 999_999_999))
+
+    result, info = check_file(str(path), settings)
+    stat = path.stat()
+    persist_result(str(path), result, info, stat.st_size, stat.st_mtime)
+
+    row = db.q1("SELECT size, mtime FROM files WHERE path=?", (str(path),))
+    assert row["size"] == stat.st_size
+    assert row["mtime"] == stat.st_mtime
+
+
+@needs_ffmpeg
+def test_the_watcher_does_not_undo_a_finished_shrink(video_factory, settings,
+                                                     monkeypatch):
+    """A watch folder covering the library sees the *output* of a shrink as an
+    arrival about a minute later. Checking it without knowing the file is
+    already shrunk re-raises `not_measured` and overwrites the post-shrink
+    state, so a finished file sits in the backlog for ever — which is exactly
+    what happened within two minutes of the first real shrink."""
+    from unfuckarr.service import Service
+
+    path = video_factory("done.mkv", seconds=4, size="640x360")
+    settings.efficiency.min_size_mb = 0
+    settings.efficiency.min_duration_seconds = 0
+    db.ex("INSERT INTO files (path, status, size, shrunk, shrunk_from) "
+          "VALUES (?,?,?,?,?)",
+          (str(path), "ok", path.stat().st_size, 123.0, 999_999_999))
+
+    Service()._check_arrival(str(path))
+
+    row = db.q1("SELECT status FROM files WHERE path=?", (str(path),))
+    assert row["status"] != "unmeasured", \
+        "the watcher put a finished file back in the shrink backlog"
+    open_codes = {r["code"] for r in db.q(
+        "SELECT code FROM findings WHERE path=? AND resolved IS NULL", (str(path),))}
+    assert "not_measured" not in open_codes

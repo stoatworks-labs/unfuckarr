@@ -306,6 +306,16 @@ Break any of these and the failure is quiet and expensive.
   the expensive half, and it works whatever the decoder did.
 - **`-ss` before `-i`** so ffmpeg seeks rather than decoding up to the point. Sampling the middle
   of a 40 GB file takes seconds this way and minutes the other way.
+- **A watch folder covering the library sees a shrink's own output as an arrival.** The new file
+  lands, the settle timer fires about a minute later, and `_check_arrival` re-checks it — so
+  every path that calls `check_file` has to pass `already_shrunk`, not just the scanner. Missing
+  it there does not re-shrink anything (the `shrunk` marker still refuses), but it re-raises
+  `not_measured` and overwrites the post-shrink state, and the file then sits in the backlog for
+  ever. Observed on the live library within two minutes of the very first real shrink.
+- **`persist_result` has to write `size` and `mtime`, not just the signature.** Nothing else
+  updates that column until the next full enumeration, so a file rewritten in place keeps its old
+  size on record — and the reclaimed total is `shrunk_from - size`, so the first live shrink
+  reported a saving of zero while the file on disk had gone from 10.71 GiB to 3.45.
 - **unfuckarr's own `*.unfuckarr.*` temp outputs look exactly like media files.** A watch folder
   covering the library, or a scan running during a long remux, would pick up the half-written
   output, check it (it carries the same findings as its source — it is a copy of the streams),

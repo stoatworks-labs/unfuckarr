@@ -178,11 +178,17 @@ def persist_result(path: str, result: CheckResult, info: MediaInfo | None,
     for f in result.unmeasured:
         priority = f.data.get("ratio")
         break
+    # `size` and `mtime` travel with the rest, because a file that was just
+    # rewritten in place is a different size and nothing else updates the
+    # column until the next full enumeration. Leaving it stale made the first
+    # live shrink report a saving of zero: 10.71 GiB became 3.45 GiB on disk
+    # while `files.size` still said 10.71, and the reclaimed total is
+    # `shrunk_from - size`.
     db.ex("UPDATE files SET status=?, last_checked=?, last_result=?, probe=?, "
-          "checked_signature=?, shrink_priority=? WHERE path=?",
+          "checked_signature=?, shrink_priority=?, size=?, mtime=? WHERE path=?",
           (result.status, now, json.dumps(result.as_dict()),
            json.dumps(info.summary()) if info else None,
-           f"{size}:{mtime}", priority, path))
+           f"{size}:{mtime}", priority, size, mtime, path))
     # Findings are replaced wholesale each pass; the previous set is resolved
     # rather than deleted so the activity view can show what changed.
     db.ex("UPDATE findings SET resolved=? WHERE path=? AND resolved IS NULL",
