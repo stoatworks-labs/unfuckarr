@@ -152,23 +152,41 @@ jobs:
           if [ -z "$ok" ]; then echo "container never became healthy"; exit 1; fi
           curl -fsS http://localhost:6969/api/status > /dev/null
           curl -fsS http://localhost:6969/ | grep -q unfuckarr
-          docker exec smoke ffmpeg -version | head -1
           # The whole transcoding stack, asserted in the finished image rather
-          # than only in the build layer. One ffmpeg does all of it now:
+          # than only in the build layer. Each check reports itself, because a
+          # bare `cmd | grep -q` under `set -o pipefail` fails on SIGPIPE as
+          # readily as on a real mismatch, and then says nothing about which.
+          check() {
+            printf '  %-24s ' "$1"
+            if docker exec smoke sh -c "$2" >/dev/null 2>&1; then
+              echo OK
+            else
+              echo FAILED
+              docker exec smoke sh -c "$3" 2>&1 | head -5 || true
+              return 1
+            fi
+          }
           #   libvmaf, or shrinking silently falls back to SSIM, which is a
           #     weaker guarantee than the one the user asked for;
-          #   bluray, or every .iso in a library reads as a corrupt file;
           #   hevc_vaapi, and it must be an ffmpeg 8 - 5.x and 7.x pad a 1080p
           #     encode to 1088 without signalling a conformance window, which
-          #     breaks every quality comparison and mis-shapes the output.
-          docker exec smoke sh -c "ffmpeg -hide_banner -filters | grep -q ' libvmaf '"
-          docker exec smoke sh -c "ffmpeg -hide_banner -protocols | grep -qw bluray"
-          docker exec smoke sh -c "ffmpeg -hide_banner -encoders | grep -q hevc_vaapi"
-          docker exec smoke sh -c "ffmpeg -version | head -1 | grep -qE 'version (8|9|[1-9][0-9])\\.'"
-          # The VA drivers travel with that ffmpeg rather than coming from the
-          # distro, so check they actually arrived.
-          docker exec smoke sh -c "ls /usr/local/lib/*/dri/radeonsi_drv_video.so >/dev/null"
-          docker exec smoke python -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version"
+          #     breaks every quality comparison and mis-shapes the output;
+          #   subfile, which is how a DVD image is read.
+          # `bluray` is reported, not required: the ffmpeg this image is built
+          # from has no libbluray, so Blu-ray images are read by the UDF parser
+          # in disc.py instead.
+          check 'ffmpeg 8+'    "ffmpeg -version | head -1 | grep -qE 'version (8|9|[1-9][0-9])[.]'" "ffmpeg -version | head -1"
+          check 'libvmaf'      "ffmpeg -hide_banner -filters | grep -q ' libvmaf '" "ffmpeg -hide_banner -filters | grep -i vmaf"
+          check 'hevc_vaapi'   "ffmpeg -hide_banner -encoders | grep -q hevc_vaapi" "ffmpeg -hide_banner -encoders | grep -i vaapi"
+          check 'subfile'      "ffmpeg -hide_banner -protocols | tr -s ' \\n' '\\n' | grep -qx subfile" "ffmpeg -hide_banner -protocols"
+          check 'va drivers'   "ls /usr/local/lib/*/dri/radeonsi_drv_video.so" "ls /usr/local/lib/*/dri/ 2>&1"
+          check 'python 3.12'  "python -c 'import sys; raise SystemExit(0 if sys.version_info[:2]==(3,12) else 1)'" "python --version"
+          printf '  %-24s ' 'bluray (optional)'
+          if docker exec smoke sh -c "ffmpeg -hide_banner -protocols | tr -s ' \\n' '\\n' | grep -qx bluray" >/dev/null 2>&1; then
+            echo present
+          else
+            echo 'absent - Blu-ray images are read by the UDF parser instead'
+          fi
           docker exec smoke sh -c "ffmpeg -hide_banner -protocols | grep -qw subfile"
           docker rm -f smoke
           echo "image smoke test passed"
