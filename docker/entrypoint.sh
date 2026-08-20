@@ -19,8 +19,12 @@ if ! getent group "$PGID" >/dev/null 2>&1; then
 fi
 GROUP_NAME="$(getent group "$PGID" | cut -d: -f1)"
 
+# The home directory is set on the account rather than only exported, because
+# gosu replaces HOME with whatever /etc/passwd says for the target user — an
+# exported one is silently discarded.
+APP_HOME=/config/.home
 if ! getent passwd "$PUID" >/dev/null 2>&1; then
-    useradd -u "$PUID" -g "$PGID" -M -s /usr/sbin/nologin unfuckarr
+    useradd -u "$PUID" -g "$PGID" -d "$APP_HOME" -M -s /usr/sbin/nologin unfuckarr
 fi
 USER_NAME="$(getent passwd "$PUID" | cut -d: -f1)"
 
@@ -30,10 +34,7 @@ mkdir -p /config
 # that warning lands at the front of any stderr the application captures, and
 # pushed the real cause out of every truncated error message it reported.
 # Giving it a real directory also lets the cache do its job.
-APP_HOME=/config/.home
 mkdir -p "$APP_HOME/.cache"
-export HOME="$APP_HOME"
-export XDG_CACHE_HOME="$APP_HOME/.cache"
 
 # Only the config volume — never the media mounts. Recursively chowning a
 # 40 TB array on every container start is how people lose an evening.
@@ -52,5 +53,15 @@ for dev in /dev/dri/*; do
     [ -n "$DEV_GROUP" ] && usermod -aG "$DEV_GROUP" "$USER_NAME" 2>/dev/null || true
 done
 
+chown -R "$PUID:$PGID" "$APP_HOME" 2>/dev/null || true
+
 echo "unfuckarr starting as ${USER_NAME}:${GROUP_NAME} (${PUID}:${PGID}), umask ${UMASK}"
-exec gosu "$PUID:$PGID" "$@"
+# HOME and XDG_CACHE_HOME go through `env` rather than being exported, because
+# gosu rewrites HOME from the account and would drop an exported one. Without
+# somewhere writable, Mesa cannot open a shader cache and says so on *every*
+# ffmpeg invocation — which is not just noise: it lands at the front of any
+# stderr the application captures.
+exec gosu "$PUID:$PGID" env \
+    HOME="$APP_HOME" \
+    XDG_CACHE_HOME="$APP_HOME/.cache" \
+    "$@"

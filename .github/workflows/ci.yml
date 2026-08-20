@@ -181,6 +181,14 @@ jobs:
           check 'subfile'      "ffmpeg -hide_banner -protocols | tr -s ' \\n' '\\n' | grep -qx subfile" "ffmpeg -hide_banner -protocols"
           check 'va drivers'   "ls /usr/local/lib/*/dri/radeonsi_drv_video.so" "ls /usr/local/lib/*/dri/ 2>&1"
           check 'python 3.12'  "python -c 'import sys; raise SystemExit(0 if sys.version_info[:2]==(3,12) else 1)'" "python --version"
+          # The app's HOME has to be somewhere it can actually write. gosu
+          # rewrites HOME from the account, so an exported one is silently
+          # dropped - and with nowhere to write, Mesa prints a shader-cache
+          # warning on every ffmpeg call that lands at the front of any error
+          # the application captures.
+          check 'writable HOME' \
+            'for p in /proc/[0-9]*; do grep -qs unfuckarr $p/cmdline || continue; h=$(tr "\\0" "\\n" < $p/environ | sed -n "s/^HOME=//p"); [ -n "$h" ] && [ -w "$h" ] && exit 0; done; exit 1' \
+            'for p in /proc/[0-9]*; do grep -qs unfuckarr $p/cmdline && tr "\\0" "\\n" < $p/environ | grep "^HOME="; done'
           printf '  %-24s ' 'bluray (optional)'
           if docker exec smoke sh -c "ffmpeg -hide_banner -protocols | tr -s ' \\n' '\\n' | grep -qx bluray" >/dev/null 2>&1; then
             echo present
