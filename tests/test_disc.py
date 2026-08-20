@@ -176,15 +176,18 @@ def test_a_blu_ray_is_opened_through_libbluray(tmp_path, monkeypatch):
     assert found.kind == "bluray"
 
 
-def test_a_blu_ray_without_libbluray_is_refused_not_guessed(tmp_path, monkeypatch):
-    """An ISO9660 bridge cannot stand in: it cannot describe a file over 4 GB
-    in one extent, so it lists the main feature in fragments. Measured on a
-    real 96 GB disc the largest entry it offered was 1.1 GiB — a trailer.
-    Falling back to it would silently pick the wrong title."""
+def test_an_iso9660_bridge_is_never_used_to_find_a_blu_ray_stream(tmp_path, monkeypatch):
+    """A bridge cannot describe a file over 4 GB in one extent, so it lists
+    the feature in fragments — measured on a real 96 GB disc, the largest
+    entry it offered was 1.1 GiB, a trailer. Falling back to it would not
+    fail, it would silently pick the wrong title, so the UDF path is the only
+    one allowed to answer."""
     iso = build_iso9660(tmp_path / "bd.iso", {"INDEX.BDMV": b"x" * 64},
                         directory="BDMV")
-    monkeypatch.setattr(disc, "protocols_for", lambda b: frozenset({"file"}))
-    with pytest.raises(disc.DiscError, match="no bluray protocol"):
+    monkeypatch.setattr(disc, "protocols_for",
+                        lambda b: frozenset({"file", "subfile"}))
+    # ISO9660-only, so there is no UDF to read and no bridge shortcut either.
+    with pytest.raises(disc.DiscError):
         disc.input_url(str(iso))
 
 
@@ -329,3 +332,193 @@ def test_the_encode_command_carries_them(video_factory, settings, tmp_path):
     out = probe(str(tmp_path / "out.mkv"), settings.ffprobe_path)
     assert out.video.raw.get("color_space") == "bt2020nc", \
         "the re-encode dropped the colour description"
+
+
+# -- building a real UDF volume ------------------------------------------
+#
+# Same principle as the ISO9660 builder above: assemble one rather than ship a
+# fixture, so the tests run anywhere and the layout the parser depends on is
+# written down. Only the descriptors the parser reads are filled in.
+
+VDS_SECTOR = 32
+PARTITION_START = 64
+
+
+def _tag(identifier: int, location: int) -> bytes:
+    t = bytearray(16)
+    struct.pack_into("<H", t, 0, identifier)
+    struct.pack_into("<H", t, 2, 3)                 # descriptor version
+    struct.pack_into("<I", t, 12, location)
+    return bytes(t)
+
+
+def _mk_long_ad(length: int, lbn: int, partition: int = 0) -> bytes:
+    return struct.pack("<IIH", length, lbn, partition) + b"\0" * 6
+
+
+def _fid(name: str, lbn: int, is_dir: bool) -> bytes:
+    raw = b"\x08" + name.encode("latin-1")         # d-string, 8-bit
+    rec = bytearray(38)
+    rec[0:16] = _tag(disc.TAG_FILE_IDENTIFIER, 0)
+    struct.pack_into("<H", rec, 16, 1)              # file version
+    rec[18] = 0x02 if is_dir else 0x00              # characteristics
+    rec[19] = len(raw)
+    rec[20:36] = _mk_long_ad(0, lbn)
+    struct.pack_into("<H", rec, 36, 0)              # implementation use length
+    out = bytes(rec) + raw
+    return out + b"\0" * (-len(out) % 4)           # 4-byte aligned
+
+
+def _file_entry(is_dir: bool, extents: list[tuple[int, int]], length: int) -> bytes:
+    """A short_ad File Entry. `extents` are (logical block, byte length)."""
+    fe = bytearray(2048)
+    fe[0:16] = _tag(disc.TAG_FILE_ENTRY, 0)
+    fe[16 + 11] = disc.ICB_DIRECTORY if is_dir else disc.ICB_FILE
+    struct.pack_into("<H", fe, 16 + 18, 0)          # ICB flags: short_ad
+    struct.pack_into("<Q", fe, 56, length)          # information length
+    struct.pack_into("<I", fe, 168, 0)              # length of EAs
+    struct.pack_into("<I", fe, 172, 8 * len(extents))
+    for i, (lbn, size) in enumerate(extents):
+        struct.pack_into("<II", fe, 176 + i * 8, size, lbn)
+    return bytes(fe)
+
+
+def build_udf_volume(path: Path, streams: dict[str, int]) -> Path:
+    """A Blu-ray-shaped UDF volume: BDMV/STREAM holding the named .m2ts files.
+
+    `streams` maps name to byte length; the data itself is a repeating pattern
+    so a test can check the extent really points at the right file.
+    """
+    sectors: dict[int, bytes] = {}
+
+    for i, ident in enumerate((b"BEA01", b"NSR03", b"TEA01")):
+        block = bytearray(2048)
+        block[1:6] = ident
+        block[6] = 1
+        sectors[16 + i] = bytes(block)
+
+    anchor = bytearray(2048)
+    anchor[0:16] = _tag(disc.TAG_ANCHOR, 256)
+    struct.pack_into("<II", anchor, 16, 2048 * 3, VDS_SECTOR)
+    sectors[256] = bytes(anchor)
+
+    pd = bytearray(2048)
+    pd[0:16] = _tag(disc.TAG_PARTITION, VDS_SECTOR)
+    struct.pack_into("<H", pd, 22, 0)               # partition number
+    struct.pack_into("<I", pd, 188, PARTITION_START)
+    sectors[VDS_SECTOR] = bytes(pd)
+
+    lvd = bytearray(2048)
+    lvd[0:16] = _tag(disc.TAG_LOGICAL_VOLUME, VDS_SECTOR + 1)
+    struct.pack_into("<I", lvd, 212, 2048)          # logical block size
+    lvd[248:264] = _mk_long_ad(2048, 0)             # file set at lbn 0
+    sectors[VDS_SECTOR + 1] = bytes(lvd)
+
+    term = bytearray(2048)
+    term[0:16] = _tag(disc.TAG_TERMINATING, VDS_SECTOR + 2)
+    sectors[VDS_SECTOR + 2] = bytes(term)
+
+    fsd = bytearray(2048)
+    fsd[0:16] = _tag(disc.TAG_FILE_SET, 0)
+    fsd[400:416] = _mk_long_ad(2048, 1)             # root directory ICB
+    sectors[PARTITION_START + 0] = bytes(fsd)
+
+    # lbn 1 root FE -> lbn 2 root FIDs -> lbn 3 BDMV FE -> lbn 4 BDMV FIDs
+    #  -> lbn 5 STREAM FE -> lbn 6 STREAM FIDs -> lbn 7.. per-stream FEs
+    root_fids = _fid("BDMV", 3, True)
+    bdmv_fids = _fid("STREAM", 5, True)
+    sectors[PARTITION_START + 1] = _file_entry(True, [(2, len(root_fids))], len(root_fids))
+    sectors[PARTITION_START + 2] = root_fids.ljust(2048, b"\0")
+    sectors[PARTITION_START + 3] = _file_entry(True, [(4, len(bdmv_fids))], len(bdmv_fids))
+    sectors[PARTITION_START + 4] = bdmv_fids.ljust(2048, b"\0")
+
+    stream_fids = b""
+    fe_lbn, data_lbn = 7, 64
+    payloads: dict[int, bytes] = {}
+    for name, length in streams.items():
+        stream_fids += _fid(name, fe_lbn, False)
+        # Split like UDF does, because the length field is only 30 bits.
+        extents, remaining, at = [], length, data_lbn
+        while remaining > 0:
+            chunk = min(remaining, 2048 * 4)
+            extents.append((at, chunk))
+            payloads[at] = bytes([(at + i) % 251 for i in range(chunk)])
+            at += (chunk + 2047) // 2048
+            remaining -= chunk
+        sectors[PARTITION_START + fe_lbn] = _file_entry(False, extents, length)
+        fe_lbn += 1
+        data_lbn = at + 8
+
+    sectors[PARTITION_START + 5] = _file_entry(True, [(6, len(stream_fids))], len(stream_fids))
+    sectors[PARTITION_START + 6] = stream_fids.ljust(2048, b"\0")
+
+    for lbn, payload in payloads.items():
+        for i in range(0, len(payload), 2048):
+            sectors[PARTITION_START + lbn + i // 2048] = payload[i:i + 2048].ljust(2048, b"\0")
+
+    last = max(sectors) + 1
+    image = bytearray(2048 * max(last, MIN_SECTORS))
+    for n, block in sectors.items():
+        image[n * 2048:(n + 1) * 2048] = block.ljust(2048, b"\0")[:2048]
+    path.write_bytes(bytes(image))
+    return path
+
+
+def test_the_udf_reader_finds_the_feature(tmp_path):
+    """A Blu-ray is UDF, and the ffmpeg this image ships has no libbluray. The
+    filesystem is read here instead so disc support does not depend on how
+    somebody built ffmpeg — which has now been the reason it broke twice."""
+    iso = build_udf_volume(tmp_path / "bd.iso",
+                           {"00001.M2TS": 4096, "00002.M2TS": 20000,
+                            "00003.M2TS": 8192})
+    title = disc.bluray_main_title(str(iso))
+    assert title.name == "00002.M2TS"
+    assert title.length == 20000
+
+
+def test_a_split_stream_is_stitched_back_into_one_range(tmp_path):
+    """UDF splits a large file because its length field is 30 bits, not
+    because the data is scattered — so a 30 GB stream arrives as ~30 extents
+    that are adjacent on disc and have to be recognised as one run."""
+    iso = build_udf_volume(tmp_path / "bd.iso", {"00001.M2TS": 20000})
+    title = disc.bluray_main_title(str(iso))
+    assert len(title.extents) > 1, "the fixture should exercise the split"
+    whole = title.contiguous
+    assert whole is not None and whole.length == 20000
+
+
+def test_a_genuinely_scattered_stream_is_refused(tmp_path):
+    """Guessing a single range across a gap would read the wrong bytes."""
+    scattered = disc.UdfFile("x.m2ts", False, [
+        disc.Extent(0, 100), disc.Extent(500, 100)], 200)
+    assert scattered.contiguous is None
+
+
+def test_the_extent_points_at_the_real_bytes(tmp_path, monkeypatch):
+    """The whole point: the byte range handed to ffmpeg has to be the file."""
+    iso = build_udf_volume(tmp_path / "bd.iso", {"00001.M2TS": 6000})
+    monkeypatch.setattr(disc, "protocols_for",
+                        lambda b: frozenset({"file", "subfile"}))
+    url, found = disc.input_url(str(iso))
+
+    assert url.startswith("subfile,,start,")
+    start = int(url.split("start,")[1].split(",")[0])
+    end = int(url.split("end,")[1].split(",")[0])
+    assert end - start == 6000
+
+    title = disc.bluray_main_title(str(iso))
+    first = title.extents[0]
+    expected = bytes([(first.offset // 2048 - PARTITION_START + i) % 251
+                      for i in range(16)])
+    assert iso.read_bytes()[start:start + 16] == expected
+    assert found.kind == "bluray"
+
+
+def test_libbluray_is_preferred_when_it_is_there(tmp_path, monkeypatch):
+    """It follows the disc's own playlists, which is more faithful than
+    picking the largest stream."""
+    iso = build_udf_volume(tmp_path / "bd.iso", {"00001.M2TS": 4096})
+    monkeypatch.setattr(disc, "protocols_for",
+                        lambda b: frozenset({"file", "subfile", "bluray"}))
+    url, _ = disc.input_url(str(iso))
+    assert url == f"bluray:{iso}"

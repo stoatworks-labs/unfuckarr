@@ -229,13 +229,14 @@ def probe(path: str | Path, ffprobe: str = "ffprobe", timeout: int = 120,
     """Read container and stream metadata. Raises ProbeError if unreadable."""
     path = str(path)
     url, disc_kind = path, ""
+    found_disc = None
     if disc_mod.is_disc_image(path):
         # ffprobe handed a disc image by filename says "Invalid data found",
         # which reads exactly like a corrupt file and is not one. The protocol
         # list is ffmpeg's, not ffprobe's, but they are the same build.
         try:
-            url, found = disc_mod.input_url(path, ffmpeg=ffmpeg)
-            disc_kind = found.kind
+            url, found_disc = disc_mod.input_url(path, ffmpeg=ffmpeg)
+            disc_kind = found_disc.kind
         except disc_mod.DiscError as exc:
             raise DiscUnreadable(str(exc)) from None
     cmd = [
@@ -290,6 +291,16 @@ def probe(path: str | Path, ffprobe: str = "ffprobe", timeout: int = 120,
     )
     if not disc_kind and info.container in ("mp4", "m4v", "mov"):
         info.faststart = check_faststart(path)
+
+    if disc_kind and found_disc is not None and found_disc.runs:
+        # A raw MPEG-TS read through `subfile` reports a duration that is
+        # simply wrong — 117 seconds for a 137-minute film, measured. That
+        # number decides whether the integrity check calls a file truncated,
+        # so a disc read this way must have it measured properly rather than
+        # taken on trust.
+        measured = disc_mod.stream_duration(path, found_disc.runs, ffprobe)
+        if measured > 0:
+            info.duration = measured
     # A duration missing from the container header is normal for MPEG-TS;
     # fall back to the video stream's own duration before calling it unknown.
     if info.duration <= 0:
