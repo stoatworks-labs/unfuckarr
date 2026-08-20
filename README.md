@@ -215,7 +215,8 @@ half the encode engine is always there for Emby.
 
 Measured on a Radeon 880M: flat out, a 4K HEVC encode reports **958 ms of engine time per
 wall-second**; `SIGSTOP` takes that to a true **0**; `SIGCONT` returns it to **966 ms/s** and the
-finished file is valid. The two obvious metrics — `gpu_busy_percent` in sysfs and `VCN Load` in
+finished file is valid. Asked for 50% of the engine, the governor settles at **50.5%**; asked for
+25%, at **27.0%**. The two obvious metrics — `gpu_busy_percent` in sysfs and `VCN Load` in
 debugfs — both read **0** throughout that same encode, so fdinfo is not merely the nicest option,
 it is the only one that works.
 

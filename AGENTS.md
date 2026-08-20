@@ -321,6 +321,18 @@ has run", and this project has now been wrong about that once.
   an info finding and a `none` decision, and the DVD `subfile` route reading a real MPEG-PS
   stream back out of a real image through the byte range the parser computed.
 
+**Verified on the GPU, 2026-08-19** — `governor.py` driving a real 4K HEVC VAAPI encode in the
+shipped container, measured through `drm-engine-enc`:
+
+| asked for | settled at | on-fraction |
+|---|---|---|
+| 50% | **50.5%** (range 49–56%) | 0.51 |
+| 25% | **27.0%** (range 24–61%) | 0.26 |
+
+The first two or three samples of any run read 96–97%: the controller deliberately runs the first
+period flat out to find out whether the job touches the encode engine at all, and averaging those
+in is what makes a correct governor look like it overshoots. Judge it on the settled figure.
+
 **Verified against the live library on 2026-08-19** — 104 real disc images, read with the
 container's own ffmpeg:
 
@@ -345,6 +357,10 @@ container's own ffmpeg:
   verify against. That is why the default stays off, and why most 4K discs report
   `hdr_not_shrunk` rather than being touched. Do not flip the default without an HDR file to
   check the output against.
+- **The continuous worker has never run against the live library.** Its parts are covered — the
+  candidate query, the idle conditions, the governor against a real GPU — but "a worker that runs
+  for weeks" is a claim only time can support, and the failure mode to watch for is the backlog
+  not draining because every candidate fails for the same reason.
 - **No disc has actually been shrunk.** The read path is verified against the real library; the
   write path — a multi-hour 4K HEVC encode out of a disc image, replacing a 90 GB `.iso` with an
   `.mkv` — has not been run. Note also that most 4K discs are HDR, and `allow_hdr` is off by
