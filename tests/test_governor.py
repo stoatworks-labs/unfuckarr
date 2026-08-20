@@ -170,17 +170,31 @@ def test_a_software_encode_is_left_completely_alone(fake_proc, monkeypatch):
 
 # -- picking the next candidate ------------------------------------------
 
+def candidate(path: str, priority=None, size=9, status="unmeasured", **extra):
+    """A row the worker should consider: the status *and* the finding.
+
+    Both matter — the query looks for the finding rather than trusting status
+    alone, because status precedence hides a candidate under `hygiene` the
+    moment its metadata needs tidying.
+    """
+    db.ex("INSERT INTO files (path, status, size, shrink_priority) VALUES (?,?,?,?)",
+          (path, status, size, priority))
+    db.ex("INSERT INTO findings (path, category, code, severity, created) "
+          "VALUES (?,?,?,?,?)", (path, "efficiency", "not_measured", "info", 1.0))
+    for column, value in extra.items():
+        db.ex(f"UPDATE files SET {column}=? WHERE path=?", (value, path))
+
+
+
 def test_the_fattest_candidate_is_taken_first(settings):
     """The order decides which savings land this month and which land next
     year, so it is not incidental."""
     from unfuckarr.service import Service
 
-    rows = [("/media/lean.mkv", 1.1, 8_000_000_000),
-            ("/media/fat.mkv", 4.8, 40_000_000_000),
-            ("/media/middling.mkv", 2.4, 20_000_000_000)]
-    for path, priority, size in rows:
-        db.ex("INSERT INTO files (path, status, size, shrink_priority) "
-              "VALUES (?,?,?,?)", (path, "unmeasured", size, priority))
+    for path, priority, size in (("/media/lean.mkv", 1.1, 8_000_000_000),
+                                 ("/media/fat.mkv", 4.8, 40_000_000_000),
+                                 ("/media/middling.mkv", 2.4, 20_000_000_000)):
+        candidate(path, priority, size)
 
     assert Service._next_shrink_candidate()["path"] == "/media/fat.mkv"
 
@@ -188,16 +202,12 @@ def test_the_fattest_candidate_is_taken_first(settings):
 def test_finished_and_written_off_files_are_not_picked_up_again(settings):
     from unfuckarr.service import Service
 
-    db.ex("INSERT INTO files (path, status, size, shrink_priority, shrunk) "
-          "VALUES (?,?,?,?,?)", ("/media/done.mkv", "unmeasured", 9, 9.0, 1.0))
-    db.ex("INSERT INTO files (path, status, size, shrink_priority, shrink_skipped) "
-          "VALUES (?,?,?,?,?)", ("/media/no.mkv", "unmeasured", 9, 8.0, "no saving"))
-    db.ex("INSERT INTO files (path, status, size, shrink_priority, shrink_attempts) "
-          "VALUES (?,?,?,?,?)", ("/media/failed.mkv", "unmeasured", 9, 7.0, 1))
+    candidate("/media/done.mkv", 9.0, shrunk=1.0)
+    candidate("/media/no.mkv", 8.0, shrink_skipped="no saving")
+    candidate("/media/failed.mkv", 7.0, shrink_attempts=1)
     assert Service._next_shrink_candidate() is None
 
-    db.ex("INSERT INTO files (path, status, size, shrink_priority) "
-          "VALUES (?,?,?,?)", ("/media/next.mkv", "unmeasured", 9, 1.0))
+    candidate("/media/next.mkv", 1.0)
     assert Service._next_shrink_candidate()["path"] == "/media/next.mkv"
 
 
@@ -206,10 +216,8 @@ def test_an_unpriced_row_sorts_behind_a_priced_one(settings):
     nothing has assessed should not jump the queue."""
     from unfuckarr.service import Service
 
-    db.ex("INSERT INTO files (path, status, size) VALUES (?,?,?)",
-          ("/media/unknown.mkv", "unmeasured", 50_000_000_000))
-    db.ex("INSERT INTO files (path, status, size, shrink_priority) VALUES (?,?,?,?)",
-          ("/media/priced.mkv", "unmeasured", 1_000_000_000, 0.1))
+    candidate("/media/unknown.mkv", None, 50_000_000_000)
+    candidate("/media/priced.mkv", 0.1, 1_000_000_000)
     assert Service._next_shrink_candidate()["path"] == "/media/priced.mkv"
 
 
@@ -233,3 +241,44 @@ def test_the_worker_stands_down_when_there_is_nothing_to_do(settings):
         assert Service._shrink_idle_reason(settings, shrink_blocked) == "paused"
     finally:
         state.paused = False
+
+
+def test_a_file_needing_tidying_is_still_a_shrink_candidate(settings):
+    """`decide` prefers a shrink over a hygiene flag, because the re-encode
+    rewrites every byte and carries the tag fixes with it. Selecting on status
+    alone missed that entirely: status precedence files anything with untidy
+    metadata under `hygiene`, and on the live library that hid 1,489 perfectly
+    good candidates from the worker while `decide` would have shrunk them."""
+    from unfuckarr.service import Service
+
+    candidate("/media/tidy.mkv", 1.0, status="unmeasured")
+    candidate("/media/untidy.mkv", 1.0, status="hygiene")
+
+    seen = set()
+    for _ in range(2):
+        row = Service._next_shrink_candidate()
+        assert row is not None
+        seen.add(row["path"])
+        db.ex("UPDATE files SET shrunk=1 WHERE path=?", (row["path"],))
+    assert seen == {"/media/tidy.mkv", "/media/untidy.mkv"}
+
+
+def test_broken_files_are_not_shrink_candidates(settings):
+    """Repairing comes first; they become candidates once repaired."""
+    from unfuckarr.service import Service
+
+    for status in ("corrupt", "incompatible"):
+        candidate(f"/media/{status}.mkv", 5.0, status=status)
+    assert Service._next_shrink_candidate() is None
+
+
+def test_a_candidate_needs_the_finding_not_just_the_status(settings):
+    """A file whose finding has been resolved is done, whatever its status."""
+    from unfuckarr.service import Service
+
+    db.ex("INSERT INTO files (path, status, size) VALUES (?,?,?)",
+          ("/media/stale.mkv", "unmeasured", 9))
+    db.ex("INSERT INTO findings (path, category, code, severity, created, resolved) "
+          "VALUES (?,?,?,?,?,?)",
+          ("/media/stale.mkv", "efficiency", "not_measured", "info", 1.0, 2.0))
+    assert Service._next_shrink_candidate() is None

@@ -98,7 +98,17 @@ Break any of these and the failure is quiet and expensive.
     the per-scan cap means the order decides which savings land this month and which land next
     year. Do not reintroduce it as a filter.
 
-13. **`unmeasured` is a state, not a claim, and it has to drain.** The finding is `not_measured`
+13. **The shrink worker selects on the *finding*, not the status.** `CheckResult.status` is a
+    single word and its precedence puts anything with untidy metadata under `hygiene` — but
+    `decide` deliberately prefers a shrink over a hygiene flag, because the re-encode rewrites
+    every byte and carries the tag fixes with it. A worker querying `status='unmeasured'`
+    therefore disagrees with `decide` about the same file. Found on the live library the hour it
+    was deployed: 1,489 candidates were invisible to the worker while `decide` would have shrunk
+    every one of them, leaving a backlog of 28 where there were 1,517. `corrupt` and
+    `incompatible` stay excluded, which also matches `decide`: something is wrong with those
+    files and repairing them comes first.
+
+14. **`unmeasured` is a state, not a claim, and it has to drain.** The finding is `not_measured`
     at info severity: nothing is wrong with the file, it simply has not been priced. Every file
     ends in one of two terminal states on the row — `shrunk` or `shrink_skipped`, both permanent
     — and `checks/efficiency.check` then returns nothing for it. That is what makes the count a
@@ -109,7 +119,7 @@ Break any of these and the failure is quiet and expensive.
     `ok` — the backlog is the whole library at the start, and re-probing all of it nightly buys
     nothing.
 
-14. **Efficiency findings are carried separately from everything else, and each separation is
+15. **Efficiency findings are carried separately from everything else, and each separation is
     load-bearing.** They are excluded from `CheckResult`'s hygiene warning set (so
     `hygiene_action` cannot be what decides to re-encode a 40 GB file), they are last in the
     status precedence (a corrupt file that is also large is corrupt), `oversize_action` is typed
@@ -120,7 +130,7 @@ Break any of these and the failure is quiet and expensive.
     there would disable the scanner permanently on almost every real library. They get
     `max_shrinks_per_scan` instead, and are applied *after* every repair.
 
-15. **Shrinking is paced, not rationed, and the pacing is measured.** It runs on its own
+16. **Shrinking is paced, not rationed, and the pacing is measured.** It runs on its own
     worker for as long as the service is up, because a library of thousands of candidates is not
     a per-scan job — a nightly batch of five takes years, and a batch big enough to matter is a
     scan that runs all day and blocks everything behind it. What makes that safe to leave on is
@@ -134,7 +144,7 @@ Break any of these and the failure is quiet and expensive.
     holding a semaphore and looking exactly like a hang; and it must stand down entirely for
     software encodes, which have no engine to share.
 
-16. **"I cannot read this" and "this is broken" are different sentences.** `probe` raises
+17. **"I cannot read this" and "this is broken" are different sentences.** `probe` raises
     `DiscUnreadable` (a `ProbeError` subclass) for a disc image no available route can open, and
     the integrity check turns that into an *info* `disc_not_inspectable` — never `probe_failed`,
     which is in `REPAIRABLE_CODES` and leads to a remux and then a redownload. This is not a
@@ -142,7 +152,7 @@ Break any of these and the failure is quiet and expensive.
     delete-and-re-search, and three 42 GB images are recoverable only because the recycle bin
     caught them. Any new "cannot open" path must land on the info finding, not the error one.
 
-17. **The tailnet-only stance is policy, not decoration.** The README warning (private
+18. **The tailnet-only stance is policy, not decoration.** The README warning (private
     network/tailnet only, never the public internet, no independent human security review) stays,
     because the service deletes media unattended and has no auth until a key is set. In the same
     spirit, `__main__.resolve_host` **fails the start** when `UNFUCKARR_BIND_INTERFACE` names an

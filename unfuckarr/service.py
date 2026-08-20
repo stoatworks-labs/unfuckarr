@@ -190,11 +190,24 @@ class Service:
         under DESC in SQLite, so a row that has never been checked falls to
         the back rather than to the front.
         """
+        # `hygiene` as well as `unmeasured`, because `decide` deliberately
+        # prefers a shrink over a hygiene flag — the re-encode rewrites every
+        # byte and carries the tag fixes with it. Selecting on status alone
+        # missed that: status precedence puts a file with untidy metadata
+        # under `hygiene`, so on the live library 1,489 perfectly good
+        # candidates were invisible to the worker while `decide` would have
+        # shrunk every one of them.
+        #
+        # `corrupt` and `incompatible` stay out, and that also matches
+        # `decide`: something is wrong with those files, and repairing them
+        # comes first. They become candidates once repaired.
         row = db.q1(
             "SELECT * FROM files "
-            " WHERE status = 'unmeasured' "
+            " WHERE status IN ('unmeasured', 'hygiene') "
             "   AND shrunk IS NULL AND shrink_skipped IS NULL "
             "   AND COALESCE(shrink_attempts, 0) = 0 "
+            "   AND EXISTS (SELECT 1 FROM findings d WHERE d.path = files.path "
+            "               AND d.code = 'not_measured' AND d.resolved IS NULL) "
             " ORDER BY shrink_priority DESC, size DESC LIMIT 1")
         return {k: row[k] for k in row.keys()} if row else None
 
