@@ -219,6 +219,38 @@ class Attempt:
                 if self.window_seconds else 0.0)
 
 
+def extract_window(src: str, start: float, length: float, dst: str,
+                   pix_fmt: str, ffmpeg: str, timeout: int) -> None:
+    """Cut one window out of the source, losslessly, once.
+
+    This exists because comparing a sample against a *re-seeked* source does
+    not reliably line the frames up, and when it does not the metric reports
+    quality loss that is not there. Measured: a **lossless** encode scored
+    VMAF 62 that way, and 99.9 against a window extracted like this. The
+    failure is silent and plausible-looking — lossy encodes still produced
+    believable-looking numbers, which is what made it survive a whole
+    calibration run.
+
+    So the window is decoded once and everything downstream — every candidate
+    encode, and the scoring of each — works from exactly these frames. It
+    costs disk and one pass over the sample, and it buys a comparison that is
+    correct by construction rather than by assuming two seeks agree.
+
+    x264 at ``-qp 0`` rather than ffv1: both are lossless, and it is several
+    times smaller and faster to write.
+    """
+    encoder = "libx264" if "10" not in pix_fmt else "libx264"
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-v", "error",
+           "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", src,
+           "-map", "0:v:0", "-an", "-sn", "-dn",
+           "-c:v", encoder, "-preset", "ultrafast", "-qp", "0",
+           "-pix_fmt", pix_fmt, "-f", "matroska", dst]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0 or not os.path.exists(dst):
+        raise QualityError(
+            (proc.stderr or "could not extract the sample window").strip()[:300])
+
+
 def _sample_encode(src: str, start: float, length: float, dst: str,
                    codec: str, crf: int, tcfg: TranscodeConfig,
                    pix_fmt: str, ffmpeg: str, timeout: int) -> None:
@@ -228,10 +260,13 @@ def _sample_encode(src: str, start: float, length: float, dst: str,
         cmd += ["-vaapi_device", tcfg.vaapi_device]
     elif hw == "qsv":
         cmd += ["-hwaccel", "qsv"]
-    # -ss before -i so ffmpeg seeks. Sampling the middle of a 40 GB file takes
-    # seconds this way and minutes the other way.
-    cmd += ["-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", src,
-            "-map", "0:v:0", "-an", "-sn", "-dn"]
+    # A length of 0 means "all of it" — the input is already an extracted
+    # window, so there is nothing to seek to. Otherwise -ss goes before -i so
+    # ffmpeg seeks: sampling the middle of a 40 GB file takes seconds that way
+    # and minutes the other way.
+    if length > 0:
+        cmd += ["-ss", f"{start:.3f}", "-t", f"{length:.3f}"]
+    cmd += ["-i", src, "-map", "0:v:0", "-an", "-sn", "-dn"]
     cmd += video_encode_args(codec, hw, crf, tcfg.preset, "mkv", pix_fmt=pix_fmt)
     cmd += ["-f", "matroska", dst]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -279,12 +314,13 @@ def score_pair(distorted: str, reference: str, window: tuple[float, float],
             verbosity = "info"
 
         cmd = [metric.binary, "-hide_banner", "-nostdin", "-v", verbosity]
-        if distorted_window is not None:
+        if distorted_window is not None and distorted_window[1] > 0:
             cmd += ["-ss", f"{distorted_window[0]:.3f}",
                     "-t", f"{distorted_window[1]:.3f}"]
-        cmd += ["-i", distorted,
-                "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", reference,
-                "-lavfi", lavfi, "-f", "null", "-"]
+        cmd += ["-i", distorted]
+        if length > 0:
+            cmd += ["-ss", f"{start:.3f}", "-t", f"{length:.3f}"]
+        cmd += ["-i", reference, "-lavfi", lavfi, "-f", "null", "-"]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if proc.returncode != 0:
             raise QualityError(
@@ -391,25 +427,26 @@ def search(info: MediaInfo, scfg: ShrinkConfig, tcfg: TranscodeConfig,
 
     tried: dict[int, Attempt] = {}
 
-    def evaluate(crf: int) -> Attempt:
+    def evaluate(crf: int, refs: list[str]) -> Attempt:
         if crf in tried:
             return tried[crf]
         step_started = time.time()
         scores: list[float] = []
         total_bytes = 0
         with tempfile.TemporaryDirectory(prefix="unfuckarr-q-") as tmp:
-            for i, (start, length) in enumerate(windows):
+            for i, ref in enumerate(refs):
                 if cancel is not None and cancel.is_set():
                     raise QualityError("cancelled")
                 sample = str(Path(tmp) / f"s{i}-crf{crf}.mkv")
-                # info.source, not info.path: a disc image is opened through
-                # bluray:/subfile, and both the sample encode and the
-                # comparison have to read the same way or they compare
-                # nothing to nothing.
-                _sample_encode(info.source, start, length, sample, codec, crf,
+                # Both the candidate encode and the comparison read the
+                # extracted window, never the original. That is the whole
+                # point: two seeks into the same file do not reliably land on
+                # the same frame, and when they do not the metric reports
+                # loss that is not there.
+                _sample_encode(ref, 0.0, 0.0, sample, codec, crf,
                                tcfg, pix_fmt, ffmpeg, timeout)
                 total_bytes += os.path.getsize(sample)
-                scores.append(score_pair(sample, info.source, (start, length),
+                scores.append(score_pair(sample, ref, (0.0, 0.0),
                                          metric, pix_fmt,
                                          threads=scfg.metric_threads,
                                          timeout=timeout))
@@ -427,10 +464,23 @@ def search(info: MediaInfo, scfg: ShrinkConfig, tcfg: TranscodeConfig,
     lo, hi = scfg.crf_min, scfg.crf_max
     best: Attempt | None = None
     steps = 0
+    work = tempfile.TemporaryDirectory(prefix="unfuckarr-ref-")
     try:
+        # Once, up front: every candidate encode and every comparison then
+        # works from exactly these frames. It also means the 40 GB source is
+        # read once rather than once per CRF tried.
+        refs = []
+        for i, (start, length) in enumerate(windows):
+            if cancel is not None and cancel.is_set():
+                raise QualityError("cancelled")
+            ref = str(Path(work.name) / f"ref{i}.mkv")
+            extract_window(info.source, start, length, ref, pix_fmt,
+                           ffmpeg, timeout)
+            refs.append(ref)
+
         while lo <= hi and steps < scfg.search_steps:
             mid = (lo + hi) // 2
-            attempt = evaluate(mid)
+            attempt = evaluate(mid, refs)
             steps += 1
             if passes(attempt):
                 best = attempt
@@ -443,6 +493,8 @@ def search(info: MediaInfo, scfg: ShrinkConfig, tcfg: TranscodeConfig,
                            target=metric.target,
                            attempts=sorted(tried.values(), key=lambda a: a.crf),
                            seconds=time.time() - started)
+    finally:
+        work.cleanup()
 
     attempts = sorted(tried.values(), key=lambda a: a.crf)
     if best is None:

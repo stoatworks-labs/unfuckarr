@@ -123,6 +123,9 @@ def fake_encoder(monkeypatch, score_at, bytes_at):
     """Stand in for ffmpeg with a monotonic model of it."""
     def _encode(src, start, length, dst, codec, crf, tcfg, pix_fmt, ffmpeg, timeout):
         Path(dst).write_bytes(b"\0" * bytes_at(crf))
+
+    monkeypatch.setattr(quality, "extract_window",
+                        lambda src, st, ln, dst, *a, **k: Path(dst).write_bytes(b"ref"))
     monkeypatch.setattr(quality, "_sample_encode", _encode)
     monkeypatch.setattr(quality, "score_pair",
                         lambda distorted, *a, **k: score_at(
@@ -178,6 +181,8 @@ def test_one_bad_scene_fails_a_passing_mean(settings, monkeypatch):
         # the mean passes and the worst sample does not.
         return 99.0 if calls["n"] % 2 else 86.0
 
+    monkeypatch.setattr(quality, "extract_window",
+                        lambda src, st, ln, dst, *a, **k: Path(dst).write_bytes(b"ref"))
     monkeypatch.setattr(quality, "_sample_encode", _encode)
     monkeypatch.setattr(quality, "score_pair", _score)
     plan = quality.search(media(), settings.shrink, settings.transcode,
@@ -752,3 +757,67 @@ def test_a_search_that_found_nothing_worth_doing_is_final():
     plan = QualityPlan(False, "cannot reach VMAF 92 anywhere in CRF 18-34",
                        metric="vmaf")
     assert not plan.error
+
+
+@needs_vmaf
+def test_a_lossless_encode_scores_as_lossless(video_factory, settings, tmp_path):
+    """The control that should have existed from the start.
+
+    The comparison used to score a sample against a *re-seeked* source, which
+    does not reliably land on the same frame. When it did not, the metric
+    reported quality loss that was not there — and it did so *plausibly*: lossy
+    encodes still produced believable numbers, so a whole CRF calibration was
+    run and reported before anyone checked the one case with a known answer.
+    Measured on real media, a lossless encode scored VMAF 62 that way, and
+    99.9 against a window extracted once.
+
+    If this ever drops below ~98 again, every number the search produces is
+    wrong by an unknown amount, in the direction of encoding more than needed.
+    """
+    src = video_factory("ref.mkv", seconds=6, size="320x180")
+    window = tmp_path / "window.mkv"
+    quality.extract_window(str(src), 1.0, 3.0, str(window), "yuv420p",
+                           settings.ffmpeg_path, 300)
+
+    lossless = tmp_path / "lossless.mkv"
+    subprocess.run(
+        [FFMPEG, "-v", "error", "-y", "-i", str(window), "-map", "0:v:0",
+         "-an", "-c:v", "libx264", "-preset", "ultrafast", "-qp", "0",
+         "-pix_fmt", "yuv420p", str(lossless)],
+        check=True, capture_output=True)
+
+    score = quality.score_pair(str(lossless), str(window), (0.0, 0.0),
+                               VMAF, "yuv420p")
+    # 95, not 99: VMAF's model is trained on 1080p and reads a little low on a
+    # 320x180 fixture (~97.9 here against 99.9 measured on a real 1080p
+    # remux). The bug this guards against scored 62, so the gap is enormous
+    # either way.
+    assert score > 95, f"a lossless encode scored {score} — the comparison is misaligned"
+
+
+@needs_ffmpeg
+def test_the_extracted_window_is_really_lossless(video_factory, settings, tmp_path):
+    """Everything downstream is compared against this, so if the extraction
+    itself lost anything, every score would be measuring that instead."""
+    from unfuckarr.probe import probe
+
+    src = video_factory("src.mkv", seconds=6, size="320x180")
+    window = tmp_path / "w.mkv"
+    quality.extract_window(str(src), 1.0, 2.0, str(window), "yuv420p",
+                           settings.ffmpeg_path, 300)
+
+    info = probe(str(window), settings.ffprobe_path)
+    assert info.video is not None
+    assert abs(info.duration - 2.0) < 0.5, info.duration
+
+    # Byte-identical decode against the same window of the source.
+    def frames(path, seek):
+        cmd = [FFMPEG, "-v", "error"]
+        if seek:
+            cmd += ["-ss", "1.0", "-t", "2.0"]
+        cmd += ["-i", str(path), "-map", "0:v:0", "-frames:v", "1",
+                "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"]
+        return subprocess.run(cmd, capture_output=True).stdout
+
+    assert frames(window, False) == frames(src, True), \
+        "the extracted window is not the frames it claims to be"

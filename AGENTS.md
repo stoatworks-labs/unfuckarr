@@ -175,6 +175,16 @@ Break any of these and the failure is quiet and expensive.
   for scoring, and the Dockerfile greps its filter list so a download that changes shape fails
   the build instead of silently downgrading every shrink to SSIM. Encoding stays on Debian's
   ffmpeg because that is the binary the VAAPI work was verified against.
+- **Never compare a sample against a re-seeked source.** Two seeks to the same timestamp in the
+  same file do not reliably land on the same frame, and when they do not the metric reports
+  quality loss that is not there. It fails *plausibly*, which is why it survived a whole
+  calibration run: lossy encodes still produced believable numbers, and only the one case with a
+  known answer gave it away — a **lossless** encode scored **VMAF 62**, where it must score ~100.
+  `quality.extract_window` cuts each window out once, losslessly, and every candidate encode and
+  every comparison then works from exactly those frames. Same media, after the fix: 99.93.
+  `test_a_lossless_encode_scores_as_lossless` is the guard; if it ever fails again, every number
+  the search produces is wrong by an unknown amount, in the direction of encoding harder than
+  necessary.
 - **The two inputs to a quality comparison must be seeked identically.** `quality.score_pair`
   takes a `distorted_window` for exactly this. Cutting the window out of a finished file with
   `-c copy` first does *not* work: a stream copy cannot start mid-GOP, so it silently begins at
@@ -359,6 +369,13 @@ has run", and this project has now been wrong about that once.
   non-disc image refused, libbluray chatter not counted as damage, an unopenable image producing
   an info finding and a `none` decision, and the DVD `subfile` route reading a real MPEG-PS
   stream back out of a real image through the byte range the parser computed.
+
+**The first calibration run was wrong and is kept here as a warning.** The table below was
+measured with the re-seeked comparison described in the traps above, so every figure in it is
+depressed by an unknown amount. It is retained because it looked entirely reasonable — monotonic,
+plausible spacing, a sensible-looking answer — and was reported as fact. The only thing that
+exposed it was scoring an encode whose answer was known in advance. **Re-measure before trusting
+any of it.**
 
 **Calibrated on real media, 2026-08-19** — the CRF range against a 54-minute 1080p H.264
 Blu-ray remux (28.9 Mbps video), scored with libvmaf:
