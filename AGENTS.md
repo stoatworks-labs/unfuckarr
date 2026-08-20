@@ -204,6 +204,23 @@ Break any of these and the failure is quiet and expensive.
   `_container_from` reconciles that against the extension.
 - **PGS subtitles cannot be copied into MP4** — it fails the whole job. `_subtitles_to_drop`
   handles it per container.
+- **`hevc_vaapi` on Mesa/AMD emits 1088 rows for a 1080p source, and hides it.** It pads to the
+  CTB boundary and does not signal a conformance window, so the output *decodes* eight rows
+  taller than the source with padding at the bottom — while the container metadata still says
+  1080, so `ffprobe` reports the right number and everything looks fine. The only way to see it
+  is to decode a frame and count bytes: 3,133,440 against the source's 3,110,400 for yuv420p
+  1920x1080. Consequences, both found on 2026-08-19:
+  - **The quality search cannot run at all on VAAPI output.** Every comparison dies with
+    "Width and height of input videos must be same" — libvmaf *and* ssim, so it is not a metric
+    problem.
+  - **A VAAPI re-encode silently changes the picture.** `_verify_output` did not look at
+    dimensions, so a shrink or a compat transcode would have replaced a 1080p file with a padded
+    1088p one. It checks now, and that check must stay: nothing in this application ever asks for
+    a resolution change, so one is always a defect.
+
+  `scale_vaapi` does not fix it — it breaks the pipeline outright, consistent with the trap
+  below. Until there is a fix, hardware encoding is unusable for anything that has to be
+  *compared* with its source. Software encoding is unaffected and is calibrated (see below).
 - **Never ask VAAPI to filter frames it did not decode.** `-hwaccel vaapi
   -hwaccel_output_format vaapi` + `scale_vaapi` only works when the *decoder* also ran on the
   GPU. Hardware decode is per-codec, and the sources this tool exists to fix are exactly the ones
@@ -321,6 +338,22 @@ has run", and this project has now been wrong about that once.
   an info finding and a `none` decision, and the DVD `subfile` route reading a real MPEG-PS
   stream back out of a real image through the byte range the parser computed.
 
+**Calibrated on real media, 2026-08-19** — the CRF range against a 54-minute 1080p H.264
+Blu-ray remux (28.9 Mbps video), scored with libvmaf:
+
+| CRF | VMAF | worst sample | Mbps | vs source |
+|---|---|---|---|---|
+| 18 | 96.6 | 95.4 | 10.92 | 62% smaller |
+| 22 | 93.7 | 92.5 | 3.18 | 89% smaller |
+| 26 | 90.0 | 88.7 | 0.97 | 97% smaller |
+| 30 | 84.7 | 83.2 | 0.50 | 98% smaller |
+| 34 | 76.6 | 74.7 | 0.31 | 99% smaller |
+
+So the default range 18–34 brackets the VMAF 92 target properly — it falls between CRF 22 and
+26, in the middle of the range rather than pegged at an end, which is what the bisection needs.
+This is the **software** encoder; the VAAPI equivalent could not be measured at all, for the
+reason in the traps above.
+
 **Verified on the GPU, 2026-08-19** — `governor.py` driving a real 4K HEVC VAAPI encode in the
 shipped container, measured through `drm-engine-enc`:
 
@@ -361,6 +394,9 @@ container's own ffmpeg:
   candidate query, the idle conditions, the governor against a real GPU — but "a worker that runs
   for weeks" is a claim only time can support, and the failure mode to watch for is the backlog
   not draining because every candidate fails for the same reason.
+- **The VAAPI `-qp` scale is still unmeasured**, and now cannot be measured until the 1088
+  padding is dealt with. Everything calibrated above is libx265's CRF. Do not assume the numbers
+  transfer: VAAPI's `-qp` is constant-QP, not CRF, and its rate allocation is different.
 - **No disc has actually been shrunk.** The read path is verified against the real library; the
   write path — a multi-hour 4K HEVC encode out of a disc image, replacing a 90 GB `.iso` with an
   `.mkv` — has not been run. Note also that most 4K discs are HDR, and `allow_hdr` is off by

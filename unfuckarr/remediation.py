@@ -404,6 +404,20 @@ class Remediator:
             return f"output is unprobeable: {exc}"
         if out.video is None:
             return "output has no video stream"
+        src_v = source.video
+        if src_v is not None and (out.video.width, out.video.height) != \
+                (src_v.width, src_v.height):
+            # Nothing here ever asks for a resolution change, so one is a
+            # defect. `hevc_vaapi` on Mesa/AMD pads 1080 to the 1088 CTB
+            # boundary and does not signal a conformance window, so the
+            # output decodes eight rows taller than the source with padding
+            # at the bottom — and the container metadata still says 1080,
+            # which is why ffprobe does not give it away. Verified by
+            # decoding a frame and counting bytes: 3,133,440 against the
+            # source's 3,110,400.
+            return (f"output is {out.video.width}x{out.video.height} against a "
+                    f"{src_v.width}x{src_v.height} source — the encoder changed "
+                    "the picture size, which nothing asked it to do")
         if not out.audio and source.audio:
             return "output lost its audio"
         if source.duration > 0:
@@ -613,6 +627,18 @@ class Remediator:
                 if cancel.is_set():
                     self._set_job(job_id, "cancelled", 0, "cancelled")
                     return {"action": "flag", "ok": False, "message": "cancelled"}
+                if qplan.error:
+                    # The search could not be carried out — a broken encoder
+                    # setting, a missing binary, a comparison that would not
+                    # run. That says nothing about the file, and writing it
+                    # off permanently would quietly retire the whole library
+                    # over a configuration problem that is one setting away
+                    # from being fixed.
+                    db.log("shrink_search_failed", "warn", path, qplan.as_dict())
+                    self._set_job(job_id, "failed", 0, qplan.reason,
+                                  error=qplan.reason)
+                    return {"action": "flag", "ok": False,
+                            "message": qplan.reason}
                 db.log("shrink_declined", "info", path, qplan.as_dict())
                 return self._skip_shrink(job_id, path, qplan.reason)
 

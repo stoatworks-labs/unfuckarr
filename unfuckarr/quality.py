@@ -316,6 +316,12 @@ class QualityPlan:
 
     ok: bool
     reason: str
+    # True when the search could not be *carried out* — as opposed to having
+    # been carried out and found nothing worth doing. The caller must not
+    # write a file off permanently for the first kind: it is a statement about
+    # the tooling, and the same file may shrink perfectly well once whatever
+    # broke is fixed.
+    error: bool = False
     metric: str = ""
     estimated: bool = False
     target: float = 0.0
@@ -336,7 +342,8 @@ class QualityPlan:
 
     def as_dict(self) -> dict:
         return {
-            "ok": self.ok, "reason": self.reason, "metric": self.metric,
+            "ok": self.ok, "reason": self.reason, "error": self.error,
+            "metric": self.metric,
             "estimated": self.estimated, "target": round(self.target, 4),
             "crf": self.crf, "codec": self.codec,
             "score": round(self.score, 4), "worst": round(self.worst, 4),
@@ -368,7 +375,7 @@ def search(info: MediaInfo, scfg: ShrinkConfig, tcfg: TranscodeConfig,
         metric = resolve_metric(scfg, ffmpeg)
     if metric is None:
         return QualityPlan(False, "no quality metric available — neither "
-                                  "libvmaf nor ssim could be found")
+                                  "libvmaf nor ssim could be found", error=True)
 
     codec = scfg.codec
     pix_fmt = pix_fmt_for(info)
@@ -431,7 +438,7 @@ def search(info: MediaInfo, scfg: ShrinkConfig, tcfg: TranscodeConfig,
             else:
                 hi = mid - 1
     except QualityError as exc:
-        return QualityPlan(False, f"quality search failed: {exc}",
+        return QualityPlan(False, f"quality search failed: {exc}", error=True,
                            metric=metric.name, estimated=metric.is_estimate,
                            target=metric.target,
                            attempts=sorted(tried.values(), key=lambda a: a.crf),

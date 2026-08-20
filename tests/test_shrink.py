@@ -689,3 +689,66 @@ def test_shrink_columns_are_added_to_an_existing_database(tmp_path):
     row = db.q1("SELECT status, shrunk FROM files WHERE path='/media/a.mkv'")
     assert row["status"] == "ok", "the existing rows must survive"
     assert row["shrunk"] is None
+
+
+# -- what the hardware encoder taught us ---------------------------------
+
+@needs_ffmpeg
+def test_an_output_that_changed_size_is_rejected(video_factory, settings,
+                                                 monkeypatch):
+    """Nothing here ever asks for a resolution change, so one is a defect.
+
+    Found on real hardware: `hevc_vaapi` on Mesa/AMD pads 1080 to the 1088 CTB
+    boundary without signalling a conformance window, so the output decodes
+    eight rows taller than the source — and the container metadata still says
+    1080, so ffprobe does not give it away. Verified by decoding a frame and
+    counting bytes: 3,133,440 against the source's 3,110,400. Nothing in the
+    verification looked at dimensions, so a shrink would have replaced a
+    1080p file with a padded 1088p one.
+    """
+    from unfuckarr.probe import probe
+
+    path = video_factory("src.mkv", seconds=4, size="320x180")
+    taller = Path(str(path).replace("src.mkv", "taller.mkv"))
+    subprocess.run(
+        [FFMPEG, "-v", "error", "-y", "-i", str(path), "-map", "0:v:0",
+         "-map", "0:a?", "-vf", "pad=320:184:0:0", "-c:v", "libx264",
+         "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(taller)],
+        check=True, capture_output=True)
+
+    source = probe(str(path), settings.ffprobe_path)
+    bad = Remediator(lambda: settings)._verify_output(
+        str(taller), source, settings)
+    assert bad is not None and "320x184" in bad and "320x180" in bad
+
+
+@needs_ffmpeg
+def test_a_search_that_could_not_run_does_not_write_the_file_off(
+        video_factory, settings, monkeypatch):
+    """A broken encoder setting is a statement about the tooling, not the
+    file. Writing it off permanently would quietly retire the whole library
+    over a configuration problem one setting away from being fixed — which is
+    exactly what a VAAPI encoder producing uncomparable output would have
+    done."""
+    path = video_factory("tooling.mkv", seconds=4)
+    row = insert(path)
+    monkeypatch.setattr(quality, "resolve_metric", lambda *a, **k: VMAF)
+    monkeypatch.setattr(quality, "search", lambda *a, **k: QualityPlan(
+        False, "quality search failed: Width and height of input videos must "
+               "be same.", error=True, metric="vmaf"))
+    result, info = check_file(str(path), settings)
+
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("shrink", "unmeasured"))
+    assert not out["ok"]
+    assert db.q1("SELECT shrink_skipped FROM files WHERE path=?",
+                 (str(path),))["shrink_skipped"] is None, \
+        "a tooling failure must not be recorded as a verdict on the file"
+
+
+def test_a_search_that_found_nothing_worth_doing_is_final():
+    """The other half: a verdict about the content is permanent, because it
+    will be just as true next time and costs hours of CPU to reach again."""
+    plan = QualityPlan(False, "cannot reach VMAF 92 anywhere in CRF 18-34",
+                       metric="vmaf")
+    assert not plan.error
