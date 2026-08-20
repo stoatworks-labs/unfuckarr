@@ -157,6 +157,24 @@ Break any of these and the failure is quiet and expensive.
   recognises none of the 98. `disc.identify` reads the Volume Recognition Sequence and only walks
   an ISO9660 directory when one is actually there — which is the DVD case, and the case where
   telling a DVD from a Blu-ray needs the directory.
+- **A Blu-ray's file metadata is usually not where its blocks appear to say.** UDF 2.50 puts file
+  entries and directory contents inside a *metadata file*, addressed through a second, virtual
+  partition; every disc measured here does that, so a reader resolving logical blocks directly
+  finds the file set descriptor missing. Behind that sits the opposite trap: the metadata
+  partition holds the metadata, but **file data stays in the physical partition underneath**.
+  Resolving data extents through the metadata file lands past its end, and the symptom is
+  exquisitely misleading — every directory reads perfectly and every single `.m2ts` fails.
+- **A raw MPEG-TS read through `subfile` reports a duration that is simply wrong** — 117 seconds
+  for a 137-minute film. That number decides whether the integrity check calls a file truncated,
+  so `disc.stream_duration` measures it from the first and last video presentation timestamps
+  instead, each found by probing a small window rather than reading 77 GiB. Cross-checked against
+  libbluray on a disc both can read: 8201.7 seconds against libbluray's 8201.4.
+- **The main title is the largest `.m2ts`, and that is a heuristic, not a fact.** On a disc using
+  seamless branching the feature is split, and the largest stream is one segment: measured across
+  ten real discs, two read short for that reason, one by 85%. So a *disc* that reads short of its
+  expected runtime raises `duration_below_expected` (info) and never `duration_mismatch` — on an
+  ordinary file that shortfall means truncation, on a disc it almost always means the heuristic
+  picked a segment. Reading `BDMV/PLAYLIST/*.mpls` for the longest playlist is the real fix.
 - **Never fall back to the ISO9660 bridge to find a Blu-ray's streams.** It is tempting when
   libudfread cannot read the UDF (4 of 104 images), and it is wrong: ISO9660 cannot describe a
   file over 4 GB in one extent, so the bridge lists the main feature in fragments. On a real 96 GB
@@ -489,8 +507,8 @@ unfuckarr/
   transcode.py       Plan builder, ffmpeg command, progress runner
   quality.py         Metric discovery, sampling, VMAF/SSIM scoring, the CRF search
   governor.py        Per-process GPU encode share from fdinfo, held by SIGSTOP/SIGCONT
-  disc.py            Reading .iso/.img without mounting: UDF/ISO9660 identification,
-                     bluray: and subfile URLs, libbluray noise filtering
+  disc.py            Reading .iso/.img without mounting: a UDF reader (metadata
+                     partitions included), ISO9660 for DVDs, subfile/concat URLs
   recycle.py         Recycle bin + retention
   remediation.py     decide() and Remediator
   scanner.py         Enumeration, check_file, the scan loop, the brakes

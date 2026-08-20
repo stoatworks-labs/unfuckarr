@@ -522,3 +522,33 @@ def test_libbluray_is_preferred_when_it_is_there(tmp_path, monkeypatch):
                         lambda b: frozenset({"file", "subfile", "bluray"}))
     url, _ = disc.input_url(str(iso))
     assert url == f"bluray:{iso}"
+
+
+@needs_ffmpeg
+def test_a_short_reading_disc_is_never_called_truncated(tmp_path, settings):
+    """The main title is picked as the largest stream, and on a disc that
+    splits its feature that is one segment of the film. Measured across ten
+    real discs, two read short for exactly that reason — one by 85%, which
+    against the *arr's runtime is "truncated" and would delete a perfectly
+    good 10 GB image."""
+    from unfuckarr.probe import MediaInfo, Stream
+
+    info = MediaInfo(path="/media/Film/Film.iso", input_url="subfile,,:x",
+                     disc_kind="bluray", duration=22 * 60, size=10 * 2**30,
+                     streams=[Stream(index=0, codec_type="video",
+                                     codec_name="hevc", width=1920, height=1080),
+                              Stream(index=1, codec_type="audio",
+                                     codec_name="ac3", channels=6)])
+    assert info.is_disc
+
+    stub = tmp_path / "Film.iso"
+    stub.write_bytes(b"\0" * (MIN_SECTORS * SECTOR))
+    info.path = str(stub)
+    r, _ = integrity_checks.check(str(stub), settings.integrity,
+                                  ffprobe=settings.ffprobe_path,
+                                  ffmpeg=settings.ffmpeg_path,
+                                  expected_runtime=143 * 60, info=info)
+    codes = {f.code for f in r.findings}
+    assert "duration_below_expected" in codes
+    assert "duration_mismatch" not in codes, \
+        "a disc that reads short must never be called truncated"

@@ -109,7 +109,22 @@ def check(
                   f"{expected_runtime / 60:.0f} min expected ({short:.0f}% short)")
         data = {"duration": info.duration, "expected": expected_runtime,
                 "short_pct": short}
-        if short >= cfg.duration_truncated_pct:
+        if info.is_disc:
+            # A disc image that reads short is far more likely to be a disc
+            # whose feature is split across several streams than a truncated
+            # download — the main title is picked as the largest .m2ts, and on
+            # a disc using seamless branching that is one segment of the film.
+            # Measured across ten real discs, two read short for exactly that
+            # reason, one of them by 85%. Condemning those would delete a
+            # perfectly good 10 GB image over a heuristic.
+            result.add(Finding(
+                "integrity", "duration_below_expected", "info",
+                f"{detail} — on a disc image this usually means the feature is "
+                "split across several streams rather than that anything is "
+                "wrong with it",
+                data,
+            ))
+        elif short >= cfg.duration_truncated_pct:
             result.add(Finding(
                 "integrity", "duration_mismatch", "error", detail, data))
         elif short > cfg.duration_tolerance_pct:
