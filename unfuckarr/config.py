@@ -151,6 +151,13 @@ class EfficiencyConfig(BaseModel):
     # wrong produces a grey, washed-out file that still plays — the worst kind
     # of failure, because nothing reports it. Off until asked for.
     allow_hdr: bool = False
+    # Disc images are read fine and measured fine, but re-encoding one is not
+    # proven: a full encode from a raw MPEG-TS byte range came out short
+    # (1620s of a 6604s film) on the live library. Every one of those was
+    # caught and discarded by the verification, so nothing was damaged — but
+    # they cost a full encode each to reach that conclusion. Off until the
+    # encode is right.
+    shrink_disc_images: bool = False
     # NOT a gate. The backlog is worked through fattest-first so the biggest
     # wins land first, and this is what "fattest" is measured against: the
     # ratio of a file's video bitrate to the target for its height. A file

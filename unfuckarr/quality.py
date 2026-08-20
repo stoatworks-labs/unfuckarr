@@ -560,26 +560,41 @@ def search(info: MediaInfo, scfg: ShrinkConfig, tcfg: TranscodeConfig,
 
 
 def verify(source: str, output: str, info: MediaInfo, scfg: ShrinkConfig,
-           metric: Metric, cancel=None) -> tuple[float, float]:
+           metric: Metric, cancel=None, ffmpeg: str = "ffmpeg") -> tuple[float, float]:
     """Score the finished file against the original. Returns (mean, worst).
 
     The search measured samples encoded on their own; a full encode is not
-    guaranteed to land in the same place — rate control behaves differently
-    over two hours than over fifteen seconds. This is the check that decides
-    whether the output is kept, so it reads the real output, not a sample of
-    the plan.
+    guaranteed to land in the same place, because rate control behaves
+    differently over two hours than over fifteen seconds. This is the check
+    that decides whether the output is kept.
+
+    Both sides are cut out losslessly first, for the same reason the search
+    does it: seeking two different files to the same timestamp does not
+    reliably reach the same frame. That was survivable when both were ordinary
+    Matroska with the same timebase — but a disc image is read as a raw
+    MPEG-TS byte range whose timestamps start wherever the stream happens to
+    start, so seeking it lands somewhere else entirely. Measured on the live
+    library: every disc encode scored between 0.0 and 32 against a target of
+    92, which is not quality loss, it is a comparison of two different films.
     """
     windows = sample_windows(info.duration, scfg.sample_count, scfg.sample_seconds)
+    if not windows:
+        raise QualityError("nothing could be scored")
     pix_fmt = pix_fmt_for(info)
     timeout = max(300, int(scfg.sample_seconds * 60))
     scores: list[float] = []
-    for start, length in windows:
-        if cancel is not None and cancel.is_set():
-            raise QualityError("cancelled")
-        scores.append(score_pair(output, source, (start, length), metric,
-                                 pix_fmt, threads=scfg.metric_threads,
-                                 timeout=timeout,
-                                 distorted_window=(start, length)))
+
+    with tempfile.TemporaryDirectory(prefix="unfuckarr-v-") as tmp:
+        for i, (start, length) in enumerate(windows):
+            if cancel is not None and cancel.is_set():
+                raise QualityError("cancelled")
+            ref = str(Path(tmp) / f"ref{i}.mkv")
+            got = str(Path(tmp) / f"out{i}.mkv")
+            extract_window(source, start, length, ref, pix_fmt, ffmpeg, timeout)
+            extract_window(output, start, length, got, pix_fmt, ffmpeg, timeout)
+            scores.append(score_pair(got, ref, (0.0, 0.0), metric, pix_fmt,
+                                     threads=scfg.metric_threads,
+                                     timeout=timeout))
     if not scores:
         raise QualityError("nothing could be scored")
     return statistics.fmean(scores), min(scores)

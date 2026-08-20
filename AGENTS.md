@@ -203,6 +203,12 @@ Break any of these and the failure is quiet and expensive.
   for scoring, and the Dockerfile greps its filter list so a download that changes shape fails
   the build instead of silently downgrading every shrink to SSIM. Encoding stays on Debian's
   ffmpeg because that is the binary the VAAPI work was verified against.
+- **`verify` has to cut both sides out too, not just the search.** Seeking two different files to
+  the same timestamp does not reliably reach the same frame, and while that was survivable when
+  both were ordinary Matroska with the same timebase, a disc image is read as a raw MPEG-TS byte
+  range whose timestamps start wherever the stream does. Live, every disc encode scored between
+  0.0 and 32 against a target of 92 — not quality loss, a comparison of two different films. The
+  guards held and nothing was damaged, but each verdict cost a full encode.
 - **Never compare a sample against a re-seeked source.** Two seeks to the same timestamp in the
   same file do not reliably land on the same frame, and when they do not the metric reports
   quality loss that is not there. It fails *plausibly*, which is why it survived a whole
@@ -500,6 +506,13 @@ container's own ffmpeg:
   candidate query, the idle conditions, the governor against a real GPU — but "a worker that runs
   for weeks" is a claim only time can support, and the failure mode to watch for is the backlog
   not draining because every candidate fails for the same reason.
+- **Encoding *out of* a disc image does not work yet, and is off by default**
+  (`shrink_disc_images`). Reading and measuring them is verified against the real library; the
+  full encode is not — on the live run it came out short, 1620s of a 6604s film, on a stream read
+  through `concat:`/`subfile`. Every one was caught by the duration check in `_verify_output` and
+  discarded, so the failure mode is wasted CPU rather than damaged media, but it is wasted a
+  whole encode at a time. The likely culprit is timestamp handling on a raw MPEG-TS byte range;
+  `-fflags +genpts+igndts` is already set, so it needs a proper look rather than another guess.
 - **No disc has actually been shrunk.** The read path is verified against the real library; the
   write path — a multi-hour 4K HEVC encode out of a disc image, replacing a 90 GB `.iso` with an
   `.mkv` — has not been run. Note also that most 4K discs are HDR, and `allow_hdr` is off by

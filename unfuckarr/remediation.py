@@ -764,7 +764,8 @@ class Remediator:
                  detail="checking the result against the original")
         try:
             mean, worst = quality.verify(info.source, dst, info, s.shrink,
-                                         metric, cancel=cancel)
+                                         metric, cancel=cancel,
+                                         ffmpeg=s.ffmpeg_path)
         except quality.QualityError as exc:
             # Unable to prove the output is good is not the same as knowing it
             # is bad, but it is not a licence to replace the original either.

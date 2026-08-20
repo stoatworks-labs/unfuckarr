@@ -114,6 +114,15 @@ def check(info: MediaInfo, cfg: EfficiencyConfig, result: CheckResult,
         return
     if v.codec_name in cfg.skip_codecs:
         return
+    if info.is_disc and not cfg.shrink_disc_images:
+        result.add(Finding(
+            "efficiency", "disc_not_shrunk", "info",
+            f"{v.height}p disc image — readable and measurable, but encoding "
+            "one out of a raw stream is not proven yet, so it is left alone. "
+            "Enable shrink_disc_images to include it.",
+            {"disc": info.disc_kind, "size": info.size},
+        ))
+        return
 
     mbps = video_mbps(info)
     target = target_for_height(v.height, cfg.target_mbps)

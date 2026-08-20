@@ -247,3 +247,21 @@ def test_shrinking_is_blocked_when_transcoding_is_off(settings):
     settings.transcode.enabled = True
     settings.shrink.enabled = False
     assert shrink_blocked(settings) is not None
+
+
+def test_disc_images_are_left_alone_until_encoding_them_is_proven(settings):
+    """They read fine and measure fine, but a full encode out of a raw
+    MPEG-TS byte range came out short on the live library — 1620s of a 6604s
+    film. The verification caught every one and nothing was damaged, but each
+    cost a full encode to reach that conclusion."""
+    info = media(size_mb=40000, duration=7200)
+    object.__setattr__(info, "disc_kind", "bluray")
+    assert info.is_disc
+
+    result = run(info, settings)
+    assert [f.code for f in result.findings] == ["disc_not_shrunk"]
+    assert all(f.severity == "info" for f in result.findings)
+    assert result.status == "ok", "a parked disc must not sit in the backlog"
+
+    settings.efficiency.shrink_disc_images = True
+    assert [f.code for f in run(info, settings).findings] == ["not_measured"]
