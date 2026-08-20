@@ -252,7 +252,8 @@ Break any of these and the failure is quiet and expensive.
 
   Until the image ships an ffmpeg 8.x, **hardware encoding is unusable for anything that has to
   be compared with its source**, and `_verify_output`'s dimension check is what stops it doing
-  damage. Software encoding is unaffected and is calibrated (see below).
+  damage. On ffmpeg 8 it works and measures well — see the calibration table below, where VAAPI
+  reached the quality target at a slightly *lower* bitrate than x265 `medium`.
 - **Never ask VAAPI to filter frames it did not decode.** `-hwaccel vaapi
   -hwaccel_output_format vaapi` + `scale_vaapi` only works when the *decoder* also ran on the
   GPU. Hardware decode is per-codec, and the sources this tool exists to fix are exactly the ones
@@ -370,28 +371,26 @@ has run", and this project has now been wrong about that once.
   an info finding and a `none` decision, and the DVD `subfile` route reading a real MPEG-PS
   stream back out of a real image through the byte range the parser computed.
 
-**The first calibration run was wrong and is kept here as a warning.** The table below was
-measured with the re-seeked comparison described in the traps above, so every figure in it is
-depressed by an unknown amount. It is retained because it looked entirely reasonable — monotonic,
-plausible spacing, a sensible-looking answer — and was reported as fact. The only thing that
-exposed it was scoring an encode whose answer was known in advance. **Re-measure before trusting
-any of it.**
+**Calibrated on real media, 2026-08-20**, with the fixed comparison — one 6-second 1080p window
+cut losslessly out of a 28.9 Mbps H.264 Blu-ray remux, every candidate encoded from that window
+and scored against it:
 
-**Calibrated on real media, 2026-08-19** — the CRF range against a 54-minute 1080p H.264
-Blu-ray remux (28.9 Mbps video), scored with libvmaf:
+| target | hevc_vaapi | libx265 |
+|---|---|---|
+| control (near-lossless) | QP 1 → **99.87** | CRF 0 → **99.73** |
+| excellent (95) | QP 22 → 95.55, 9.3 Mbps | CRF 18 → 95.34, 8.1 Mbps |
+| **good (92)** | **QP 26 → 91.96, 2.2 Mbps (92% smaller)** | **CRF 22 → 92.46, 2.7 Mbps (91% smaller)** |
+| acceptable (85) | QP 31 ≈ 85, ~1 Mbps | CRF 29 ≈ 85, ~0.7 Mbps |
 
-| CRF | VMAF | worst sample | Mbps | vs source |
-|---|---|---|---|---|
-| 18 | 96.6 | 95.4 | 10.92 | 62% smaller |
-| 22 | 93.7 | 92.5 | 3.18 | 89% smaller |
-| 26 | 90.0 | 88.7 | 0.97 | 97% smaller |
-| 30 | 84.7 | 83.2 | 0.50 | 98% smaller |
-| 34 | 76.6 | 74.7 | 0.31 | 99% smaller |
+Two things follow. **The default range 18–34 brackets all three tiers for both encoders**, with
+the "good" target landing mid-range where a bisection can actually find it — so it needs no
+change. And **VAAPI is not the poor relation here**: at the 92 target it reached a slightly lower
+bitrate than x265 `medium` for the same score. That is one window of one file and should not be
+read as a general claim about the encoders, but it does mean there is no quality argument for
+preferring software once the geometry bug is fixed.
 
-So the default range 18–34 brackets the VMAF 92 target properly — it falls between CRF 22 and
-26, in the middle of the range rather than pegged at an end, which is what the bisection needs.
-This is the **software** encoder; the VAAPI equivalent could not be measured at all, for the
-reason in the traps above.
+The control rows are the point of the table. Before `extract_window`, those same two encodes
+scored 76.7 and 62.
 
 **Verified on the GPU, 2026-08-19** — `governor.py` driving a real 4K HEVC VAAPI encode in the
 shipped container, measured through `drm-engine-enc`:
@@ -433,9 +432,6 @@ container's own ffmpeg:
   candidate query, the idle conditions, the governor against a real GPU — but "a worker that runs
   for weeks" is a claim only time can support, and the failure mode to watch for is the backlog
   not draining because every candidate fails for the same reason.
-- **The VAAPI `-qp` scale is still unmeasured**, and now cannot be measured until the 1088
-  padding is dealt with. Everything calibrated above is libx265's CRF. Do not assume the numbers
-  transfer: VAAPI's `-qp` is constant-QP, not CRF, and its rate allocation is different.
 - **No disc has actually been shrunk.** The read path is verified against the real library; the
   write path — a multi-hour 4K HEVC encode out of a disc image, replacing a 90 GB `.iso` with an
   `.mkv` — has not been run. Note also that most 4K discs are HDR, and `allow_hdr` is off by
