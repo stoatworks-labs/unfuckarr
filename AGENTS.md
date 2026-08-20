@@ -219,8 +219,30 @@ Break any of these and the failure is quiet and expensive.
     a resolution change, so one is always a defect.
 
   `scale_vaapi` does not fix it — it breaks the pipeline outright, consistent with the trap
-  below. Until there is a fix, hardware encoding is unusable for anything that has to be
-  *compared* with its source. Software encoding is unaffected and is calibrated (see below).
+  below. **The fix is a newer ffmpeg**, established by testing the same command and source
+  against four builds on the same hardware:
+
+  | ffmpeg | VAAPI geometry | libvmaf |
+  |---|---|---|
+  | Debian bookworm 5.1.9 (what the image ships) | **1088, padded** | no |
+  | Debian trixie 7.1.5 | **1088, padded** | no |
+  | BtbN static (master) | aborts — bundled libva cannot reach the host driver | yes |
+  | **linuxserver.io 8.0.1** | **1080, correct** | **yes** |
+
+  So ffmpeg 8.x fixes it, and the linuxserver.io build has libvmaf as well — one binary instead
+  of Debian's plus a separate scorer. That is exactly what Shrinkray does (it is built *from*
+  `lscr.io/linuxserver/ffmpeg`), which is why it can do VAAPI encodes when this cannot.
+
+  Grafting that binary onto a Debian Python base does **not** work as-is: its `/usr/local/lib`
+  carries its own libva (2.23), which shadows the distro's and then cannot load Mesa's
+  `radeonsi_drv_video.so`, so device creation fails with "unknown libva error". Either leave that
+  libva behind and use the distro's, or take Mesa from the same image too. Seventeen ordinary
+  system libraries also have to be installed alongside (libxcb*, libX11, libglib, libgomp,
+  libv4l2, libxml2, libasound, libbrotli, libexpat, libOpenCL).
+
+  Until the image ships an ffmpeg 8.x, **hardware encoding is unusable for anything that has to
+  be compared with its source**, and `_verify_output`'s dimension check is what stops it doing
+  damage. Software encoding is unaffected and is calibrated (see below).
 - **Never ask VAAPI to filter frames it did not decode.** `-hwaccel vaapi
   -hwaccel_output_format vaapi` + `scale_vaapi` only works when the *decoder* also ran on the
   GPU. Hardware decode is per-codec, and the sources this tool exists to fix are exactly the ones
