@@ -153,16 +153,22 @@ jobs:
           curl -fsS http://localhost:6969/api/status > /dev/null
           curl -fsS http://localhost:6969/ | grep -q unfuckarr
           docker exec smoke ffmpeg -version | head -1
-          # Both halves of the transcoding stack, asserted in the finished
-          # image rather than only in the build layer: Debian's ffmpeg does
-          # every encode, and the static ffmpeg-vmaf does the scoring that
-          # decides whether a re-encode may replace someone's file. Without
-          # the second one, shrinking silently falls back to SSIM.
-          docker exec smoke ffmpeg-vmaf -version | head -1
-          docker exec smoke sh -c "ffmpeg-vmaf -hide_banner -filters | grep -q ' libvmaf '"
-          # And the disc-image reader, which is what stops an .iso being
-          # mistaken for a corrupt file.
+          # The whole transcoding stack, asserted in the finished image rather
+          # than only in the build layer. One ffmpeg does all of it now:
+          #   libvmaf, or shrinking silently falls back to SSIM, which is a
+          #     weaker guarantee than the one the user asked for;
+          #   bluray, or every .iso in a library reads as a corrupt file;
+          #   hevc_vaapi, and it must be an ffmpeg 8 - 5.x and 7.x pad a 1080p
+          #     encode to 1088 without signalling a conformance window, which
+          #     breaks every quality comparison and mis-shapes the output.
+          docker exec smoke sh -c "ffmpeg -hide_banner -filters | grep -q ' libvmaf '"
           docker exec smoke sh -c "ffmpeg -hide_banner -protocols | grep -qw bluray"
+          docker exec smoke sh -c "ffmpeg -hide_banner -encoders | grep -q hevc_vaapi"
+          docker exec smoke sh -c "ffmpeg -version | head -1 | grep -qE 'version (8|9|[1-9][0-9])\\.'"
+          # The VA drivers travel with that ffmpeg rather than coming from the
+          # distro, so check they actually arrived.
+          docker exec smoke sh -c "ls /usr/local/lib/*/dri/radeonsi_drv_video.so >/dev/null"
+          docker exec smoke python -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version"
           docker exec smoke sh -c "ffmpeg -hide_banner -protocols | grep -qw subfile"
           docker rm -f smoke
           echo "image smoke test passed"

@@ -17,10 +17,11 @@ the same shape as shrinkray's "SmartShrink" and ab-av1's CRF search.
 Two things about the metric are worth knowing before changing anything here:
 
 * **VMAF is not available in any distro ffmpeg.** Debian bookworm, Debian
-  trixie and jellyfin-ffmpeg are all built without ``--enable-libvmaf``. The
-  container therefore ships a second, static ffmpeg (``ffmpeg-vmaf``) built by
-  BtbN, used *only* for scoring — never for encoding, so the VAAPI/Mesa path
-  that took real hardware to get right is left completely alone.
+  trixie and jellyfin-ffmpeg are all built without ``--enable-libvmaf``, which
+  is why the image is built on linuxserver.io's ffmpeg 8 instead — one binary
+  that both encodes with VAAPI and measures with libvmaf. ``ffmpeg-vmaf`` is
+  still looked for first, so anyone running from source can point a
+  libvmaf-capable build at it without replacing their system ffmpeg.
 * **SSIM is the fallback, and it is a weaker guarantee.** When no libvmaf is
   found anywhere, scoring falls back to ffmpeg's built-in ``ssim`` filter. It
   is always available and it does detect gross quality loss, but it correlates

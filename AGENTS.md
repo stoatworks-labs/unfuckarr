@@ -243,6 +243,20 @@ Break any of these and the failure is quiet and expensive.
   of Debian's plus a separate scorer. That is exactly what Shrinkray does (it is built *from*
   `lscr.io/linuxserver/ffmpeg`), which is why it can do VAAPI encodes when this cannot.
 
+  **The image is now built the same way** — Ubuntu 24.04 plus a multi-stage copy of that
+  ffmpeg's `/usr/local`, verified by building it and running it on the target hardware: correct
+  1080p geometry, VMAF 91.65 on a QP 26 encode against a calibration that predicted 91.96, and
+  the PUID/PGID drop still working.
+
+  **What that build does not have is libbluray**, so Blu-ray images cannot be opened and are
+  reported as `disc_not_inspectable`. DVD images are unaffected, because that path parses ISO9660
+  here and reads the VOB through `subfile`, which is a builtin. BtbN's static build *does* carry
+  all three flags, but it needs a libva newer than Ubuntu ships (it aborts on `vaMapBuffer2`
+  against 2.20), and once given linuxserver's libva 2.23 its VAAPI and libvmaf worked while
+  reading a disc still did not. The durable fix is to stop depending on the ffmpeg build for this
+  at all: parse UDF here, the way the DVD path already parses ISO9660, and hand ffmpeg a
+  `subfile` range.
+
   Grafting that binary onto a Debian Python base does **not** work as-is: its `/usr/local/lib`
   carries its own libva (2.23), which shadows the distro's and then cannot load Mesa's
   `radeonsi_drv_video.so`, so device creation fails with "unknown libva error". Either leave that

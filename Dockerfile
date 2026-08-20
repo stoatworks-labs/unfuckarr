@@ -1,10 +1,30 @@
 # unfuckarr
 #
-# Single stage on purpose: the runtime needs ffmpeg regardless, and ffmpeg is
-# most of the image, so a builder stage would save nothing worth the
-# complexity. Python deps are wheels; there is nothing to compile.
+# Two stages, and only because ffmpeg is not something a distro can supply here.
+#
+# The application needs one ffmpeg that can do two things at once: encode with
+# VAAPI, and measure quality with libvmaf. No distribution ships that. Debian
+# bookworm's 5.1.9 and trixie's 7.1.5 both build without libvmaf *and* both
+# have a VAAPI bug that pads a 1080p encode to 1088 without signalling a
+# conformance window — so the output decodes eight rows taller than its source
+# while the container metadata still says 1080, which means ffprobe reports the
+# right number and nothing looks wrong. That silently breaks every quality
+# comparison and, worse, would replace people's files with mis-shaped ones.
+#
+# ffmpeg 8 fixes the padding, and linuxserver.io publish an 8.x build with
+# --enable-vaapi and --enable-libvmaf together, multi-arch, which is the same
+# ffmpeg Shrinkray uses to do VAAPI encodes on this hardware. It also bundles
+# its own VA drivers (radeonsi, iHD, i965), so this image no longer installs
+# Mesa at all — which retires the bookworm-backports workaround that used to
+# be needed for any AMD GPU newer than RDNA2.
+#
+# Ubuntu 24.04 rather than a python: image because that is what the ffmpeg
+# build is compiled against (glibc 2.39), and it ships Python 3.12 natively.
 
-FROM python:3.12-slim-bookworm
+ARG FFMPEG_IMAGE=lscr.io/linuxserver/ffmpeg:8.0.1-cli-ls58
+FROM ${FFMPEG_IMAGE} AS ffmpeg
+
+FROM ubuntu:24.04
 
 ARG TARGETARCH
 ARG VERSION=dev
@@ -22,80 +42,93 @@ ENV PYTHONUNBUFFERED=1 \
     UNFUCKARR_PORT=6969 \
     PUID=99 \
     PGID=100 \
-    UMASK=002
+    UMASK=002 \
+    PATH=/opt/venv/bin:/usr/local/bin:$PATH \
+    LD_LIBRARY_PATH=/usr/local/lib \
+    LIBVA_DRIVERS_PATH=/usr/local/lib/x86_64-linux-gnu/dri:/usr/local/lib/aarch64-linux-gnu/dri
 
-# ffmpeg is the whole point; gosu drops to the PUID/PGID Unraid expects.
-# The VAAPI/QSV drivers are amd64-only — an arm64 build installs neither and
-# hardware transcoding is simply unavailable there.
+# ffmpeg, ffprobe, and everything they link — including the VA drivers, which
+# is why no Mesa package is installed below.
+COPY --from=ffmpeg /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /usr/local/bin/
+COPY --from=ffmpeg /usr/local/lib /usr/local/lib
+
+# gosu drops to the PUID/PGID Unraid expects; tini reaps the ffmpeg children.
 #
-# Mesa comes from bookworm-backports, and that is not tidiness. Bookworm ships
-# Mesa 22.3, which does not know any AMD GPU newer than RDNA2: on a Radeon 880M
-# radeonsi refuses to initialise with "amdgpu: unknown (family_id,
-# chip_external_rev): (150, 20)" and every VAAPI job dies at device creation,
-# with the card sitting right there in /dev/dri. Backports (25.x) recognises
-# gfx1150 and exposes HEVC EncSlice. Intel's driver is left at the stable
-# version because Intel iGPUs of that vintage are already supported there.
+# The long list after them is what that ffmpeg build and its VA drivers link
+# against on Ubuntu. libllvm18 is the one nobody guesses: Mesa's radeonsi
+# compiles shaders through LLVM, so without it the driver loads and then fails
+# at device creation with nothing more useful than "unknown libva error".
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        ffmpeg \
+        python3 \
+        python3-venv \
         gosu \
         tini \
-        ca-certificates; \
-    if [ "${TARGETARCH}" = "amd64" ]; then \
-        apt-get install -y --no-install-recommends \
-            intel-media-va-driver \
-            i965-va-driver \
-            vainfo; \
-        echo 'deb http://deb.debian.org/debian bookworm-backports main' \
-            > /etc/apt/sources.list.d/backports.list; \
-        apt-get update; \
-        apt-get install -y --no-install-recommends \
-            -t bookworm-backports mesa-va-drivers; \
-    fi; \
+        ca-certificates \
+        libllvm18 \
+        libdrm2 \
+        libelf1 \
+        libexpat1 \
+        libpciaccess0 \
+        libxshmfence1 \
+        libx11-6 \
+        libx11-xcb1 \
+        libxcb1 \
+        libxcb-shm0 \
+        libxcb-shape0 \
+        libxcb-xfixes0 \
+        libxcb-dri3-0 \
+        libxcb-present0 \
+        libxcb-randr0 \
+        libxcb-sync1 \
+        libxext6 \
+        libxfixes3 \
+        libasound2t64 \
+        libglib2.0-0t64 \
+        libgomp1 \
+        libbrotli1 \
+        libv4l-0t64 \
+        libxml2 \
+        ocl-icd-libopencl1; \
     rm -rf /var/lib/apt/lists/*; \
+    ldconfig
+
+# Everything the transcoding stack has to be able to do, asserted in the layer
+# that could have broken it rather than discovered on someone's server:
+#
+#   * every shared library resolves — a missing one turns into a runtime
+#     "cannot open shared object file" that looks like a broken install;
+#   * libvmaf is present, because without it shrinking silently falls back to
+#     SSIM, which is a weaker guarantee than the one the user asked for;
+#   * the VAAPI encoder exists at all;
+#   * and `subfile`, which is how a DVD image is read.
+#
+# `bluray` is NOT required, and its absence is reported rather than fatal. This
+# build does not have libbluray, so Blu-ray images cannot be opened: they are
+# reported as `disc_not_inspectable` and nothing acts on them, which is safe
+# but leaves the largest files in a library unmeasured. DVD images are
+# unaffected — that path parses ISO9660 here and reads the VOB through
+# `subfile`, needing nothing from the ffmpeg build.
+RUN set -eux; \
+    ! ldd /usr/local/bin/ffmpeg | grep -q 'not found'; \
+    ! ldd /usr/local/bin/ffprobe | grep -q 'not found'; \
+    ffmpeg -hide_banner -filters | grep -q ' libvmaf '; \
+    ffmpeg -hide_banner -encoders | grep -q hevc_vaapi; \
+    ffmpeg -hide_banner -protocols | grep -qw subfile; \
+    if ffmpeg -hide_banner -protocols | grep -qw bluray; then \
+        echo "bluray protocol: present"; \
+    else \
+        echo "bluray protocol: ABSENT - Blu-ray images will be reported as not inspectable"; \
+    fi; \
     ffmpeg -version | head -1; \
     ffprobe -version | head -1
 
-# A second ffmpeg, used for exactly one thing: computing VMAF.
-#
-# No distribution ffmpeg is built with libvmaf. Not Debian bookworm, not Debian
-# trixie, not jellyfin-ffmpeg — check their debian/rules and the flag simply is
-# not there. Without this binary there is no way to measure whether a
-# space-saving re-encode still looks like the original, and `shrink` falls back
-# to SSIM, which is a weaker guarantee.
-#
-# It is deliberately NOT used for encoding. The VAAPI path above took real
-# hardware and two wrong turns to get right (Mesa from backports; software
-# decode plus hwupload), and it is Debian's ffmpeg that was verified doing it.
-# Scoring is pure CPU and cares about none of that, so the two stay separate
-# and a change to one cannot break the other.
-#
-# BtbN's builds are GPL. This image already ships Debian's GPL ffmpeg, so
-# aggregating another changes nothing about unfuckarr's own MIT licence.
-#
-# The grep at the end is the point of the whole block: fail the build rather
-# than ship an image that silently scores with SSIM because a download changed
-# shape.
-ARG FFMPEG_VMAF_RELEASE=latest
-RUN set -eux; \
-    case "${TARGETARCH}" in \
-        amd64) arch=linux64 ;; \
-        arm64) arch=linuxarm64 ;; \
-        *) echo "no libvmaf build for ${TARGETARCH} - SSIM fallback only"; exit 0 ;; \
-    esac; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends curl xz-utils; \
-    name="ffmpeg-master-${FFMPEG_VMAF_RELEASE}-${arch}-gpl"; \
-    curl -fsSL -o /tmp/ff.tar.xz \
-        "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_VMAF_RELEASE}/${name}.tar.xz"; \
-    tar -xJf /tmp/ff.tar.xz -C /tmp; \
-    install -m 0755 "/tmp/${name}/bin/ffmpeg" /usr/local/bin/ffmpeg-vmaf; \
-    rm -rf /tmp/ff.tar.xz "/tmp/${name}"; \
-    apt-get purge -y --auto-remove curl xz-utils; \
-    rm -rf /var/lib/apt/lists/*; \
-    ffmpeg-vmaf -hide_banner -filters | grep -q ' libvmaf '; \
-    ffmpeg-vmaf -version | head -1
+# Ubuntu marks its Python as externally managed (PEP 668), so the application's
+# dependencies go in a virtualenv rather than fighting the distro over
+# site-packages. PATH puts it first, which is what makes `python` in CMD and
+# the healthcheck resolve here.
+RUN python3 -m venv /opt/venv
 
 WORKDIR /app
 
