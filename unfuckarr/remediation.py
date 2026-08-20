@@ -629,12 +629,21 @@ class Remediator:
                     return {"action": "flag", "ok": False, "message": "cancelled"}
                 if qplan.error:
                     # The search could not be carried out — a broken encoder
-                    # setting, a missing binary, a comparison that would not
-                    # run. That says nothing about the file, and writing it
-                    # off permanently would quietly retire the whole library
-                    # over a configuration problem that is one setting away
-                    # from being fixed.
-                    db.log("shrink_search_failed", "warn", path, qplan.as_dict())
+                    # setting, a missing binary, a source too damaged to read.
+                    # That says nothing conclusive about whether the file is
+                    # worth shrinking, so it is not recorded as a verdict:
+                    # `shrink_skipped` stays empty and fixing the cause makes
+                    # the file a candidate again.
+                    #
+                    # The attempt is still counted, because the continuous
+                    # worker picks the fattest candidate every time it looks —
+                    # so a failure that repeats deterministically is an
+                    # infinite loop on one file. Live, that was 330 identical
+                    # failures on a damaged Matroska, one every 55 seconds,
+                    # while the rest of the backlog waited.
+                    attempts = self._count_shrink_attempt(path, file_row)
+                    db.log("shrink_search_failed", "warn", path,
+                           {**qplan.as_dict(), "attempts": attempts})
                     self._set_job(job_id, "failed", 0, qplan.reason,
                                   error=qplan.reason)
                     return {"action": "flag", "ok": False,

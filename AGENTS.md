@@ -306,6 +306,22 @@ Break any of these and the failure is quiet and expensive.
   the expensive half, and it works whatever the decoder did.
 - **`-ss` before `-i`** so ffmpeg seeks rather than decoding up to the point. Sampling the middle
   of a 40 GB file takes seconds this way and minutes the other way.
+- **ffmpeg exits 0 having written a header and no frames** when the region it was asked for is
+  damaged: it complains on stderr and returns success. Checking the exit code and that the output
+  exists — the obvious pair — catches neither, so `extract_window` checks the size as well. Live,
+  a Matroska with EBML damage produced a 576-byte "window", and every failure downstream then
+  pointed at the sample encode instead of at the source.
+- **Report the *tail* of ffmpeg's stderr, never the head.** It narrates as it goes, so the cause
+  is the last thing it says; `[:300]` from the front reliably returned the warnings and discarded
+  the error. Worse, with no writable home Mesa prints a shader-cache complaint on *every*
+  invocation, which sat at the front of every captured message. The entrypoint now gives the app
+  user a real cache directory, and `quality.ffmpeg_error` filters what is left.
+- **Anything the continuous worker can fail at, it will fail at in a tight loop.** It picks the
+  fattest candidate every time it looks, so a deterministic failure is an infinite loop on one
+  file — 330 identical failures on one damaged Matroska, one every 55 seconds, while the rest of
+  the backlog waited. Every path out of `_shrink` that is not a success must therefore either
+  record a verdict (`shrink_skipped`) or count an attempt. A search that *could not run* counts
+  the attempt without recording a verdict: fixing the cause and forcing from the UI clears both.
 - **A watch folder covering the library sees a shrink's own output as an arrival.** The new file
   lands, the settle timer fires about a minute later, and `_check_arrival` re-checks it — so
   every path that calls `check_file` has to pass `already_shrunk`, not just the scanner. Missing

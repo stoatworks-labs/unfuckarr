@@ -870,3 +870,87 @@ def test_the_watcher_does_not_undo_a_finished_shrink(video_factory, settings,
     open_codes = {r["code"] for r in db.q(
         "SELECT code FROM findings WHERE path=? AND resolved IS NULL", (str(path),))}
     assert "not_measured" not in open_codes
+
+
+@needs_ffmpeg
+def test_an_extraction_that_wrote_no_frames_is_caught(video_factory, settings,
+                                                      tmp_path, monkeypatch):
+    """ffmpeg exits 0 having written a header and nothing else when the region
+    it was asked for is damaged. Checking the exit code and that the file
+    exists — the obvious pair — catches neither, and live that turned a
+    Matroska with EBML damage into a 576-byte "window" whose every downstream
+    failure pointed at the sample encode instead of at the source."""
+    src = video_factory("src.mkv", seconds=4)
+    dst = tmp_path / "window.mkv"
+
+    real_run = quality.subprocess.run
+
+    def header_only(cmd, *a, **kw):
+        # Behave exactly as ffmpeg did: complain, write a stub, succeed.
+        Path(cmd[-1]).write_bytes(b"\x1a\x45\xdf\xa3" + b"\0" * 500)
+        class R:
+            returncode = 0
+            stderr = ("[matroska,webm @ 0x1] 0x00 at pos 1991519 invalid as "
+                      "first byte of an EBML number\n")
+            stdout = ""
+        return R()
+
+    monkeypatch.setattr(quality.subprocess, "run", header_only)
+    with pytest.raises(quality.QualityError) as caught:
+        quality.extract_window(str(src), 1.0, 3.0, str(dst), "yuv420p",
+                               settings.ffmpeg_path, 60)
+    message = str(caught.value)
+    assert "wrote no frames" in message
+    assert "EBML" in message, "the real cause has to survive into the message"
+    monkeypatch.setattr(quality.subprocess, "run", real_run)
+
+
+def test_the_useful_end_of_an_ffmpeg_error_is_kept():
+    """ffmpeg narrates as it goes, so the cause is the last thing it says.
+    Taking the first 300 characters returned the warnings and threw away the
+    error — and with no writable home, Mesa's shader-cache complaint was the
+    first thing on every single invocation."""
+    stderr = (
+        "Failed to create /home/unfuckarr for shader cache (Permission denied)"
+        "---disabling.\n"
+        "    Last message repeated 1 times\n"
+        "[matroska,webm @ 0x1] Duplicate element\n"
+        "Conversion failed!\n")
+    out = quality.ffmpeg_error(stderr, "fallback")
+    assert "shader cache" not in out
+    assert "Last message repeated" not in out
+    assert "Conversion failed!" in out
+    assert quality.ffmpeg_error("", "fallback") == "fallback"
+
+
+@needs_ffmpeg
+def test_a_failed_search_cannot_loop_on_the_same_file(video_factory, settings,
+                                                      monkeypatch):
+    """The continuous worker picks the fattest candidate every time it looks,
+    so a failure that repeats deterministically is an infinite loop on one
+    file. Live that was 330 identical failures on a damaged Matroska, one
+    every 55 seconds, while the rest of the backlog waited."""
+    path = video_factory("damaged.mkv", seconds=4)
+    row = insert(path)
+    monkeypatch.setattr(quality, "resolve_metric", lambda *a, **k: VMAF)
+    monkeypatch.setattr(quality, "search", lambda *a, **k: QualityPlan(
+        False, "quality search failed: wrote no frames", error=True,
+        metric="vmaf"))
+    result, info = check_file(str(path), settings)
+
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("shrink", "unmeasured"))
+    assert not out["ok"]
+
+    stored = db.q1("SELECT shrink_attempts, shrink_skipped FROM files WHERE path=?",
+                   (str(path),))
+    assert stored["shrink_attempts"] == 1, "the attempt has to be counted"
+    assert stored["shrink_skipped"] is None, \
+        "a tooling failure is not a verdict on the file"
+
+    from unfuckarr.service import Service
+    db.ex("UPDATE files SET status='unmeasured' WHERE path=?", (str(path),))
+    db.ex("INSERT INTO findings (path, category, code, severity, created) "
+          "VALUES (?,?,?,?,?)", (str(path), "efficiency", "not_measured", "info", 1.0))
+    assert Service._next_shrink_candidate() is None, \
+        "the worker would pick it straight back up and fail identically"

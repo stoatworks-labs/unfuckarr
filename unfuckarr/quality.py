@@ -71,6 +71,30 @@ DEFAULT_WINDOW_TOLERANCE = {"vmaf": 3.0, "ssim": 0.010}
 # Names tried, in order, when looking for an ffmpeg that can compute VMAF.
 VMAF_BINARIES = ("ffmpeg-vmaf", "ffmpeg")
 
+# A lossless window of real video is megabytes. Anything near this is a
+# container header and nothing else — see `extract_window`.
+MIN_WINDOW_BYTES = 64 * 1024
+
+# Lines ffmpeg prints that are never the error you are looking for. The Mesa
+# one matters more than it looks: it is emitted on *every* invocation when the
+# container user has no writable home, so it lands at the front of any stderr
+# captured and pushes the real message out of a truncated error string.
+NOISE = re.compile(r"shader cache|Last message repeated|deprecated pixel format",
+                   re.IGNORECASE)
+
+
+def ffmpeg_error(stderr: str, fallback: str) -> str:
+    """The part of ffmpeg's stderr worth reporting.
+
+    The tail, not the head: ffmpeg narrates as it goes and the thing that
+    actually went wrong is the last thing it says. Taking the first 300
+    characters — which this did — reliably returned the warnings and threw
+    away the cause.
+    """
+    lines = [ln.strip() for ln in (stderr or "").splitlines()
+             if ln.strip() and not NOISE.search(ln)]
+    return " / ".join(lines[-3:])[:400] or fallback
+
 _filters_cache: dict[str, frozenset[str]] = {}
 
 
@@ -248,8 +272,22 @@ def extract_window(src: str, start: float, length: float, dst: str,
            "-pix_fmt", pix_fmt, "-f", "matroska", dst]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0 or not os.path.exists(dst):
+        raise QualityError(ffmpeg_error(proc.stderr,
+                                        "could not extract the sample window"))
+
+    # ffmpeg exits 0 having written a header and no frames when the region it
+    # was asked for is damaged — it complains on stderr and returns success.
+    # Checking the exit code and the file's existence, which is the obvious
+    # pair, catches neither. Live, a Matroska with EBML damage produced a
+    # 576-byte "window" and every downstream failure then pointed at the
+    # sample encode instead of at the source.
+    written = os.path.getsize(dst)
+    if written < MIN_WINDOW_BYTES:
+        detail = ffmpeg_error(proc.stderr, "no error was reported")
         raise QualityError(
-            (proc.stderr or "could not extract the sample window").strip()[:300])
+            f"reading {length:.0f}s from {start:.0f}s produced only {written} "
+            f"bytes — ffmpeg exited cleanly but wrote no frames, which is what "
+            f"a damaged region of the source looks like ({detail})")
 
 
 def _sample_encode(src: str, start: float, length: float, dst: str,
@@ -272,8 +310,8 @@ def _sample_encode(src: str, start: float, length: float, dst: str,
     cmd += ["-f", "matroska", dst]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0 or not os.path.exists(dst):
-        raise QualityError(
-            (proc.stderr or "sample encode produced nothing").strip()[:300])
+        raise QualityError(ffmpeg_error(proc.stderr,
+                                        "sample encode produced nothing"))
 
 
 _VMAF_LINE = re.compile(r"VMAF score:\s*([\d.]+)")
@@ -324,9 +362,8 @@ def score_pair(distorted: str, reference: str, window: tuple[float, float],
         cmd += ["-i", reference, "-lavfi", lavfi, "-f", "null", "-"]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if proc.returncode != 0:
-            raise QualityError(
-                (proc.stderr or f"{metric.name} exited {proc.returncode}")
-                .strip()[-300:])
+            raise QualityError(ffmpeg_error(
+                proc.stderr, f"{metric.name} exited {proc.returncode}"))
 
         if metric.name == "vmaf":
             try:

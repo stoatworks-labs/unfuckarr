@@ -25,6 +25,16 @@ fi
 USER_NAME="$(getent passwd "$PUID" | cut -d: -f1)"
 
 mkdir -p /config
+# Somewhere for the user to write caches. Without it Mesa cannot open a shader
+# cache and says so on *every* ffmpeg invocation — which is not merely untidy:
+# that warning lands at the front of any stderr the application captures, and
+# pushed the real cause out of every truncated error message it reported.
+# Giving it a real directory also lets the cache do its job.
+APP_HOME=/config/.home
+mkdir -p "$APP_HOME/.cache"
+export HOME="$APP_HOME"
+export XDG_CACHE_HOME="$APP_HOME/.cache"
+
 # Only the config volume — never the media mounts. Recursively chowning a
 # 40 TB array on every container start is how people lose an evening.
 chown "$PUID:$PGID" /config 2>/dev/null || true
