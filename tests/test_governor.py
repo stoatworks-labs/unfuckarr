@@ -37,17 +37,28 @@ def write_fdinfo(tmp_path, pid: int, entries: list[tuple[str, int, int]]) -> Non
 
 @pytest.fixture
 def fake_proc(tmp_path, monkeypatch):
+    """Redirect only fdinfo reads, and only those.
+
+    Redirecting everything under /proc was the obvious first version and it
+    passed on macOS purely because macOS has no /proc: on Linux the test's own
+    read of /proc/<pid>/stat got redirected into the fixture directory and
+    blew up. Nothing here wants to fake the rest of /proc — the process being
+    governed is a real one.
+    """
     real_listdir, real_open = os.listdir, open
 
+    def redirected(path: str) -> str | None:
+        if not isinstance(path, str) or "/fdinfo" not in path:
+            return None
+        if not path.startswith("/proc/"):
+            return None
+        return str(tmp_path / path[len("/proc/"):])
+
     def listdir(path):
-        if isinstance(path, str) and path.startswith("/proc/"):
-            return real_listdir(str(tmp_path / path[len("/proc/"):]))
-        return real_listdir(path)
+        return real_listdir(redirected(path) or path)
 
     def opener(path, *a, **kw):
-        if isinstance(path, str) and path.startswith("/proc/"):
-            return real_open(str(tmp_path / path[len("/proc/"):]), *a, **kw)
-        return real_open(path, *a, **kw)
+        return real_open(redirected(path) or path, *a, **kw)
 
     monkeypatch.setattr(governor.os, "listdir", listdir)
     monkeypatch.setattr("builtins.open", opener)
@@ -129,11 +140,12 @@ def test_a_governed_process_is_always_left_running(fake_proc):
         t.join(timeout=5)
 
         # State T means stopped; anything else means it was left runnable.
-        with open(f"/proc/{proc.pid}/stat") if os.path.exists(f"/proc/{proc.pid}/stat") \
-                else open(os.devnull) as fh:
-            content = fh.read()
-        if content:
-            assert content.split()[2] != "T", "left the process stopped"
+        # Read the real kernel file — /proc exists on Linux, not on macOS.
+        stat_path = f"/proc/{proc.pid}/stat"
+        if os.path.exists(stat_path):
+            with open(stat_path) as fh:
+                state = fh.read().rsplit(")", 1)[1].split()[0]
+            assert state != "T", f"left the process stopped (state {state})"
     finally:
         proc.kill()
         proc.wait()
