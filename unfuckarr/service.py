@@ -38,6 +38,7 @@ class Service:
         self._sched_thread: threading.Thread | None = None
         self._watch_pool = threading.Semaphore(2)
         self._estimate_lock = threading.Lock()
+        self._shrink_thread: threading.Thread | None = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -51,6 +52,10 @@ class Service:
         self._sched_thread = threading.Thread(target=self._scheduler, daemon=True,
                                               name="unfuckarr-scheduler")
         self._sched_thread.start()
+        self._shrink_thread = threading.Thread(target=self._shrink_worker,
+                                               daemon=True,
+                                               name="unfuckarr-shrink")
+        self._shrink_thread.start()
         self.refresh_services()
         s = config.get()
         if s.schedule.scan_enabled and s.schedule.scan_at_startup:
@@ -107,6 +112,112 @@ class Service:
         # slow array must not hold up the web server coming back.
         threading.Thread(target=sweep, daemon=True,
                          name="unfuckarr-leftovers").start()
+
+    # -- continuous shrinking ---------------------------------------------
+
+    def _shrink_worker(self) -> None:
+        """Work through the shrink backlog for as long as the service runs.
+
+        A library of thousands of candidates is not a per-scan job. At a
+        quarter of an hour or more each, a nightly batch of five takes years,
+        and a nightly batch large enough to matter is a scan that runs all
+        day and blocks everything behind it. So shrinking is a worker that is
+        simply always running, and is *paced* rather than *rationed* — see
+        governor.py, which holds it to a share of the GPU's encode engine so
+        that leaving it on permanently is not the reason a film stutters.
+
+        The scan's job is now only to decide *what* is a candidate; this
+        decides when, and in what order.
+        """
+        from .remediation import Decision, shrink_blocked
+
+        # Nothing at all until the first scan has had a chance to populate the
+        # backlog, and so that a restart does not immediately start encoding.
+        self._sched_stop.wait(30)
+
+        while not self._sched_stop.is_set():
+            wait = 60.0
+            try:
+                s = config.get()
+                reason = self._shrink_idle_reason(s, shrink_blocked)
+                if reason is not None:
+                    # Nothing to do, and nothing wrong. Checking every five
+                    # minutes is often enough for a state that only changes
+                    # when someone edits the settings or a scan finishes.
+                    self._sched_stop.wait(300)
+                    continue
+
+                row = self._next_shrink_candidate()
+                if row is None:
+                    self._sched_stop.wait(300)
+                    continue
+
+                self._shrink_one(row, Decision(
+                    "shrink",
+                    "measuring how small this can be at full perceptual quality"))
+                # Straight on to the next one: the governor is what paces
+                # this, not a delay here.
+                wait = 0.0
+            except Exception as exc:  # noqa: BLE001 - the worker must not die
+                log.exception("shrink worker failed")
+                db.log("shrink_worker_error", "error", detail=str(exc))
+                wait = 300.0
+            if wait:
+                self._sched_stop.wait(wait)
+
+    @staticmethod
+    def _shrink_idle_reason(s: Settings, shrink_blocked) -> str | None:
+        """Why the worker has nothing to do, or None when it should work."""
+        if not s.shrink.continuous:
+            return "continuous shrinking is off"
+        if s.policy.oversize_action != "shrink":
+            return f"the policy is {s.policy.oversize_action!r}"
+        if state.paused:
+            return "paused"
+        blocked = shrink_blocked(s)
+        if blocked is not None:
+            return blocked
+        from .remediation import _window_wait
+        return _window_wait(s.shrink.only_between_hours)
+
+    @staticmethod
+    def _next_shrink_candidate() -> dict[str, Any] | None:
+        """The fattest file still waiting to be measured.
+
+        Fattest first because the order decides which savings land this month
+        and which land next year. `shrink_priority` is how far above the
+        reference bitrate for its resolution the file sits; NULLs sort last
+        under DESC in SQLite, so a row that has never been checked falls to
+        the back rather than to the front.
+        """
+        row = db.q1(
+            "SELECT * FROM files "
+            " WHERE status = 'unmeasured' "
+            "   AND shrunk IS NULL AND shrink_skipped IS NULL "
+            "   AND COALESCE(shrink_attempts, 0) = 0 "
+            " ORDER BY shrink_priority DESC, size DESC LIMIT 1")
+        return {k: row[k] for k in row.keys()} if row else None
+
+    def _shrink_one(self, record: dict[str, Any], decision) -> None:
+        path = record["path"]
+        if not Path(path).exists():
+            db.ex("UPDATE files SET status='missing' WHERE path=?", (path,))
+            return
+        s = config.get()
+        result, info = check_file(
+            path, s, expected_runtime=record.get("expected_runtime"),
+            already_shrunk=bool(record.get("shrunk") or record.get("shrink_skipped")))
+        try:
+            stat = Path(path).stat()
+            persist_result(path, result, info, stat.st_size, stat.st_mtime)
+        except OSError:
+            pass
+        # The file may have changed since the scan flagged it — repaired,
+        # replaced by the *arr, or no longer a candidate at all.
+        if not result.unmeasured:
+            return
+        outcome = self.remediator.apply(record, result, info, decision)
+        bus.publish("remediated", {"path": path, **outcome})
 
     def _restore_last_scan(self) -> None:
         """Carry the last scan time across a restart.

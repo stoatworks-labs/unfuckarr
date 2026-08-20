@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import db, quality, recycle, transcode
+from . import db, governor, quality, recycle, transcode
 from .checks import CheckResult
 from .checks.compat import resolve as resolve_profile
 from .checks.integrity import looks_repairable
@@ -674,10 +674,12 @@ class Remediator:
                 set_task(f"remediate:{path}", progress=frac, eta=eta)
                 db.ex("UPDATE jobs SET progress=? WHERE id=?", (frac, job_id))
 
+            gov = governor.Governor(target=s.shrink.gpu_encode_percent / 100)
             ok, message = transcode.run(
                 cmd, info.duration, on_progress=on_progress,
                 stall_timeout=s.transcode.stall_timeout_seconds,
                 nice_level=s.transcode.nice_level, cancel=cancel,
+                governor=gov,
             )
             self._cancel.pop(path, None)
 

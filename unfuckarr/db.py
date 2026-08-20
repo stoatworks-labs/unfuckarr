@@ -50,7 +50,11 @@ CREATE TABLE IF NOT EXISTS files (
     shrink_score    REAL,             -- measured quality of the result
     shrink_metric   TEXT,             -- vmaf | ssim — which number that is
     shrink_skipped  TEXT,             -- why we will not try this file again
-    shrink_attempts INTEGER DEFAULT 0
+    shrink_attempts INTEGER DEFAULT 0,
+    -- How far above the reference bitrate for its resolution this file sits.
+    -- Only an ordering key: the continuous worker takes the fattest first,
+    -- because the biggest savings should land first, not eventually.
+    shrink_priority REAL
 );
 CREATE INDEX IF NOT EXISTS idx_files_status  ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_library ON files(library);
@@ -141,6 +145,7 @@ MIGRATIONS = [
     ("files", "shrink_metric", "TEXT"),
     ("files", "shrink_skipped", "TEXT"),
     ("files", "shrink_attempts", "INTEGER DEFAULT 0"),
+    ("files", "shrink_priority", "REAL"),
 ]
 
 

@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from . import governor as governor_mod
 from .checks import CheckResult
 from .checks.compat import resolve as resolve_profile
 from .config import EmbyCompatConfig, TranscodeConfig
@@ -368,7 +369,8 @@ def run(cmd: list[str], total_duration: float,
         on_progress: Callable[[float, float | None], None] | None = None,
         stall_timeout: int = 900,
         nice_level: int = 10,
-        cancel: threading.Event | None = None) -> tuple[bool, str]:
+        cancel: threading.Event | None = None,
+        governor: "governor_mod.Governor | None" = None) -> tuple[bool, str]:
     """Run ffmpeg, reporting progress and killing a stalled job.
 
     ffmpeg's ``-progress pipe:1`` emits key=value blocks; ``out_time_ms`` is
@@ -388,6 +390,17 @@ def run(cmd: list[str], total_duration: float,
     )
     last_output = time.time()
     stderr_tail: list[str] = []
+
+    # Hold this encode to its share of the GPU's encode engine, on its own
+    # thread: the loop below is blocked on ffmpeg's progress output, and a
+    # governed process produces that output in bursts by design.
+    gov_stop = threading.Event()
+    gov_thread = None
+    if governor is not None and governor.active:
+        gov_thread = threading.Thread(
+            target=governor.run, args=(proc.pid, gov_stop), daemon=True,
+            name="unfuckarr-governor")
+        gov_thread.start()
 
     def drain_stderr() -> None:
         assert proc.stderr is not None
@@ -430,6 +443,9 @@ def run(cmd: list[str], total_duration: float,
             proc.kill()
             break
 
+    gov_stop.set()
+    if gov_thread is not None:
+        gov_thread.join(timeout=5)
     proc.wait()
     err_thread.join(timeout=2)
     if killed_for:

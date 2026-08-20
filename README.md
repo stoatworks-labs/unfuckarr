@@ -186,17 +186,8 @@ Unattended deletion needs to be wrong safely, so there are three layers:
   it is safe to keep it inside the library. The dashboard shows where the bin actually is, and
   says so loudly if it is not writable.
 - **Action cap.** No single scan may act on more than `max_actions_per_scan` files (default 50).
-  Shrinks are counted separately and far more tightly (`max_shrinks_per_scan`, default 5): one
-  shrink is a quality search plus a full re-encode, and unlike a repair, nothing is broken while
-  a file waits for the next scan. Repairs are always applied before shrinks, and the shrinks
-  themselves are ordered fattest-first so the biggest savings land first.
-
-  **Expect to raise this.** Shrinks run one after another at roughly 15–25 minutes each, so the
-  cap is really "how many hours of encoding per scan" — 5 is about two hours. On a library with
-  thousands of candidates that is a multi-year job; pick the number that fits the window you are
-  willing to give it, and pair it with `only_between_hours` if that window is overnight. The
-  shipped default is timid on purpose so a fresh install does not pin somebody's server the first
-  night.
+  Shrinking is not rationed this way at all — see below — so a long re-encode can never consume
+  the pass that a corrupt file is waiting on.
 - **Failure-ratio abort.** If more than half a library fails one pass, the scan stops and changes
   *nothing*. That is what an unmounted array looks like, and it is the failure mode that costs
   people their library. Shrinks are deliberately *not* counted here: an unmounted array produces
@@ -207,6 +198,30 @@ Unattended deletion needs to be wrong safely, so there are three layers:
 All of it is on one settings page, with every option explaining what it actually does:
 
 ![Policy settings](docs/screenshots/settings-policy.png)
+
+## Pacing, not rationing
+
+Shrinking runs **continuously**, on its own worker, for as long as the service is up. It takes
+the fattest unmeasured file, measures it, acts or declines, and moves to the next one. That is the
+only shape that fits a real library: at a quarter of an hour or more per file, a nightly batch of
+five takes years, and a batch big enough to matter is a scan that runs all day and blocks
+everything behind it.
+
+What stops that from ruining the server is a **governor on the GPU's video encode engine**, not a
+file count. Linux reports per-process DRM engine time in `/proc/<pid>/fdinfo`; sampled over a
+wall-clock interval, `drm-engine-enc` is a direct percentage. unfuckarr reads its own encoder's
+share and holds it at `gpu_encode_percent` (default 50) by pausing and resuming the process, so
+half the encode engine is always there for Emby.
+
+Measured on a Radeon 880M: flat out, a 4K HEVC encode reports **958 ms of engine time per
+wall-second**; `SIGSTOP` takes that to a true **0**; `SIGCONT` returns it to **966 ms/s** and the
+finished file is valid. The two obvious metrics — `gpu_busy_percent` in sysfs and `VCN Load` in
+debugfs — both read **0** throughout that same encode, so fdinfo is not merely the nicest option,
+it is the only one that works.
+
+The governor is inert for software encodes: there is no encode engine to share, and `nice_level`
+already handles being polite about the CPU. Set `only_between_hours` if you would rather the work
+only happened overnight.
 
 ## Watch folders — the live import gate
 

@@ -171,11 +171,18 @@ def check_file(path: str, s: Settings, expected_runtime: int | None = None,
 def persist_result(path: str, result: CheckResult, info: MediaInfo | None,
                    size: int, mtime: float) -> None:
     now = time.time()
+    # The ordering key rides along on the finding that created it, so the
+    # continuous worker can pick the fattest candidate with a plain ORDER BY
+    # rather than re-probing the library to work out what to do next.
+    priority = None
+    for f in result.unmeasured:
+        priority = f.data.get("ratio")
+        break
     db.ex("UPDATE files SET status=?, last_checked=?, last_result=?, probe=?, "
-          "checked_signature=? WHERE path=?",
+          "checked_signature=?, shrink_priority=? WHERE path=?",
           (result.status, now, json.dumps(result.as_dict()),
            json.dumps(info.summary()) if info else None,
-           f"{size}:{mtime}", path))
+           f"{size}:{mtime}", priority, path))
     # Findings are replaced wholesale each pass; the previous set is resolved
     # rather than deleted so the activity view can show what changed.
     db.ex("UPDATE findings SET resolved=? WHERE path=? AND resolved IS NULL",
@@ -402,6 +409,12 @@ class Scanner:
             if self._stop:
                 break
             if decision.action == "shrink":
+                if s.shrink.continuous:
+                    # The background worker owns shrinking. Running them here
+                    # too would mean two encoders competing for the engine the
+                    # governor is trying to hold to a share, and a scan that
+                    # takes as long as the backlog.
+                    continue
                 if shrinks >= s.policy.max_shrinks_per_scan:
                     if not capped_shrinks:
                         db.log("shrink_cap_reached", "info", row["path"],

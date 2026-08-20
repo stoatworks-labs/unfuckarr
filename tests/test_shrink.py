@@ -538,6 +538,7 @@ def test_shrinks_do_not_count_towards_the_abort_ratio(settings, monkeypatch):
     """The brake exists to notice a library that has just broken. "Most of this
     library is H.264" is not that, and counting it here would disable the
     scanner permanently on almost every real library."""
+    settings.shrink.continuous = False   # this is the batch path
     from unfuckarr.scanner import Scanner
     from unfuckarr.state import ScanProgress, state
 
@@ -561,6 +562,7 @@ def test_shrinks_do_not_count_towards_the_abort_ratio(settings, monkeypatch):
 
 
 def test_shrinks_have_their_own_much_smaller_cap(settings, monkeypatch):
+    settings.shrink.continuous = False   # this is the batch path
     from unfuckarr.scanner import Scanner
     from unfuckarr.state import ScanProgress, state
 
@@ -586,6 +588,7 @@ def test_shrinks_have_their_own_much_smaller_cap(settings, monkeypatch):
 def test_repairs_are_applied_before_shrinks(settings, monkeypatch):
     """One multi-hour shrink must never consume the pass a corrupt file is
     waiting on."""
+    settings.shrink.continuous = False   # this is the batch path
     from unfuckarr.scanner import Scanner
     from unfuckarr.state import ScanProgress, state
 

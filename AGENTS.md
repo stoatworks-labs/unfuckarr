@@ -120,7 +120,21 @@ Break any of these and the failure is quiet and expensive.
     there would disable the scanner permanently on almost every real library. They get
     `max_shrinks_per_scan` instead, and are applied *after* every repair.
 
-15. **"I cannot read this" and "this is broken" are different sentences.** `probe` raises
+15. **Shrinking is paced, not rationed, and the pacing is measured.** It runs on its own
+    worker for as long as the service is up, because a library of thousands of candidates is not
+    a per-scan job — a nightly batch of five takes years, and a batch big enough to matter is a
+    scan that runs all day and blocks everything behind it. What makes that safe to leave on is
+    `governor.py`: `drm-engine-enc` in `/proc/<pid>/fdinfo`, sampled over wall clock, is a direct
+    percentage of the GPU's *encode* engine for that process, and SIGSTOP/SIGCONT holds it at
+    `gpu_encode_percent`. Measured on the target hardware — flat out 958 ms/s, stopped a true 0,
+    resumed 966 ms/s, output valid. **Do not swap this for `gpu_busy_percent` or debugfs
+    `VCN Load`**: both read 0 through a saturating 4K encode on this GPU, because the first
+    tracks the graphics engine and the second is not mounted in a container. The governor must
+    also always leave the process running on exit, or a cancelled job sits in state T for ever
+    holding a semaphore and looking exactly like a hang; and it must stand down entirely for
+    software encodes, which have no engine to share.
+
+16. **"I cannot read this" and "this is broken" are different sentences.** `probe` raises
     `DiscUnreadable` (a `ProbeError` subclass) for a disc image no available route can open, and
     the integrity check turns that into an *info* `disc_not_inspectable` — never `probe_failed`,
     which is in `REPAIRABLE_CODES` and leads to a remux and then a redownload. This is not a
@@ -128,7 +142,7 @@ Break any of these and the failure is quiet and expensive.
     delete-and-re-search, and three 42 GB images are recoverable only because the recycle bin
     caught them. Any new "cannot open" path must land on the info finding, not the error one.
 
-16. **The tailnet-only stance is policy, not decoration.** The README warning (private
+17. **The tailnet-only stance is policy, not decoration.** The README warning (private
     network/tailnet only, never the public internet, no independent human security review) stays,
     because the service deletes media unattended and has no auth until a key is set. In the same
     spirit, `__main__.resolve_host` **fails the start** when `UNFUCKARR_BIND_INTERFACE` names an
@@ -373,6 +387,7 @@ unfuckarr/
     emby.py          PlaybackInfo, item index, activity log
   transcode.py       Plan builder, ffmpeg command, progress runner
   quality.py         Metric discovery, sampling, VMAF/SSIM scoring, the CRF search
+  governor.py        Per-process GPU encode share from fdinfo, held by SIGSTOP/SIGCONT
   disc.py            Reading .iso/.img without mounting: UDF/ISO9660 identification,
                      bluray: and subfile URLs, libbluray noise filtering
   recycle.py         Recycle bin + retention

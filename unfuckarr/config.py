@@ -199,6 +199,26 @@ class ShrinkConfig(BaseModel):
     # Restrict shrinking to a window of the day, e.g. "22-06". Empty = any time.
     # Scans still run; only the shrink action waits.
     only_between_hours: str = ""
+    # Work through the backlog continuously on a background thread, rather
+    # than a handful per scan. A library of thousands of candidates is not a
+    # per-scan job — at a quarter-hour or more each, a nightly batch takes
+    # years — so the natural shape is a worker that is simply always running
+    # and is *paced* rather than *rationed*.
+    continuous: bool = True
+    # The pacing: the share of the GPU's video encode engine this may use,
+    # as a percentage. The rest is left for everything else on the box —
+    # Emby's own transcodes above all. Measured per process from
+    # /proc/<pid>/fdinfo and held there by pausing and resuming the encoder;
+    # see governor.py. 0 or 100 disables throttling, and it is inert for
+    # software encodes, which have no engine to share.
+    gpu_encode_percent: int = 50
+
+    @field_validator("gpu_encode_percent")
+    @classmethod
+    def _check_share(cls, v: int) -> int:
+        if not 0 <= v <= 100:
+            raise ValueError("must be between 0 and 100")
+        return v
 
     @field_validator("only_between_hours")
     @classmethod
