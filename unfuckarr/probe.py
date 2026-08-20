@@ -7,11 +7,14 @@ distro ffmpeg and makes the failure modes legible in the activity log.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from . import disc as disc_mod
 
 # ffmpeg writes decode complaints to stderr with these markers. Matching on the
 # text is unpleasant but it is the only signal a decode-only pass produces.
@@ -35,6 +38,15 @@ DECODE_ERROR_PATTERNS = [
 
 class ProbeError(RuntimeError):
     """ffprobe could not read the file at all."""
+
+
+class DiscUnreadable(ProbeError):
+    """A disc image this build has no way to open.
+
+    Deliberately its own exception. "I cannot read this" and "this is broken"
+    are different sentences, and conflating them is what put three 42 GB disc
+    images in the recycle bin.
+    """
 
 
 @dataclass
@@ -64,6 +76,12 @@ class Stream:
 @dataclass
 class MediaInfo:
     path: str
+    # What to hand ffmpeg. The same as ``path`` for ordinary files, and
+    # something like ``bluray:/media/Film/Film.iso`` for a disc image, which
+    # ffmpeg cannot open by filename. Everything that shells out uses this;
+    # everything that touches the filesystem uses ``path``.
+    input_url: str = ""
+    disc_kind: str = ""
     container: str = ""
     format_name: str = ""
     duration: float = 0.0
@@ -89,11 +107,43 @@ class MediaInfo:
     def subtitles(self) -> list[Stream]:
         return [s for s in self.streams if s.codec_type == "subtitle"]
 
+    @property
+    def is_hdr(self) -> bool:
+        """HDR10, HDR10+, Dolby Vision or HLG.
+
+        Read off the colour metadata rather than the codec: HDR is a property
+        of the transfer function, and an HEVC file is as likely to be SDR as
+        not. This matters because a re-encode that drops the metadata produces
+        a file that still plays and looks grey and washed out — a failure
+        nothing reports.
+        """
+        v = self.video
+        if v is None:
+            return False
+        transfer = (v.raw.get("color_transfer") or "").lower()
+        primaries = (v.raw.get("color_primaries") or "").lower()
+        if transfer in ("smpte2084", "arib-std-b67"):
+            return True
+        if primaries == "bt2020" and transfer.startswith("bt2020"):
+            return True
+        return any((sd.get("side_data_type") or "").lower().startswith(
+            ("mastering display", "content light level", "dolby vision"))
+            for sd in v.raw.get("side_data_list") or [])
+
+    @property
+    def source(self) -> str:
+        return self.input_url or self.path
+
+    @property
+    def is_disc(self) -> bool:
+        return bool(self.disc_kind)
+
     def summary(self) -> dict[str, Any]:
         """Compact form stored in the DB and rendered in the UI."""
         v = self.video
         return {
             "container": self.container,
+            "disc": self.disc_kind or None,
             "duration": round(self.duration, 2),
             "size": self.size,
             "bitrate": self.bitrate,
@@ -102,6 +152,7 @@ class MediaInfo:
                 "width": v.width, "height": v.height,
                 "pix_fmt": v.pix_fmt, "bit_depth": v.bit_depth,
                 "fps": round(v.fps, 3),
+                "hdr": self.is_hdr,
             } if v else None,
             "audio": [
                 {"codec": a.codec_name, "channels": a.channels,
@@ -173,14 +224,26 @@ def _parse_stream(s: dict[str, Any]) -> Stream:
     )
 
 
-def probe(path: str | Path, ffprobe: str = "ffprobe", timeout: int = 120) -> MediaInfo:
+def probe(path: str | Path, ffprobe: str = "ffprobe", timeout: int = 120,
+          ffmpeg: str = "ffmpeg") -> MediaInfo:
     """Read container and stream metadata. Raises ProbeError if unreadable."""
     path = str(path)
+    url, disc_kind = path, ""
+    found_disc = None
+    if disc_mod.is_disc_image(path):
+        # ffprobe handed a disc image by filename says "Invalid data found",
+        # which reads exactly like a corrupt file and is not one. The protocol
+        # list is ffmpeg's, not ffprobe's, but they are the same build.
+        try:
+            url, found_disc = disc_mod.input_url(path, ffmpeg=ffmpeg)
+            disc_kind = found_disc.kind
+        except disc_mod.DiscError as exc:
+            raise DiscUnreadable(str(exc)) from None
     cmd = [
         ffprobe, "-v", "error", "-hide_banner",
         "-print_format", "json",
         "-show_format", "-show_streams",
-        path,
+        url,
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -190,7 +253,12 @@ def probe(path: str | Path, ffprobe: str = "ffprobe", timeout: int = 120) -> Med
         raise ProbeError(f"ffprobe timed out after {timeout}s") from exc
 
     if proc.returncode != 0 or not proc.stdout.strip():
-        raise ProbeError((proc.stderr or "ffprobe produced no output").strip()[:500])
+        noise = [ln for ln in (proc.stderr or "").splitlines()
+                 if ln.strip() and not disc_mod.is_noise(ln)]
+        message = " ".join(noise) or "ffprobe produced no output"
+        if disc_kind:
+            raise DiscUnreadable(message.strip()[:500])
+        raise ProbeError(message.strip()[:500])
 
     try:
         data = json.loads(proc.stdout)
@@ -200,18 +268,39 @@ def probe(path: str | Path, ffprobe: str = "ffprobe", timeout: int = 120) -> Med
     fmt = data.get("format") or {}
     streams = [_parse_stream(s) for s in data.get("streams") or []]
     format_name = fmt.get("format_name", "")
+    size = _to_int(fmt.get("size"))
+    if disc_kind:
+        # ffprobe reports the size of the *playlist* it selected, not the
+        # image. The image is what gets replaced and what the saving is
+        # measured against, so the file on disk is the number that matters.
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            pass
     info = MediaInfo(
         path=path,
+        input_url=url,
+        disc_kind=disc_kind,
         format_name=format_name,
-        container=_container_from(path, format_name),
+        container=disc_kind or _container_from(path, format_name),
         duration=_to_float(fmt.get("duration")),
-        size=_to_int(fmt.get("size")),
+        size=size,
         bitrate=_to_int(fmt.get("bit_rate")),
         streams=streams,
         raw=data,
     )
-    if info.container in ("mp4", "m4v", "mov"):
+    if not disc_kind and info.container in ("mp4", "m4v", "mov"):
         info.faststart = check_faststart(path)
+
+    if disc_kind and found_disc is not None and found_disc.runs:
+        # A raw MPEG-TS read through `subfile` reports a duration that is
+        # simply wrong — 117 seconds for a 137-minute film, measured. That
+        # number decides whether the integrity check calls a file truncated,
+        # so a disc read this way must have it measured properly rather than
+        # taken on trust.
+        measured = disc_mod.stream_duration(path, found_disc.runs, ffprobe)
+        if measured > 0:
+            info.duration = measured
     # A duration missing from the container header is normal for MPEG-TS;
     # fall back to the video stream's own duration before calling it unknown.
     if info.duration <= 0:
@@ -299,15 +388,25 @@ def decode_check_full(
     start: float | None = None,
     duration: float | None = None,
     timeout: int = 3600,
+    streams: tuple[str, ...] = ("0:v:0?", "0:a?"),
 ) -> DecodeResult:
-    """Actually decode the video stream — catches damage a remux would miss."""
+    """Actually decode the video stream — catches damage a remux would miss.
+
+    ``streams`` exists for disc images. A Blu-ray playlist carries a dozen
+    audio tracks, several of them TrueHD, and ``0:a?`` decodes every one of
+    them: a three-second sample that takes five seconds on the video alone
+    runs for minutes with the audio attached. One audio track answers the same
+    question — is this readable — for a fraction of the work.
+    """
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-v", "error"]
     if start is not None:
         cmd += ["-ss", f"{start:.3f}"]
     cmd += ["-i", str(path)]
     if duration is not None:
         cmd += ["-t", f"{duration:.3f}"]
-    cmd += ["-map", "0:v:0?", "-map", "0:a?", "-f", "null", "-"]
+    for spec in streams:
+        cmd += ["-map", spec]
+    cmd += ["-f", "null", "-"]
     return _run_decode(cmd, timeout)
 
 
@@ -322,12 +421,20 @@ def _run_decode(cmd: list[str], timeout: int) -> DecodeResult:
     messages: list[str] = []
     for line in (proc.stderr or "").splitlines():
         line = line.strip()
-        if line and any(p.search(line) for p in DECODE_ERROR_PATTERNS):
+        if not line or disc_mod.is_noise(line):
+            # libbluray narrates every open (BD-J menus it will not run, a
+            # playlist whose first clip has no timestamp) and seeking into a
+            # GOP always reports a missing first slice. None of it is damage,
+            # and counting it would make every disc image look broken — which
+            # is the exact failure this module exists to undo.
+            continue
+        if any(p.search(line) for p in DECODE_ERROR_PATTERNS):
             messages.append(line)
     # A non-zero exit with no matched line is still a failure; keep the tail so
     # the UI shows something more useful than "it failed".
     if proc.returncode != 0 and not messages:
-        tail = [ln.strip() for ln in (proc.stderr or "").splitlines() if ln.strip()]
+        tail = [ln.strip() for ln in (proc.stderr or "").splitlines()
+                if ln.strip() and not disc_mod.is_noise(ln)]
         messages = tail[-3:] or [f"ffmpeg exited {proc.returncode}"]
     return DecodeResult(
         errors=len(messages),

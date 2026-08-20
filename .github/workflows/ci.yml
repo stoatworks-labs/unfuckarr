@@ -24,11 +24,33 @@ jobs:
 
       # The check engine is tested against files ffmpeg actually renders, so
       # the runner needs a real ffmpeg — not a mock.
+      #
+      # timeout-minutes because a hung apt mirror is a real failure mode: this
+      # step once sat in `apt-get install` for over an hour, against a suite
+      # that takes ten seconds, and would have run to the six-hour job limit.
       - name: Install ffmpeg
+        timeout-minutes: 10
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=3 ffmpeg
           ffmpeg -version | head -1
+
+      # No distro ffmpeg is built with libvmaf, so without this the quality
+      # search — the part of the application that decides whether a re-encode
+      # is allowed to replace someone's file — is the one thing CI cannot
+      # actually exercise. Same binary and same role as in the image: scoring
+      # only, never encoding.
+      - name: Install an ffmpeg that has libvmaf
+        timeout-minutes: 10
+        run: |
+          curl -fsSL -o /tmp/ff.tar.xz \
+            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xJf /tmp/ff.tar.xz -C /tmp
+          sudo install -m 0755 /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg \
+            /usr/local/bin/ffmpeg-vmaf
+          ffmpeg-vmaf -hide_banner -filters | grep -q ' libvmaf '
+          ffmpeg-vmaf -version | head -1
 
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
@@ -130,7 +152,42 @@ jobs:
           if [ -z "$ok" ]; then echo "container never became healthy"; exit 1; fi
           curl -fsS http://localhost:6969/api/status > /dev/null
           curl -fsS http://localhost:6969/ | grep -q unfuckarr
-          docker exec smoke ffmpeg -version | head -1
+          # The whole transcoding stack, asserted in the finished image rather
+          # than only in the build layer. Each check reports itself, because a
+          # bare `cmd | grep -q` under `set -o pipefail` fails on SIGPIPE as
+          # readily as on a real mismatch, and then says nothing about which.
+          check() {
+            printf '  %-24s ' "$1"
+            if docker exec smoke sh -c "$2" >/dev/null 2>&1; then
+              echo OK
+            else
+              echo FAILED
+              docker exec smoke sh -c "$3" 2>&1 | head -5 || true
+              return 1
+            fi
+          }
+          #   libvmaf, or shrinking silently falls back to SSIM, which is a
+          #     weaker guarantee than the one the user asked for;
+          #   hevc_vaapi, and it must be an ffmpeg 8 - 5.x and 7.x pad a 1080p
+          #     encode to 1088 without signalling a conformance window, which
+          #     breaks every quality comparison and mis-shapes the output;
+          #   subfile, which is how a DVD image is read.
+          # `bluray` is reported, not required: the ffmpeg this image is built
+          # from has no libbluray, so Blu-ray images are read by the UDF parser
+          # in disc.py instead.
+          check 'ffmpeg 8+'    "ffmpeg -version | head -1 | grep -qE 'version (8|9|[1-9][0-9])[.]'" "ffmpeg -version | head -1"
+          check 'libvmaf'      "ffmpeg -hide_banner -filters | grep -q ' libvmaf '" "ffmpeg -hide_banner -filters | grep -i vmaf"
+          check 'hevc_vaapi'   "ffmpeg -hide_banner -encoders | grep -q hevc_vaapi" "ffmpeg -hide_banner -encoders | grep -i vaapi"
+          check 'subfile'      "ffmpeg -hide_banner -protocols | tr -s ' \\n' '\\n' | grep -qx subfile" "ffmpeg -hide_banner -protocols"
+          check 'va drivers'   "ls /usr/local/lib/*/dri/radeonsi_drv_video.so" "ls /usr/local/lib/*/dri/ 2>&1"
+          check 'python 3.12'  "python -c 'import sys; raise SystemExit(0 if sys.version_info[:2]==(3,12) else 1)'" "python --version"
+          printf '  %-24s ' 'bluray (optional)'
+          if docker exec smoke sh -c "ffmpeg -hide_banner -protocols | tr -s ' \\n' '\\n' | grep -qx bluray" >/dev/null 2>&1; then
+            echo present
+          else
+            echo 'absent - Blu-ray images are read by the UDF parser instead'
+          fi
+          docker exec smoke sh -c "ffmpeg -hide_banner -protocols | grep -qw subfile"
           docker rm -f smoke
           echo "image smoke test passed"
 

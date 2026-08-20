@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from . import governor as governor_mod
 from .checks import CheckResult
 from .checks.compat import resolve as resolve_profile
 from .config import EmbyCompatConfig, TranscodeConfig
@@ -52,6 +53,38 @@ def is_temp_output(path: str) -> bool:
     return TEMP_MARKER in Path(path).name
 
 
+def abandoned_outputs(media_paths) -> list[str]:
+    """Every leftover of ours sitting beside a known media file.
+
+    A transcode killed part-way — a container restart, an Unraid reboot, an
+    OOM — leaves its half-written output behind for ever. `is_temp_output`
+    makes the scanner and the watcher ignore it, which stops the file being
+    acted on and also stops anyone noticing it: live, four of these had
+    accumulated to **199 GB** inside the library, and Emby had indexed each one
+    as a separate film and downloaded artwork for it (507 files of that too).
+
+    The artwork is matched as well as the video, because the marker string
+    only ever appears in names we caused. Sidecars are named
+    ``X.unfuckarr-banner.jpg`` — no trailing dot — so this matches the marker
+    without it.
+    """
+    seen: set[str] = set()
+    found: list[str] = []
+    for path in media_paths:
+        parent = os.path.dirname(path)
+        if not parent or parent in seen:
+            continue
+        seen.add(parent)
+        try:
+            entries = os.listdir(parent)
+        except OSError:
+            continue
+        for name in entries:
+            if TEMP_MARKER.rstrip(".") in name:
+                found.append(os.path.join(parent, name))
+    return found
+
+
 # Subtitle codecs each container will accept. Copying a PGS track into MP4
 # fails the whole job, so those get dropped instead.
 CONTAINER_SUBTITLES = {
@@ -72,11 +105,20 @@ class TranscodePlan:
     set_default_audio: int | None = None
     faststart: bool = False
     is_remux: bool = False
+    # Set by the shrink path: the codec and CRF the quality search settled on,
+    # which are deliberately not the global transcode defaults.
+    codec: str | None = None
+    crf: int | None = None
+    pix_fmt: str = "yuv420p"
+    is_shrink: bool = False
 
     @property
     def describe(self) -> str:
         bits = []
-        if self.video_action == "encode":
+        if self.is_shrink:
+            bits.append(f"shrink to {self.codec or 'hevc'} "
+                        f"at CRF {self.crf}")
+        elif self.video_action == "encode":
             bits.append("re-encode video")
         if self.audio_action == "encode":
             bits.append("re-encode audio")
@@ -166,6 +208,39 @@ def _subtitles_to_drop(info: MediaInfo, container: str) -> list[int]:
     return [i for i, s in enumerate(info.subtitles) if s.codec_name not in allowed]
 
 
+def video_encode_args(codec: str, hw: str, crf: int, preset: str,
+                     container: str, pix_fmt: str = "yuv420p") -> list[str]:
+    """The encoder half of an ffmpeg command, on its own.
+
+    Split out because the quality search in ``quality.py`` has to encode short
+    samples with *exactly* the settings the real job will use. A sample encoded
+    by a different encoder, or at a quality scale that means something else,
+    produces a CRF that does not transfer — and the whole point of the search
+    is that the number it returns is the number the full encode uses.
+    """
+    args = ["-c:v", ENCODERS.get((codec, hw), "libx264")]
+    if hw == "vaapi":
+        # format before hwupload: the encoder wants an nv12/p010 surface, and
+        # doing the conversion on the CPU side keeps this working for 10-bit
+        # and odd-pixel-format sources too. -qp, not -crf: VAAPI has no CRF.
+        surface = "p010" if "10" in pix_fmt else "nv12"
+        args += ["-vf", f"format={surface},hwupload", "-qp", str(crf)]
+        if surface == "p010" and codec == "hevc":
+            args += ["-profile:v", "main10"]
+    elif hw == "nvenc":
+        args += ["-preset", "p5", "-cq", str(crf), "-pix_fmt", pix_fmt]
+    elif hw == "qsv":
+        args += ["-global_quality", str(crf), "-preset", preset]
+    elif hw == "videotoolbox":
+        args += ["-q:v", str(max(1, min(100, 100 - crf * 2)))]
+    else:
+        args += ["-preset", preset, "-crf", str(crf), "-pix_fmt", pix_fmt]
+    if codec == "hevc" and container == "mp4":
+        # Without this tag Apple clients refuse HEVC in MP4.
+        args += ["-tag:v", "hvc1"]
+    return args
+
+
 def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
                   tcfg: TranscodeConfig, ffmpeg: str = "ffmpeg",
                   default_language: str = "eng") -> list[str]:
@@ -189,7 +264,10 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
 
     # Rebuild timestamps: a truncated or badly muxed source often has broken
     # ones, and they are the usual cause of a remux that plays but will not seek.
-    cmd += ["-fflags", "+genpts+igndts", "-i", src]
+    # A disc image has to be opened through its protocol; ffmpeg cannot read
+    # one by filename. Everything downstream (mapping, encoding) is identical.
+    cmd += ["-fflags", "+genpts+igndts", "-i",
+            info.source if info.is_disc else src]
 
     cmd += ["-map", "0:v:0?", "-map", "0:a?"]
     if tcfg.keep_subtitles:
@@ -201,25 +279,11 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
         cmd += ["-map", "0:t?", "-map_chapters", "0"]
 
     if p.video_action == "encode":
-        encoder = ENCODERS.get((tcfg.video_codec, hw), "libx264")
-        cmd += ["-c:v", encoder]
-        if hw == "vaapi":
-            # format=nv12 before hwupload: the encoder wants nv12, and doing the
-            # conversion on the CPU side keeps this working for 10-bit and
-            # odd-pixel-format sources too.
-            cmd += ["-vf", "format=nv12,hwupload", "-qp", str(tcfg.crf)]
-        elif hw == "nvenc":
-            cmd += ["-preset", "p5", "-cq", str(tcfg.crf), "-pix_fmt", "yuv420p"]
-        elif hw == "qsv":
-            cmd += ["-global_quality", str(tcfg.crf), "-preset", tcfg.preset]
-        elif hw == "videotoolbox":
-            cmd += ["-q:v", str(max(1, min(100, 100 - tcfg.crf * 2)))]
-        else:
-            cmd += ["-preset", tcfg.preset, "-crf", str(tcfg.crf),
-                    "-pix_fmt", "yuv420p"]
-        if tcfg.video_codec == "hevc" and p.container == "mp4":
-            # Without this tag Apple clients refuse HEVC in MP4.
-            cmd += ["-tag:v", "hvc1"]
+        cmd += video_encode_args(
+            p.codec or tcfg.video_codec, hw,
+            tcfg.crf if p.crf is None else p.crf,
+            tcfg.preset, p.container, pix_fmt=p.pix_fmt)
+        cmd += colour_args(info)
     else:
         cmd += ["-c:v", "copy"]
 
@@ -260,6 +324,35 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
     return cmd
 
 
+def colour_args(info: MediaInfo) -> list[str]:
+    """Carry the source's colour description onto the encode.
+
+    ffmpeg does not copy these tags across a re-encode. Losing them on an SDR
+    file is invisible; losing them on HDR gives a file that still plays and
+    looks grey and washed out, which is the worst kind of failure because
+    nothing reports it — hence `EfficiencyConfig.allow_hdr` defaults off.
+
+    This carries the transfer function, primaries and matrix, which is what
+    decides whether a player treats the file as HDR at all. It does **not**
+    carry mastering-display or MaxCLL side data; that needs per-encoder
+    plumbing (`-x265-params master-display=...`) and there is no HDR source
+    here to verify it against. So enabling `allow_hdr` is better than it was
+    and still not proven — see AGENTS.md.
+    """
+    v = info.video
+    if v is None:
+        return []
+    args: list[str] = []
+    for flag, key in (("-color_primaries", "color_primaries"),
+                      ("-color_trc", "color_transfer"),
+                      ("-colorspace", "color_space"),
+                      ("-color_range", "color_range")):
+        value = v.raw.get(key)
+        if value and value not in ("unknown", "und"):
+            args += [flag, str(value)]
+    return args
+
+
 _TIME_RE = re.compile(r"out_time_ms=(\d+)")
 
 
@@ -276,7 +369,8 @@ def run(cmd: list[str], total_duration: float,
         on_progress: Callable[[float, float | None], None] | None = None,
         stall_timeout: int = 900,
         nice_level: int = 10,
-        cancel: threading.Event | None = None) -> tuple[bool, str]:
+        cancel: threading.Event | None = None,
+        governor: "governor_mod.Governor | None" = None) -> tuple[bool, str]:
     """Run ffmpeg, reporting progress and killing a stalled job.
 
     ffmpeg's ``-progress pipe:1`` emits key=value blocks; ``out_time_ms`` is
@@ -296,6 +390,17 @@ def run(cmd: list[str], total_duration: float,
     )
     last_output = time.time()
     stderr_tail: list[str] = []
+
+    # Hold this encode to its share of the GPU's encode engine, on its own
+    # thread: the loop below is blocked on ffmpeg's progress output, and a
+    # governed process produces that output in bursts by design.
+    gov_stop = threading.Event()
+    gov_thread = None
+    if governor is not None and governor.active:
+        gov_thread = threading.Thread(
+            target=governor.run, args=(proc.pid, gov_stop), daemon=True,
+            name="unfuckarr-governor")
+        gov_thread.start()
 
     def drain_stderr() -> None:
         assert proc.stderr is not None
@@ -338,6 +443,9 @@ def run(cmd: list[str], total_duration: float,
             proc.kill()
             break
 
+    gov_stop.set()
+    if gov_thread is not None:
+        gov_thread.join(timeout=5)
     proc.wait()
     err_thread.join(timeout=2)
     if killed_for:

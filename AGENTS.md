@@ -13,11 +13,12 @@ vanilla-JS web UI (no build step), ffmpeg via subprocess.
 ```
 scanner.collect_library()      → inventory from Sonarr/Radarr APIs + extra paths
   ↓
-scanner.check_file()           → integrity → (emby direct-play OR local compat) → hygiene
+scanner.check_file()           → integrity → (emby direct-play OR local compat) → hygiene → efficiency
   ↓                              produces CheckResult: a list of Findings with categories
-remediation.decide()           → CheckResult + Policy → Decision (none|flag|transcode|repair|redownload)
+remediation.decide()           → CheckResult + Policy → Decision (none|flag|transcode|repair|shrink|redownload)
   ↓
 Remediator.apply()             → transcode.plan() → build_command() → run() → verify → replace
+                                 or: quality.search() → encode → quality.verify() → replace
                                  or: recycle.store() → arr.delete_file() → arr.blocklist_last_grab()
 ```
 
@@ -67,7 +68,81 @@ Break any of these and the failure is quiet and expensive.
    this, a transcode that does not clear the finding is redone on *every* scan, for ever, with
    nothing in the log saying why — live proof: 86 identical remuxes of one film (2026-08),
    because the hygiene path and the failure paths never counted.
-10. **The tailnet-only stance is policy, not decoration.** The README warning (private
+10. **A shrink is measured at both ends, and nothing else in the codebase works this way.**
+    Every other action fixes a *fault*; `shrink` re-encodes a file that is perfectly good, so the
+    only thing that justifies it is proof. `quality.search` finds the largest CRF still meeting
+    the target on sampled windows, and its projected saving must clear `min_saving_pct` before a
+    single frame of the real encode runs. Then the **finished file** is checked again: it must be
+    that much smaller *and* still score at the target when measured against the original
+    (`quality.verify`). Failing either, the output is deleted and the source is untouched. Do not
+    "optimise" the second measurement away because the first one passed — the sample search
+    genuinely lands over the line and the full encode genuinely misses it (observed: samples
+    92.0, full encode 90.3, output correctly discarded).
+
+11. **A file is shrunk at most once, ever.** `files.shrunk` and `files.shrink_skipped` are both
+    permanent, and `checks/efficiency.check` returns nothing for a file carrying either. Without
+    that, an encode gets re-encoded — a second generation of loss for a fraction of the saving —
+    and a file the search has already priced gets priced again, for hours of CPU, to reach the
+    same answer. `Decision.force` (the UI's Shrink button) reopens a *skipped* file, because the
+    settings may have changed; it never reopens a *shrunk* one, because generation loss does not
+    become untrue.
+
+12. **The measurement is the gate — nothing decides in advance which files are "too big".**
+    An earlier version of `checks/efficiency.py` selected candidates by video bitrate against a
+    target for their resolution. That is a guess about how an encoder will behave on content it
+    has not seen, and it is wrong in both directions: it condemns grain-heavy 35mm that will not
+    compress and waves through a lazy encode that would halve. `EfficiencyConfig` now decides
+    only whether the *search is worth spending* (size floor, duration floor, HDR, a codec skip
+    list that is purely a cost optimisation); `min_saving_pct` and the quality target decide
+    everything else. `target_mbps` survives only to **order** the backlog fattest-first, because
+    the per-scan cap means the order decides which savings land this month and which land next
+    year. Do not reintroduce it as a filter.
+
+13. **`unmeasured` is a state, not a claim, and it has to drain.** The finding is `not_measured`
+    at info severity: nothing is wrong with the file, it simply has not been priced. Every file
+    ends in one of two terminal states on the row — `shrunk` or `shrink_skipped`, both permanent
+    — and `checks/efficiency.check` then returns nothing for it. That is what makes the count a
+    progress figure rather than a permanent pill on the whole library. `CheckResult.unmeasured`
+    is deliberately narrower than `.efficiency` for the same reason: an HDR file being skipped is
+    an efficiency finding but a *terminal* one, so it reads as `ok` with an explanation rather
+    than sitting in a backlog it will never leave. `needs_check` also treats `unmeasured` like
+    `ok` — the backlog is the whole library at the start, and re-probing all of it nightly buys
+    nothing.
+
+14. **Efficiency findings are carried separately from everything else, and each separation is
+    load-bearing.** They are excluded from `CheckResult`'s hygiene warning set (so
+    `hygiene_action` cannot be what decides to re-encode a 40 GB file), they are last in the
+    status precedence (a corrupt file that is also large is corrupt), `oversize_action` is typed
+    `none|flag|shrink` so it can never delete, and — most importantly — **shrinks are not in
+    `_remediate`'s destructive list**. The abort ratio exists to notice a library that has just
+    broken. "Most of this library is H.264" is not that; an unmounted array produces integrity
+    failures, and a file ffprobe cannot read never reaches the efficiency check. Counting shrinks
+    there would disable the scanner permanently on almost every real library. They get
+    `max_shrinks_per_scan` instead, and are applied *after* every repair.
+
+15. **Shrinking is paced, not rationed, and the pacing is measured.** It runs on its own
+    worker for as long as the service is up, because a library of thousands of candidates is not
+    a per-scan job — a nightly batch of five takes years, and a batch big enough to matter is a
+    scan that runs all day and blocks everything behind it. What makes that safe to leave on is
+    `governor.py`: `drm-engine-enc` in `/proc/<pid>/fdinfo`, sampled over wall clock, is a direct
+    percentage of the GPU's *encode* engine for that process, and SIGSTOP/SIGCONT holds it at
+    `gpu_encode_percent`. Measured on the target hardware — flat out 958 ms/s, stopped a true 0,
+    resumed 966 ms/s, output valid. **Do not swap this for `gpu_busy_percent` or debugfs
+    `VCN Load`**: both read 0 through a saturating 4K encode on this GPU, because the first
+    tracks the graphics engine and the second is not mounted in a container. The governor must
+    also always leave the process running on exit, or a cancelled job sits in state T for ever
+    holding a semaphore and looking exactly like a hang; and it must stand down entirely for
+    software encodes, which have no engine to share.
+
+16. **"I cannot read this" and "this is broken" are different sentences.** `probe` raises
+    `DiscUnreadable` (a `ProbeError` subclass) for a disc image no available route can open, and
+    the integrity check turns that into an *info* `disc_not_inspectable` — never `probe_failed`,
+    which is in `REPAIRABLE_CODES` and leads to a remux and then a redownload. This is not a
+    hypothetical: before disc support existed, every BR-DISK in the live library was queued for
+    delete-and-re-search, and three 42 GB images are recoverable only because the recycle bin
+    caught them. Any new "cannot open" path must land on the info finding, not the error one.
+
+17. **The tailnet-only stance is policy, not decoration.** The README warning (private
     network/tailnet only, never the public internet, no independent human security review) stays,
     because the service deletes media unattended and has no auth until a key is set. In the same
     spirit, `__main__.resolve_host` **fails the start** when `UNFUCKARR_BIND_INTERFACE` names an
@@ -76,6 +151,70 @@ Break any of these and the failure is quiet and expensive.
 
 ## Traps found the hard way
 
+- **A Blu-ray image is pure UDF, not ISO9660.** Measured across the live library: of 104 disc
+  images, 98 were pure UDF (`BEA01`/`NSR03`/`TEA01` at sector 16), 5 carried an ISO9660 bridge as
+  well, and exactly one was ISO9660 with a BDMV directory. An identifier that looks for `CD001`
+  recognises none of the 98. `disc.identify` reads the Volume Recognition Sequence and only walks
+  an ISO9660 directory when one is actually there — which is the DVD case, and the case where
+  telling a DVD from a Blu-ray needs the directory.
+- **A Blu-ray's file metadata is usually not where its blocks appear to say.** UDF 2.50 puts file
+  entries and directory contents inside a *metadata file*, addressed through a second, virtual
+  partition; every disc measured here does that, so a reader resolving logical blocks directly
+  finds the file set descriptor missing. Behind that sits the opposite trap: the metadata
+  partition holds the metadata, but **file data stays in the physical partition underneath**.
+  Resolving data extents through the metadata file lands past its end, and the symptom is
+  exquisitely misleading — every directory reads perfectly and every single `.m2ts` fails.
+- **A raw MPEG-TS read through `subfile` reports a duration that is simply wrong** — 117 seconds
+  for a 137-minute film. That number decides whether the integrity check calls a file truncated,
+  so `disc.stream_duration` measures it from the first and last video presentation timestamps
+  instead, each found by probing a small window rather than reading 77 GiB. Cross-checked against
+  libbluray on a disc both can read: 8201.7 seconds against libbluray's 8201.4.
+- **The main title is the largest `.m2ts`, and that is a heuristic, not a fact.** On a disc using
+  seamless branching the feature is split, and the largest stream is one segment: measured across
+  ten real discs, two read short for that reason, one by 85%. So a *disc* that reads short of its
+  expected runtime raises `duration_below_expected` (info) and never `duration_mismatch` — on an
+  ordinary file that shortfall means truncation, on a disc it almost always means the heuristic
+  picked a segment. Reading `BDMV/PLAYLIST/*.mpls` for the longest playlist is the real fix.
+- **Never fall back to the ISO9660 bridge to find a Blu-ray's streams.** It is tempting when
+  libudfread cannot read the UDF (4 of 104 images), and it is wrong: ISO9660 cannot describe a
+  file over 4 GB in one extent, so the bridge lists the main feature in fragments. On a real 96 GB
+  disc the largest entry it offered was 1.1 GiB — a trailer. The fallback would not fail, it
+  would silently pick the wrong title. Report "not inspectable" instead. (The same limit does not
+  apply to DVD: the spec caps a VOB at 1 GB precisely so it fits one extent.)
+- **ffmpeg's `subfile` URL needs doubled commas**: `subfile,,start,X,end,Y,,:/path`. Drop either
+  one and it fails with "Error parsing options string", which points nowhere near the cause.
+- **libbluray narrates every open** — BD-J menus it will not run, a playlist whose first clip has
+  no timestamp — and seeking into a GOP always reports a missing first slice. `disc.is_noise`
+  filters all of it out of the decode-error count. Without that, every disc image reads as
+  damaged, which is the failure the module exists to undo.
+- **No distribution ffmpeg has libvmaf.** Not Debian bookworm (5.1.9), not Debian trixie (7.1.5),
+  not jellyfin-ffmpeg — check `debian/rules` in any of them and `--enable-libvmaf` is simply not
+  there. The image therefore installs a second, static BtbN build as `ffmpeg-vmaf`, used *only*
+  for scoring, and the Dockerfile greps its filter list so a download that changes shape fails
+  the build instead of silently downgrading every shrink to SSIM. Encoding stays on Debian's
+  ffmpeg because that is the binary the VAAPI work was verified against.
+- **Never compare a sample against a re-seeked source.** Two seeks to the same timestamp in the
+  same file do not reliably land on the same frame, and when they do not the metric reports
+  quality loss that is not there. It fails *plausibly*, which is why it survived a whole
+  calibration run: lossy encodes still produced believable numbers, and only the one case with a
+  known answer gave it away — a **lossless** encode scored **VMAF 62**, where it must score ~100.
+  `quality.extract_window` cuts each window out once, losslessly, and every candidate encode and
+  every comparison then works from exactly those frames. Same media, after the fix: 99.93.
+  `test_a_lossless_encode_scores_as_lossless` is the guard; if it ever fails again, every number
+  the search produces is wrong by an unknown amount, in the direction of encoding harder than
+  necessary.
+- **The two inputs to a quality comparison must be seeked identically.** `quality.score_pair`
+  takes a `distorted_window` for exactly this. Cutting the window out of a finished file with
+  `-c copy` first does *not* work: a stream copy cannot start mid-GOP, so it silently begins at
+  the previous keyframe and every frame is then compared against the wrong one. The resulting
+  score looks precisely like quality loss and is not — a byte-identical copy scores in the 50s.
+  There is a test for this (`test_a_misaligned_comparison_is_not_mistaken_for_quality_loss`).
+- **libvmaf wants the distorted input first**, reference second. Getting it backwards does not
+  error; it returns a different, wrong number.
+- **A quality search must use the encoder the real job will use.** `transcode.video_encode_args`
+  is split out for this. A CRF found with libx265 does not transfer to `hevc_vaapi`, which has no
+  CRF at all (`-qp`), and a sample encoded with different settings produces a number that means
+  nothing about the file that actually gets written.
 - **`-nostdin` on every ffmpeg call.** Without it a stalled ffmpeg consumes the parent's stdin
   and hangs the worker. Same trap as the rest of this fleet's ffmpeg tooling.
 - **A size floor cannot detect a "sample instead of the movie".** `TINY_FILE_BYTES` is 128 KB and
@@ -93,6 +232,60 @@ Break any of these and the failure is quiet and expensive.
   `_container_from` reconciles that against the extension.
 - **PGS subtitles cannot be copied into MP4** — it fails the whole job. `_subtitles_to_drop`
   handles it per container.
+- **`hevc_vaapi` on Mesa/AMD emits 1088 rows for a 1080p source, and hides it.** It pads to the
+  CTB boundary and does not signal a conformance window, so the output *decodes* eight rows
+  taller than the source with padding at the bottom — while the container metadata still says
+  1080, so `ffprobe` reports the right number and everything looks fine. The only way to see it
+  is to decode a frame and count bytes: 3,133,440 against the source's 3,110,400 for yuv420p
+  1920x1080. Consequences, both found on 2026-08-19:
+  - **The quality search cannot run at all on VAAPI output.** Every comparison dies with
+    "Width and height of input videos must be same" — libvmaf *and* ssim, so it is not a metric
+    problem.
+  - **A VAAPI re-encode silently changes the picture.** `_verify_output` did not look at
+    dimensions, so a shrink or a compat transcode would have replaced a 1080p file with a padded
+    1088p one. It checks now, and that check must stay: nothing in this application ever asks for
+    a resolution change, so one is always a defect.
+
+  `scale_vaapi` does not fix it — it breaks the pipeline outright, consistent with the trap
+  below. **The fix is a newer ffmpeg**, established by testing the same command and source
+  against four builds on the same hardware:
+
+  | ffmpeg | VAAPI geometry | libvmaf |
+  |---|---|---|
+  | Debian bookworm 5.1.9 (what the image ships) | **1088, padded** | no |
+  | Debian trixie 7.1.5 | **1088, padded** | no |
+  | BtbN static (master) | aborts — bundled libva cannot reach the host driver | yes |
+  | **linuxserver.io 8.0.1** | **1080, correct** | **yes** |
+
+  So ffmpeg 8.x fixes it, and the linuxserver.io build has libvmaf as well — one binary instead
+  of Debian's plus a separate scorer. That is exactly what Shrinkray does (it is built *from*
+  `lscr.io/linuxserver/ffmpeg`), which is why it can do VAAPI encodes when this cannot.
+
+  **The image is now built the same way** — Ubuntu 24.04 plus a multi-stage copy of that
+  ffmpeg's `/usr/local`, verified by building it and running it on the target hardware: correct
+  1080p geometry, VMAF 91.65 on a QP 26 encode against a calibration that predicted 91.96, and
+  the PUID/PGID drop still working.
+
+  **What that build does not have is libbluray**, so Blu-ray images cannot be opened and are
+  reported as `disc_not_inspectable`. DVD images are unaffected, because that path parses ISO9660
+  here and reads the VOB through `subfile`, which is a builtin. BtbN's static build *does* carry
+  all three flags, but it needs a libva newer than Ubuntu ships (it aborts on `vaMapBuffer2`
+  against 2.20), and once given linuxserver's libva 2.23 its VAAPI and libvmaf worked while
+  reading a disc still did not. The durable fix is to stop depending on the ffmpeg build for this
+  at all: parse UDF here, the way the DVD path already parses ISO9660, and hand ffmpeg a
+  `subfile` range.
+
+  Grafting that binary onto a Debian Python base does **not** work as-is: its `/usr/local/lib`
+  carries its own libva (2.23), which shadows the distro's and then cannot load Mesa's
+  `radeonsi_drv_video.so`, so device creation fails with "unknown libva error". Either leave that
+  libva behind and use the distro's, or take Mesa from the same image too. Seventeen ordinary
+  system libraries also have to be installed alongside (libxcb*, libX11, libglib, libgomp,
+  libv4l2, libxml2, libasound, libbrotli, libexpat, libOpenCL).
+
+  Until the image ships an ffmpeg 8.x, **hardware encoding is unusable for anything that has to
+  be compared with its source**, and `_verify_output`'s dimension check is what stops it doing
+  damage. On ffmpeg 8 it works and measures well — see the calibration table below, where VAAPI
+  reached the quality target at a slightly *lower* bitrate than x265 `medium`.
 - **Never ask VAAPI to filter frames it did not decode.** `-hwaccel vaapi
   -hwaccel_output_format vaapi` + `scale_vaapi` only works when the *decoder* also ran on the
   GPU. Hardware decode is per-codec, and the sources this tool exists to fix are exactly the ones
@@ -113,6 +306,12 @@ Break any of these and the failure is quiet and expensive.
 - **Unraid user shares are SMB/NFS and produce no inotify events.** `WatchManager._needs_polling`
   reads `/proc/mounts` and falls back to `PollingObserver`. When it cannot tell, it polls, because
   a missed event is silent and polling only costs a stat.
+- **A trailing `-- comment` on a column line breaks `ALTER TABLE ... DROP COLUMN` on older
+  SQLite.** DROP COLUMN rewrites the stored `CREATE TABLE` text, and the comment then swallows
+  the line after the removed one: *"error in table files after drop column: incomplete input"*.
+  Newer SQLite handles it, so this passes locally and fails on the CI runner. Production never
+  drops a column — the migration only ever ADDs — so it is only ever a problem for tests that
+  synthesise an old schema, which strip the comments first.
 - **SQLite objects are per-thread.** `db.connect()` uses `threading.local`. Scan workers, transcode
   workers and the async web layer are all different threads.
 - **The event bus crosses the thread/async boundary** via `loop.call_soon_threadsafe`, with the
@@ -152,6 +351,10 @@ has run", and this project has now been wrong about that once.
 
 **Verified in CI** — the test suite, green, run against real ffmpeg output on every push:
 
+- That the measurement decides, not a bitrate guess: a modest HEVC file and a fat MPEG-2 one
+  both queue for measurement, the fattest is ordered first, a skip-listed codec is excluded only
+  as a cost optimisation and included again when the list is emptied, and an HDR skip reads as a
+  terminal `ok` rather than sitting in a backlog it will never leave.
 - The whole check engine against files ffmpeg actually renders: good, garbage, truncated,
   MPEG-2/AVI, HEVC, dual-audio, faststart vs not.
 - The transcode planner's copy-vs-encode decisions, and one full end-to-end run
@@ -167,16 +370,110 @@ has run", and this project has now been wrong about that once.
 - Recycle store/restore/sweep, including two files with the same basename.
 - Path mapping, including that `/tv` does not rewrite `/tvshows`.
 - The full API surface, settings round-trip, API-key gating, and the settle timer.
+- **The quality search runs in CI**, not just locally: the runner installs the same static
+  `ffmpeg-vmaf` the image ships, so the real-media shrink and the VMAF discrimination tests
+  execute there rather than skipping. Before that, the part of the application that decides
+  whether a re-encode may replace someone's file was the one thing CI could not exercise.
 - The web UI: dashboard, files list, file drawer, and a settings round-trip driven through the
   real page in a browser, persisted to disk.
-- **The Docker image builds and runs.** CI boots it and asserts `/health`, `/api/status`, the
-  served UI and `ffmpeg -version`; the log shows the PUID/PGID drop working
+- **The Docker image builds and runs, with both ffmpegs.** CI boots it and asserts `/health`,
+  `/api/status`, the served UI, and — since 2026-08-19 — that the image really carries both
+  halves of the transcoding stack: Debian's ffmpeg 5.1.9 for encoding, the static `ffmpeg-vmaf`
+  with a working `libvmaf` filter for scoring, and the `bluray` and `subfile` protocols the disc
+  reader needs. Build-time greps prove the layer; the smoke test proves the image. Also
+  `ffmpeg -version`; the log shows the PUID/PGID drop working
   (`unfuckarr starting as unfuckarr:unfuckarr (1000:1000)`). Multi-arch amd64 + arm64 on tags.
   This is the only container proof available — there is no runtime on the dev machine.
 - That the scheduled-scan time survives a restart.
+- **The shrink path, including a full pass against real media** — search, encode, structural
+  verification, realised-saving check, VMAF verification of the finished file, recycle, replace,
+  and the permanent marker. Plus every brake individually: never twice, never reassessed, a
+  forced request reopening a skipped file but not a shrunk one, a projection under the floor
+  never starting an encode, an output that is not smaller being discarded, an output that
+  measures below target being discarded, one bad sample failing a passing mean, an unverifiable
+  output being discarded, HDR left alone, a missing metric not writing the file off, the shrink
+  window wrapping past midnight, shrinks staying out of the abort ratio, their own cap, repairs
+  ordered ahead of them, and the six new columns migrating onto a 1.0.0-shaped database.
+- That VMAF actually discriminates: a near-lossless re-encode scores above 90 and CRF 51 below
+  80, measured against media ffmpeg rendered.
+- **Disc images**, against ISO9660 volumes the tests assemble byte by byte (so no fixture and no
+  `xorriso` on the runner): pure-UDF recognised as Blu-ray, a DVD recognised from its VIDEO_TS
+  with the menu VOB correctly excluded, an ISO9660 bridge still read as Blu-ray, a truncated or
+  non-disc image refused, libbluray chatter not counted as damage, an unopenable image producing
+  an info finding and a `none` decision, and the DVD `subfile` route reading a real MPEG-PS
+  stream back out of a real image through the byte range the parser computed.
+
+**Calibrated on real media, 2026-08-20**, with the fixed comparison — one 6-second 1080p window
+cut losslessly out of a 28.9 Mbps H.264 Blu-ray remux, every candidate encoded from that window
+and scored against it:
+
+| target | hevc_vaapi | libx265 |
+|---|---|---|
+| control (near-lossless) | QP 1 → **99.87** | CRF 0 → **99.73** |
+| excellent (95) | QP 22 → 95.55, 9.3 Mbps | CRF 18 → 95.34, 8.1 Mbps |
+| **good (92)** | **QP 26 → 91.96, 2.2 Mbps (92% smaller)** | **CRF 22 → 92.46, 2.7 Mbps (91% smaller)** |
+| acceptable (85) | QP 31 ≈ 85, ~1 Mbps | CRF 29 ≈ 85, ~0.7 Mbps |
+
+Two things follow. **The default range 18–34 brackets all three tiers for both encoders**, with
+the "good" target landing mid-range where a bisection can actually find it — so it needs no
+change. And **VAAPI is not the poor relation here**: at the 92 target it reached a slightly lower
+bitrate than x265 `medium` for the same score. That is one window of one file and should not be
+read as a general claim about the encoders, but it does mean there is no quality argument for
+preferring software once the geometry bug is fixed.
+
+The control rows are the point of the table. Before `extract_window`, those same two encodes
+scored 76.7 and 62.
+
+**Verified on the GPU, 2026-08-19** — `governor.py` driving a real 4K HEVC VAAPI encode in the
+shipped container, measured through `drm-engine-enc`:
+
+| asked for | settled at | on-fraction |
+|---|---|---|
+| 50% | **50.5%** (range 49–56%) | 0.51 |
+| 25% | **27.0%** (range 24–61%) | 0.26 |
+
+The first two or three samples of any run read 96–97%: the controller deliberately runs the first
+period flat out to find out whether the job touches the encode engine at all, and averaging those
+in is what makes a correct governor look like it overshoots. Judge it on the settled figure.
+
+**Verified against the live library on 2026-08-19** — 104 real disc images, read with the
+container's own ffmpeg:
+
+- `disc.identify` classified all 104 correctly (98 pure UDF, 5 UDF+ISO9660, 1 ISO9660/BDMV).
+- 99 of 104 opened through `bluray:` and gave full stream information — an 88 GiB image reporting
+  2h17m of HEVC 4K HDR with six audio tracks, at 89 Mbps, which is the best shrink candidate in
+  the library.
+- 5 could not be opened by libudfread (UDF 2.50 metadata partitions: *"read metadata file 0:
+  unexpected tag 261"*, *"ECMA 167 Volume Recognition failed"*). Those now produce
+  `disc_not_inspectable` and no action, where previously they produced `probe_failed` and a
+  redownload.
+- Seeking an hour into a 4K disc and encoding two seconds took 5 seconds, so the quality search
+  is usable on a disc rather than merely possible.
 
 **Still assumed:**
 
+- **`allow_hdr` is better than it was and still not proven.** `transcode.colour_args` now carries
+  the transfer function, primaries, matrix and range onto the encode — ffmpeg does not do that on
+  its own, and without them an HDR re-encode plays grey and washed out with nothing reporting it.
+  What is *not* carried is mastering-display and MaxCLL side data, which needs per-encoder
+  plumbing (`-x265-params master-display=...`) and there is no HDR source on the dev machine to
+  verify against. That is why the default stays off, and why most 4K discs report
+  `hdr_not_shrunk` rather than being touched. Do not flip the default without an HDR file to
+  check the output against.
+- **The continuous worker has never run against the live library.** Its parts are covered — the
+  candidate query, the idle conditions, the governor against a real GPU — but "a worker that runs
+  for weeks" is a claim only time can support, and the failure mode to watch for is the backlog
+  not draining because every candidate fails for the same reason.
+- **No disc has actually been shrunk.** The read path is verified against the real library; the
+  write path — a multi-hour 4K HEVC encode out of a disc image, replacing a 90 GB `.iso` with an
+  `.mkv` — has not been run. Note also that most 4K discs are HDR, and `allow_hdr` is off by
+  default, so out of the box the majority of them will report `hdr_not_shrunk` and be left alone.
+- **Nothing has been shrunk on the live library.** The whole path is exercised end to end in CI
+  against real media, and the search has been run by hand against a 400 MB 720p clip (83 Mbps →
+  CRF 29 at VMAF 92.7). What has *not* happened is a shrink of a real 40 GB remux, on the array,
+  with the hardware encoder — so the timings are arithmetic, and `hevc_vaapi`'s `-qp` scale has
+  never been through the search at all. Expect the first live run to want `crf_min`/`crf_max`
+  adjusting for VAAPI, whose QP numbers do not mean what libx265's CRF numbers mean.
 - **No Unraid server has installed the CA template.** It is written against the CA conventions
   used elsewhere in this fleet (root `<Container version="2">`, no trailing colon on subcategory
   tokens, per-image `<Registry>` URL) and `scripts/validate_template.py` checks those in CI, but
@@ -203,10 +500,15 @@ unfuckarr/
     integrity.py     Is it intact? + looks_repairable()
     compat.py        Local Emby direct-play model + the three presets
     hygiene.py       Stream metadata
+    efficiency.py    Is it far bigger than it needs to be? + the bitrate arithmetic
   clients/
     arr.py           Sonarr + Radarr v3
     emby.py          PlaybackInfo, item index, activity log
   transcode.py       Plan builder, ffmpeg command, progress runner
+  quality.py         Metric discovery, sampling, VMAF/SSIM scoring, the CRF search
+  governor.py        Per-process GPU encode share from fdinfo, held by SIGSTOP/SIGCONT
+  disc.py            Reading .iso/.img without mounting: a UDF reader (metadata
+                     partitions included), ISO9660 for DVDs, subfile/concat URLs
   recycle.py         Recycle bin + retention
   remediation.py     decide() and Remediator
   scanner.py         Enumeration, check_file, the scan loop, the brakes

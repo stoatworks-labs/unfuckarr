@@ -27,9 +27,18 @@
     re-searches genuinely broken files (blocklisting the release so the same
     bad copy is not grabbed again).
 
+    It can also reclaim space. Every file worth the CPU is MEASURED to see how
+    small it can be at full perceptual quality: short samples are encoded at
+    candidate settings and scored against the original with VMAF, and nothing
+    replaces anything unless the finished file is both meaningfully smaller
+    and still scores at the target. There is no bitrate threshold guessing
+    which files are too big - the measurement decides, per file. A file is
+    only ever shrunk once, and one that is measured and left alone is not
+    measured again.
+
     Watch folders check new downloads the moment they land, before the *arr
-    imports them. Everything deleted goes to a recycle bin with a retention
-    window, so an automatic decision can be undone.
+    imports them. Everything deleted or replaced goes to a recycle bin with a
+    retention window, so an automatic decision can be undone.
 
     Web UI shows library status, what it is doing right now, and every setting.
 
@@ -66,12 +75,20 @@
           Type="Port" Display="always" Required="true" Mask="false">6969</Config>
 
   <Config Name="Config" Target="/config" Default="/mnt/user/appdata/unfuckarr" Mode="rw"
-          Description="Settings, the file database, and the recycle bin. Keep this on the cache/appdata share."
+          Description="Settings and the file database. Keep this on the cache/appdata share. The recycle bin is deliberately NOT here — see Recycle bin below."
           Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/unfuckarr</Config>
 
   <Config Name="Media" Target="/media" Default="/mnt/user/media" Mode="rw"
           Description="Your library. Mount it at the SAME path Sonarr/Radarr use, or set path mappings in the settings page — a mismatch makes every file look missing. Read-write is required: transcoding and deleting both write here."
           Type="Path" Display="always" Required="true" Mask="false">/mnt/user/media</Config>
+
+  <Config Name="Recycle bin" Target="UNFUCKARR_RECYCLE_BIN_PATH" Default="/media/.recycle" Mode=""
+          Description="Where deleted and replaced files are kept until retention expires. Leave this at /media/.recycle: it is inside the Media mount above, so recycling a file is a RENAME and costs nothing, and the bin lands on the array with the media rather than on the cache. Any path outside that mount makes every delete a full copy — and the old default (/config/recycle) is appdata on the cache, which a handful of 40 GB remuxes will fill. unfuckarr never scans its own bin, so it is safe inside the library."
+          Type="Variable" Display="always" Required="false" Mask="false">/media/.recycle</Config>
+
+  <Config Name="Recycle bin retention (days)" Target="UNFUCKARR_RECYCLE_BIN_DAYS" Default="" Mode=""
+          Description="Optional. How long deleted and replaced files are kept before the bin is swept. Leave empty to use the settings page (14 days). 0 deletes immediately and gives up the ability to undo an automatic decision. Space-saving shrinks keep the original of every file they replace, so this window times the per-scan cap is roughly how much is held back from the array at once."
+          Type="Variable" Display="advanced" Required="false" Mask="false"/>
 
   <Config Name="Downloads (watch folder)" Target="/downloads" Default="/mnt/user/downloads/complete" Mode="rw"
           Description="Optional. Point this at your completed-downloads folder, then add /downloads as a watch folder in Settings to have new files checked the moment they land."

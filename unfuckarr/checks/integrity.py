@@ -9,7 +9,9 @@ from __future__ import annotations
 import os
 
 from ..config import IntegrityConfig
-from ..probe import MediaInfo, ProbeError, decode_check, decode_check_full, probe
+from ..disc import is_disc_image
+from ..probe import (DiscUnreadable, MediaInfo, ProbeError, decode_check,
+                     decode_check_full, probe)
 from . import CheckResult, Finding
 
 # Below this nothing is a real video file — it is a stub, a placeholder, or a
@@ -50,8 +52,26 @@ def check(
         ))
 
     if info is None:
+        if is_disc_image(path) and not cfg.inspect_disc_images:
+            result.add(Finding(
+                "integrity", "disc_not_inspected", "info",
+                "disc image, and disc inspection is switched off",
+            ))
+            return result, None
         try:
-            info = probe(path, ffprobe)
+            info = probe(path, ffprobe, ffmpeg=ffmpeg)
+        except DiscUnreadable as exc:
+            # A disc image this build has no way to open. That is a statement
+            # about the tooling, not about the file, and it must never reach a
+            # policy that deletes: doing so put three 42 GB Blu-ray images in
+            # the recycle bin on the live library before this existed.
+            result.add(Finding(
+                "integrity", "disc_not_inspectable", "info",
+                f"disc image that could not be opened for inspection: {exc}. "
+                "Nothing has been done to it — being unable to read a file is "
+                "not evidence that the file is bad.",
+            ))
+            return result, None
         except ProbeError as exc:
             result.add(Finding(
                 "integrity", "probe_failed", "error",
@@ -89,7 +109,22 @@ def check(
                   f"{expected_runtime / 60:.0f} min expected ({short:.0f}% short)")
         data = {"duration": info.duration, "expected": expected_runtime,
                 "short_pct": short}
-        if short >= cfg.duration_truncated_pct:
+        if info.is_disc:
+            # A disc image that reads short is far more likely to be a disc
+            # whose feature is split across several streams than a truncated
+            # download — the main title is picked as the largest .m2ts, and on
+            # a disc using seamless branching that is one segment of the film.
+            # Measured across ten real discs, two read short for exactly that
+            # reason, one of them by 85%. Condemning those would delete a
+            # perfectly good 10 GB image over a heuristic.
+            result.add(Finding(
+                "integrity", "duration_below_expected", "info",
+                f"{detail} — on a disc image this usually means the feature is "
+                "split across several streams rather than that anything is "
+                "wrong with it",
+                data,
+            ))
+        elif short >= cfg.duration_truncated_pct:
             result.add(Finding(
                 "integrity", "duration_mismatch", "error", detail, data))
         elif short > cfg.duration_tolerance_pct:
@@ -104,14 +139,20 @@ def check(
     if result.errors or cfg.depth == "quick":
         return result, info
 
-    _decode_pass(path, cfg, ffmpeg, info, result)
+    _decode_pass(info.source, cfg, ffmpeg, info, result)
     return result, info
 
 
-def _decode_pass(path: str, cfg: IntegrityConfig, ffmpeg: str,
+def _decode_pass(source: str, cfg: IntegrityConfig, ffmpeg: str,
                  info: MediaInfo, result: CheckResult) -> None:
+    """``source`` is what ffmpeg opens — a path, or ``bluray:`` for a disc."""
+    # One audio track, not all of them, when the source is a disc: a Blu-ray
+    # playlist carries a dozen, several TrueHD, and decoding every one turns a
+    # five-second sample into a multi-minute one without answering anything
+    # the first track does not.
+    streams = ("0:v:0?", "0:a:0?") if info.is_disc else ("0:v:0?", "0:a?")
     if cfg.depth == "full":
-        res = decode_check_full(path, ffmpeg)
+        res = decode_check_full(source, ffmpeg, streams=streams)
         windows = [("whole file", res)]
     else:
         # Head, middle and tail. Damage from an interrupted download lands at
@@ -124,12 +165,21 @@ def _decode_pass(path: str, cfg: IntegrityConfig, ffmpeg: str,
             offsets.append(("middle", max(0.0, dur / 2 - span / 2)))
             offsets.append(("end", max(0.0, dur - span - 1)))
         windows = [
-            (label, decode_check_full(path, ffmpeg, start=off, duration=span))
+            (label, decode_check_full(source, ffmpeg, start=off, duration=span,
+                              streams=streams))
             for label, off in offsets
         ]
         # A container whose index is broken demuxes badly even where the video
         # decodes; one cheap copy pass over the whole file catches that.
-        windows.append(("demux", decode_check(path, ffmpeg)))
+        #
+        # Not for a disc image. "Cheap" here means I/O-bound rather than
+        # CPU-bound, which is true of a 40 GB mkv and emphatically not true of
+        # a 94 GB Blu-ray read through libbluray — it reads the whole disc,
+        # for hours, to answer a question that does not arise: libbluray built
+        # its own index from the playlist to open the thing at all, so a
+        # broken index would have failed already.
+        if not info.is_disc:
+            windows.append(("demux", decode_check(source, ffmpeg)))
 
     total = 0
     messages: list[str] = []

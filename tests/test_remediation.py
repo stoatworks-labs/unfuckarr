@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import httpx
@@ -384,6 +385,80 @@ def test_zero_retention_unlinks_immediately(tmp_path, settings):
     assert not src.exists()
     # Still recorded, so the activity log can show what happened.
     assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 1
+
+
+def test_orphaned_bin_files_are_swept_too(tmp_path, settings):
+    """The sweep walks the database, so a file whose row is gone was never
+    looked at again. Live that was 139 GB, 126 GB of it three identical copies
+    of one 42 GB disc image."""
+    import time
+
+    bin_dir = tmp_path / "bin"
+    dated = bin_dir / "2026-08-08"
+    dated.mkdir(parents=True)
+    orphan = dated / "movies_Film__Film BR-DISK.1.2.iso"
+    orphan.write_bytes(b"x" * 2048)
+    old_enough = time.time() - 30 * 86400
+    os.utime(orphan, (old_enough, old_enough))
+
+    # A file the database *does* know about, from today, must survive.
+    keeper = dated / "movies_Other__Other.mkv"
+    keeper.write_bytes(b"y" * 2048)
+    db.ex("INSERT INTO recycle (original, stored, size, deleted, reason) "
+          "VALUES (?,?,?,?,?)",
+          ("/media/Other.mkv", str(keeper), 2048, time.time(), "test"))
+
+    removed = recycle.sweep(14, str(bin_dir))
+    assert removed == 1
+    assert not orphan.exists()
+    assert keeper.exists()
+
+
+def test_a_recent_orphan_is_left_alone(tmp_path, settings):
+    """An in-flight recycle writes the file before it writes the row."""
+    bin_dir = tmp_path / "bin"
+    dated = bin_dir / "2026-08-19"
+    dated.mkdir(parents=True)
+    fresh = dated / "movies_New__New.mkv"
+    fresh.write_bytes(b"z" * 1024)
+
+    assert recycle.sweep(14, str(bin_dir)) == 0
+    assert fresh.exists()
+
+
+def test_unrelated_directories_in_the_bin_are_not_touched(tmp_path, settings):
+    """Only dated directories are ours to empty."""
+    import time
+
+    bin_dir = tmp_path / "bin"
+    other = bin_dir / "please-do-not-delete"
+    other.mkdir(parents=True)
+    theirs = other / "notes.txt"
+    theirs.write_bytes(b"hello")
+    old_enough = time.time() - 30 * 86400
+    os.utime(theirs, (old_enough, old_enough))
+
+    assert recycle.sweep(14, str(bin_dir)) == 0
+    assert theirs.exists()
+
+
+def test_abandoned_transcode_outputs_are_found(tmp_path):
+    """A transcode killed part-way leaves its output behind for ever: the
+    scanner and the watcher both ignore it by design, so nothing notices.
+    Live, four had reached 199 GB inside the library, with 507 metadata files
+    Emby had written for them as if they were separate films."""
+    movie = tmp_path / "Batman (1989)"
+    movie.mkdir()
+    real = movie / "Batman (1989).mkv"
+    real.write_bytes(b"real")
+    leftover = movie / "Batman (1989).unfuckarr.mkv"
+    leftover.write_bytes(b"half a transcode")
+    artwork = movie / "Batman (1989).unfuckarr-banner.jpg"
+    artwork.write_bytes(b"emby wrote this for the temp file")
+
+    found = set(transcode.abandoned_outputs([str(real)]))
+    assert found == {str(leftover), str(artwork)}
+    assert str(real) not in found
 
 
 def test_sweep_only_removes_expired_entries(tmp_path, settings):

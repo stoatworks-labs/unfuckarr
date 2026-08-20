@@ -22,6 +22,7 @@ from typing import Any, Iterable
 from . import db, recycle, transcode
 from .checks import CheckResult, Finding
 from .checks import compat as compat_checks
+from .checks import efficiency as efficiency_checks
 from .checks import hygiene as hygiene_checks
 from .checks import integrity as integrity_checks
 from .clients.arr import ArrClient, ArrError
@@ -134,7 +135,8 @@ def sync_inventory(rows: list[dict[str, Any]]) -> tuple[int, int]:
 # -- per-file check -------------------------------------------------------
 
 def check_file(path: str, s: Settings, expected_runtime: int | None = None,
-               emby: EmbyClient | None = None) -> tuple[CheckResult, MediaInfo | None]:
+               emby: EmbyClient | None = None,
+               already_shrunk: bool = False) -> tuple[CheckResult, MediaInfo | None]:
     """Run every enabled check against one file."""
     result, info = integrity_checks.check(
         path, s.integrity, ffprobe=s.ffprobe_path, ffmpeg=s.ffmpeg_path,
@@ -161,17 +163,26 @@ def check_file(path: str, s: Settings, expected_runtime: int | None = None,
         compat_checks.check(info, s.emby_compat, result)
 
     hygiene_checks.check(info, s.hygiene, result)
+    efficiency_checks.check(info, s.efficiency, result,
+                            already_shrunk=already_shrunk)
     return result, info
 
 
 def persist_result(path: str, result: CheckResult, info: MediaInfo | None,
                    size: int, mtime: float) -> None:
     now = time.time()
+    # The ordering key rides along on the finding that created it, so the
+    # continuous worker can pick the fattest candidate with a plain ORDER BY
+    # rather than re-probing the library to work out what to do next.
+    priority = None
+    for f in result.unmeasured:
+        priority = f.data.get("ratio")
+        break
     db.ex("UPDATE files SET status=?, last_checked=?, last_result=?, probe=?, "
-          "checked_signature=? WHERE path=?",
+          "checked_signature=?, shrink_priority=? WHERE path=?",
           (result.status, now, json.dumps(result.as_dict()),
            json.dumps(info.summary()) if info else None,
-           f"{size}:{mtime}", path))
+           f"{size}:{mtime}", priority, path))
     # Findings are replaced wholesale each pass; the previous set is resolved
     # rather than deleted so the activity view can show what changed.
     db.ex("UPDATE findings SET resolved=? WHERE path=? AND resolved IS NULL",
@@ -195,7 +206,12 @@ def needs_check(row: Any, s: Settings) -> bool:
     signature = f"{stat.st_size}:{stat.st_mtime}"
     if row["checked_signature"] != signature:
         return True
-    if row["status"] not in ("ok",):
+    # "unmeasured" belongs with "ok" here, not with the faults. Nothing is
+    # wrong with the file; it is waiting for a quality search that the
+    # per-scan cap doles out slowly. Re-probing every one of them on every
+    # pass would mean probing the entire library nightly for ever, because the
+    # backlog is the whole library to begin with.
+    if row["status"] not in ("ok", "unmeasured"):
         return True                      # keep re-reporting a known-bad file
     age_days = (time.time() - row["last_checked"]) / 86400
     return age_days >= s.schedule.recheck_after_days
@@ -312,7 +328,8 @@ class Scanner:
                  if state.scan.total else -1)
         try:
             result, info = check_file(
-                path, s, expected_runtime=row["expected_runtime"], emby=emby)
+                path, s, expected_runtime=row["expected_runtime"], emby=emby,
+                already_shrunk=bool(row["shrunk"] or row["shrink_skipped"]))
         except ProbeError as exc:
             result, info = CheckResult(path=path, error=str(exc)), None
         except Exception as exc:  # noqa: BLE001
@@ -346,6 +363,13 @@ class Scanner:
         # re-queues every known-bad file, so the pass after a scan that found
         # real problems consists of almost nothing else, the ratio reads 100%,
         # and the scan aborts for ever without touching a thing.
+        # `shrink` is deliberately not in this list. The brake exists to
+        # notice a library that has just broken, and "most of this library is
+        # large" is not that: an unmounted array produces integrity failures,
+        # and a file ffprobe cannot read never reaches the efficiency check at
+        # all. Counting shrinks here would also trip the brake permanently on
+        # any library that is mostly H.264 — which is most libraries. Shrinks
+        # have their own, much smaller cap below instead.
         denominator = max(1, population or state.scan.checked)
         destructive = [p for p in pending
                        if p[3].action in ("redownload", "transcode", "repair")]
@@ -362,24 +386,59 @@ class Scanner:
             return {"aborted": state.scan.aborted, "flagged": len(pending)}
 
         applied = 0
-        for row, result, info, decision in pending:
+        shrinks = 0
+        capped_shrinks = False
+        # Repairs first, shrinks last. A broken file is urgent and a remux
+        # takes seconds; an unmeasured file is neither urgent nor cheap, and
+        # one multi-hour shrink must never consume the pass that a corrupt
+        # file is waiting on.
+        #
+        # Within the shrinks, fattest first. The cap means the order decides
+        # which savings land this month and which land next year, so the
+        # files furthest above the reference bitrate for their resolution go
+        # first — that is where the measurement is most likely to pay, and
+        # where it pays most when it does.
+        def order(item: tuple) -> tuple[bool, float]:
+            _, _, item_info, item_decision = item
+            if item_decision.action != "shrink":
+                return (False, 0.0)
+            return (True, -efficiency_checks.priority(item_info, s.efficiency))
+
+        ordered = sorted(pending, key=order)
+        for row, result, info, decision in ordered:
             if self._stop:
                 break
-            if decision.action != "flag" and applied >= s.policy.max_actions_per_scan:
+            if decision.action == "shrink":
+                if s.shrink.continuous:
+                    # The background worker owns shrinking. Running them here
+                    # too would mean two encoders competing for the engine the
+                    # governor is trying to hold to a share, and a scan that
+                    # takes as long as the backlog.
+                    continue
+                if shrinks >= s.policy.max_shrinks_per_scan:
+                    if not capped_shrinks:
+                        db.log("shrink_cap_reached", "info", row["path"],
+                               {"cap": s.policy.max_shrinks_per_scan})
+                        capped_shrinks = True
+                    continue
+            elif decision.action != "flag" and applied >= s.policy.max_actions_per_scan:
                 db.log("action_cap_reached", "warn", row["path"],
                        {"cap": s.policy.max_actions_per_scan})
                 break
             outcome = self.remediator.apply(row, result, info, decision)
-            if decision.action != "flag":
+            if decision.action == "shrink":
+                shrinks += 1
+            elif decision.action != "flag":
                 applied += 1
-                state.scan.actions = applied
+            if decision.action != "flag":
+                state.scan.actions = applied + shrinks
                 publish_scan()
             bus.publish("remediated", {"path": row["path"], **outcome})
 
-        recycle.sweep(s.policy.recycle_bin_days)
+        recycle.sweep(s.policy.recycle_bin_days, s.policy.recycle_bin_path)
         db.log("scan_finished", "info", detail={
             "checked": state.scan.checked, "failed": state.scan.failed,
-            "actions": applied,
+            "actions": applied, "shrinks": shrinks,
         })
         return {"checked": state.scan.checked, "failed": state.scan.failed,
-                "actions": applied}
+                "actions": applied, "shrinks": shrinks}

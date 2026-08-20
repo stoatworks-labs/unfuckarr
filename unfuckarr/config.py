@@ -82,6 +82,13 @@ class IntegrityConfig(BaseModel):
     # otherwise fine file); at or above it the file is called broken.
     max_decode_errors: int = 5
     fail_on_missing_audio: bool = True
+    # Read .iso/.img through libbluray (Blu-ray) or the ISO9660 directory
+    # (DVD) rather than handing the image to ffprobe, which cannot open one
+    # and says "Invalid data found" — indistinguishable, to these checks,
+    # from a genuinely broken file. Switch this off and disc images are
+    # skipped entirely rather than guessed at. Never left to guess: an
+    # image that cannot be opened is reported, not condemned.
+    inspect_disc_images: bool = True
 
 
 class EmbyCompatConfig(BaseModel):
@@ -111,6 +118,120 @@ class HygieneConfig(BaseModel):
     # Anything outside this range confuses client frame-rate matching.
     min_fps: float = 20.0
     max_fps: float = 61.0
+
+
+class EfficiencyConfig(BaseModel):
+    """Which files are worth *measuring* for a saving.
+
+    Deliberately not "which files are too big". A bitrate threshold is a guess
+    about what an encoder will manage on content it has not seen, and it is
+    wrong in both directions: it condemns a well-encoded 30 Mbps remux of
+    grain-heavy 35mm that will not compress, and it lets a lazily-encoded
+    6 Mbps 1080p through when the same picture fits in 2. The quality search
+    already answers the question properly, per file, by measuring — so these
+    settings decide only whether spending that search is *worthwhile*, and the
+    measurement decides everything else.
+
+    Nothing raised here is ever an error, and nothing raised here can lead to
+    a delete: the worst outcome is a re-encode, guarded by
+    ``Policy.oversize_action`` and every gate in ``ShrinkConfig``.
+    """
+
+    enabled: bool = True
+    # Floors, in the sense of "is there anything here worth hours of CPU".
+    min_size_mb: int = 500
+    min_duration_seconds: int = 300
+    # A cost optimisation and nothing more. A search on a file already in one
+    # of these will almost always fail `min_saving_pct` — and take minutes to
+    # say so, per file, across a whole library. Empty the list to measure them
+    # anyway; a genuinely bloated AV1 does exist, it is just rare enough not
+    # to be worth the sweep.
+    skip_codecs: list[str] = Field(default_factory=lambda: ["av1"])
+    # HDR survives a re-encode only if its metadata does, and getting that
+    # wrong produces a grey, washed-out file that still plays — the worst kind
+    # of failure, because nothing reports it. Off until asked for.
+    allow_hdr: bool = False
+    # NOT a gate. The backlog is worked through fattest-first so the biggest
+    # wins land first, and this is what "fattest" is measured against: the
+    # ratio of a file's video bitrate to the target for its height. A file
+    # under its target is still assessed, just later.
+    target_mbps: dict[str, float] = Field(default_factory=lambda: {
+        "2160": 25.0, "1440": 14.0, "1080": 8.0, "720": 4.0, "480": 2.5,
+    })
+
+
+class ShrinkConfig(BaseModel):
+    """How a shrink is carried out, and every brake on it.
+
+    The defaults are conservative on purpose. This is the one action in
+    unfuckarr that changes a file nothing is wrong with, so it has to be worth
+    it (``min_saving_pct``), it has to be measured rather than assumed (the
+    quality target), and it must never happen twice to the same file.
+    """
+
+    enabled: bool = True
+    # Only HEVC. Emby direct play is the premise of this whole application and
+    # HEVC is in the default target profile; AV1 is not, and no AMD part before
+    # RDNA3 can encode it, so shrinking to AV1 would risk trading a size win
+    # for a file Emby has to transcode on every play.
+    codec: Literal["hevc"] = "hevc"
+    # Quality tier. See quality.QUALITY_TIERS — 85 / 92 / 95 VMAF.
+    quality: Literal["acceptable", "good", "excellent"] = "good"
+    # Overrides the tier when non-zero, in whatever units `metric` is in.
+    target_score: float = 0.0
+    # How far below the target one sample may sit while the mean still passes,
+    # in VMAF points. One bad scene is exactly what a mean hides.
+    window_tolerance: float = 3.0
+    metric: Literal["auto", "vmaf", "ssim"] = "auto"
+    # An ffmpeg built with libvmaf, if it is not on PATH as ffmpeg-vmaf.
+    vmaf_ffmpeg_path: str = ""
+    metric_threads: int = 0
+    # The search itself.
+    sample_count: int = 3
+    sample_seconds: int = 15
+    crf_min: int = 18
+    crf_max: int = 34
+    search_steps: int = 5
+    # Do not touch the file unless this much is actually saved — checked twice,
+    # once against the search's projection before the encode starts and once
+    # against the finished file before it is allowed to replace anything.
+    min_saving_pct: float = 25.0
+    # Restrict shrinking to a window of the day, e.g. "22-06". Empty = any time.
+    # Scans still run; only the shrink action waits.
+    only_between_hours: str = ""
+    # Work through the backlog continuously on a background thread, rather
+    # than a handful per scan. A library of thousands of candidates is not a
+    # per-scan job — at a quarter-hour or more each, a nightly batch takes
+    # years — so the natural shape is a worker that is simply always running
+    # and is *paced* rather than *rationed*.
+    continuous: bool = True
+    # The pacing: the share of the GPU's video encode engine this may use,
+    # as a percentage. The rest is left for everything else on the box —
+    # Emby's own transcodes above all. Measured per process from
+    # /proc/<pid>/fdinfo and held there by pausing and resuming the encoder;
+    # see governor.py. 0 or 100 disables throttling, and it is inert for
+    # software encodes, which have no engine to share.
+    gpu_encode_percent: int = 50
+
+    @field_validator("gpu_encode_percent")
+    @classmethod
+    def _check_share(cls, v: int) -> int:
+        if not 0 <= v <= 100:
+            raise ValueError("must be between 0 and 100")
+        return v
+
+    @field_validator("only_between_hours")
+    @classmethod
+    def _check_window(cls, v: str) -> str:
+        if not v:
+            return v
+        try:
+            start, _, end = v.partition("-")
+            if not (0 <= int(start) <= 23 and 0 <= int(end) <= 23):
+                raise ValueError
+        except ValueError:
+            raise ValueError('expected "HH-HH", e.g. "22-06"') from None
+        return v
 
 
 class TranscodeConfig(BaseModel):
@@ -150,6 +271,9 @@ class Policy(BaseModel):
     try_repair_before_redownload: bool = True
     incompatible_action: Literal["none", "flag", "transcode", "redownload"] = "transcode"
     hygiene_action: Literal["none", "flag", "transcode"] = "flag"
+    # A file that is merely large is not a fault, so this can never delete —
+    # the literal type is the enforcement, exactly as for hygiene_action.
+    oversize_action: Literal["none", "flag", "shrink"] = "shrink"
     # Blocklist the release in Sonarr/Radarr so the same broken file is not
     # grabbed straight back.
     blocklist_on_redownload: bool = True
@@ -159,6 +283,21 @@ class Policy(BaseModel):
     # Refuse to act on more than this many files in one scan. A mount that
     # disappears mid-scan makes every file look broken; this is the brake.
     max_actions_per_scan: int = 50
+    # Shrinks have their own, much smaller cap and are counted separately.
+    # One shrink is a quality search plus a full re-encode — hours, not the
+    # seconds a remux takes — and unlike a repair, nothing is broken while it
+    # waits for the next scan.
+    #
+    # Deliberately timid as a *shipped* default, because someone installing
+    # this from Community Applications should not have their server pinned
+    # overnight by a setting they never chose. It is also the wrong number for
+    # working through a real backlog: shrinks run serially on the scan thread,
+    # so this is really "how many hours of encoding per scan" — at roughly
+    # 15–25 minutes a file, 5 is about two hours and 50 is most of a day. On a
+    # library of ten thousand candidates, 5 a night takes years. Raise it to
+    # whatever fits the window you are willing to give it, and use
+    # `ShrinkConfig.only_between_hours` if that window is overnight.
+    max_shrinks_per_scan: int = 5
     # If more than this fraction of a library fails, stop and flag instead of
     # deleting — that is a mount problem, not a media problem.
     abort_if_failure_ratio_over: float = 0.5
@@ -191,7 +330,9 @@ class Settings(BaseModel):
     integrity: IntegrityConfig = Field(default_factory=IntegrityConfig)
     emby_compat: EmbyCompatConfig = Field(default_factory=EmbyCompatConfig)
     hygiene: HygieneConfig = Field(default_factory=HygieneConfig)
+    efficiency: EfficiencyConfig = Field(default_factory=EfficiencyConfig)
     transcode: TranscodeConfig = Field(default_factory=TranscodeConfig)
+    shrink: ShrinkConfig = Field(default_factory=ShrinkConfig)
     policy: Policy = Field(default_factory=Policy)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     watch_folders: list[WatchFolder] = Field(default_factory=list)
@@ -223,6 +364,16 @@ def _env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         "UNFUCKARR_EMBY_API_KEY": ("emby", "api_key"),
         "UNFUCKARR_API_KEY": ("api_key",),
         "UNFUCKARR_LOG_LEVEL": ("log_level",),
+        # Where deleted and replaced files are kept. It belongs with the
+        # volume mappings rather than on the settings page, because it is only
+        # useful pointed at a path that was mounted into the container — and
+        # whoever writes the mapping is the one who knows where that is. It
+        # also wants to be on the same filesystem as the media (see
+        # recycle.same_filesystem): otherwise every recycled file is copied
+        # rather than renamed, which on Unraid means 40 GB remuxes landing on
+        # the cache one at a time.
+        "UNFUCKARR_RECYCLE_BIN_PATH": ("policy", "recycle_bin_path"),
+        "UNFUCKARR_RECYCLE_BIN_DAYS": ("policy", "recycle_bin_days"),
     }
     for env, path in mapping.items():
         val = os.environ.get(env)
