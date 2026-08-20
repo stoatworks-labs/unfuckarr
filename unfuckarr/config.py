@@ -267,6 +267,16 @@ class Policy(BaseModel):
     # One shrink is a quality search plus a full re-encode — hours, not the
     # seconds a remux takes — and unlike a repair, nothing is broken while it
     # waits for the next scan.
+    #
+    # Deliberately timid as a *shipped* default, because someone installing
+    # this from Community Applications should not have their server pinned
+    # overnight by a setting they never chose. It is also the wrong number for
+    # working through a real backlog: shrinks run serially on the scan thread,
+    # so this is really "how many hours of encoding per scan" — at roughly
+    # 15–25 minutes a file, 5 is about two hours and 50 is most of a day. On a
+    # library of ten thousand candidates, 5 a night takes years. Raise it to
+    # whatever fits the window you are willing to give it, and use
+    # `ShrinkConfig.only_between_hours` if that window is overnight.
     max_shrinks_per_scan: int = 5
     # If more than this fraction of a library fails, stop and flag instead of
     # deleting — that is a mount problem, not a media problem.

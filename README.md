@@ -188,7 +188,15 @@ Unattended deletion needs to be wrong safely, so there are three layers:
 - **Action cap.** No single scan may act on more than `max_actions_per_scan` files (default 50).
   Shrinks are counted separately and far more tightly (`max_shrinks_per_scan`, default 5): one
   shrink is a quality search plus a full re-encode, and unlike a repair, nothing is broken while
-  a large file waits for the next scan. Repairs are always applied before shrinks.
+  a file waits for the next scan. Repairs are always applied before shrinks, and the shrinks
+  themselves are ordered fattest-first so the biggest savings land first.
+
+  **Expect to raise this.** Shrinks run one after another at roughly 15–25 minutes each, so the
+  cap is really "how many hours of encoding per scan" — 5 is about two hours. On a library with
+  thousands of candidates that is a multi-year job; pick the number that fits the window you are
+  willing to give it, and pair it with `only_between_hours` if that window is overnight. The
+  shipped default is timid on purpose so a fresh install does not pin somebody's server the first
+  night.
 - **Failure-ratio abort.** If more than half a library fails one pass, the scan stops and changes
   *nothing*. That is what an unmounted array looks like, and it is the failure mode that costs
   people their library. Shrinks are deliberately *not* counted here: an unmounted array produces
