@@ -15,10 +15,11 @@ scanner.collect_library()      → inventory from Sonarr/Radarr APIs + extra pat
   ↓
 scanner.check_file()           → integrity → (emby direct-play OR local compat) → hygiene → efficiency
   ↓                              produces CheckResult: a list of Findings with categories
-remediation.decide()           → CheckResult + Policy → Decision (none|flag|transcode|repair|shrink|redownload)
+remediation.decide()           → CheckResult + Policy → Decision (none|flag|transcode|repair|shrink|convert|redownload)
   ↓
 Remediator.apply()             → transcode.plan() → build_command() → run() → verify → replace
                                  or: quality.search() → encode → quality.verify() → replace
+                                 or: makemkv.titles() → select() → rip() → verify → replace + extras/
                                  or: recycle.store() → arr.delete_file() → arr.blocklist_last_grab()
 ```
 
@@ -158,6 +159,34 @@ Break any of these and the failure is quiet and expensive.
     spirit, `__main__.resolve_host` **fails the start** when `UNFUCKARR_BIND_INTERFACE` names an
     interface that never gets an address — falling back to `0.0.0.0` would silently expose the
     service exactly when the VPN is down. Do not "fix" that into a fallback.
+
+19. **A conversion is the only action that produces more than one file, and only
+    one of them is a library item.** The feature replaces the image; the bonus
+    features go to `extras/`, and `walk_video_files`, the watcher and
+    `transcode.is_extras_path` all refuse to follow them. That is not tidiness.
+    A deleted scene checked as if it were a film is short, often has no usable
+    audio track, and reads as corrupt or incompatible — so it gets *repaired*,
+    or redownloaded, and a redownload on a file carrying its parent's *arr
+    identity deletes the film. `EXTRAS_DIRS` deliberately does not contain
+    `specials`: that is Sonarr's season-zero folder and a real part of the
+    library.
+
+20. **A failure of the MakeMKV installation is never recorded against a disc.**
+    `files.convert_skipped` and `convert_attempts` are permanent, and the
+    failures that earn them are properties of the image — no title matching the
+    runtime, an image MakeMKV cannot open. An expired beta key is not one of
+    those: it arrives one morning with nothing else changed, a new key fixes
+    it, and writing it to every disc it touched would silently retire the whole
+    feature. Hence `makemkv.KeyExpired`, which is an `Unavailable`, and the
+    availability check that runs before every conversion.
+
+21. **The tool is never bundled, and that is a licence fact, not a preference.**
+    MakeMKV's binary half is not redistributable, so a public image cannot ship
+    it. `MakeMKVConfig.command` is a whole command line rather than a path so
+    that a container shim is expressible without this codebase knowing anything
+    about containers — with the trap that the paths must mean the same thing on
+    both sides of that mount, and MakeMKV's error when they do not says only
+    that it cannot open the disc.
 
 ## Traps found the hard way
 
@@ -361,6 +390,43 @@ Break any of these and the failure is quiet and expensive.
 - **The scan is single-flight** via `Service._scan_lock`, and `__main__.py` pins uvicorn to one
   worker. Two workers would mean two scanners fighting over the same library.
 
+### Disc conversion
+
+- **Menus cannot come across, and nothing in this stack ever played them.** No
+  Matroska file has ever held a DVD VM program or a BD-J title; MakeMKV does not
+  preserve them and never has. Emby picks a title and plays it, from an image
+  as much as from a file. So what a conversion actually costs is the
+  navigation, and what it keeps — every audio track including the lossless
+  ones, every subtitle track, the chapters, and the bonus features as files in
+  `extras/` — is what anyone was opening the menu to reach. Do not accept a
+  feature request to "keep the menus": the honest answer is that the format
+  cannot and the player would not.
+- **MakeMKV's own reported duration is the free verification, and it is the
+  better one.** `_verify_conversion` compares the finished file against the
+  length MakeMKV said the title was moments before writing it. That reference
+  needs nothing to have been readable, which matters: the five images
+  libudfread refuses have no `MediaInfo` at all, and they are exactly the ones
+  worth handing to MakeMKV. The *arr's nominal runtime is the second reference
+  and gets a much wider tolerance, for the same reason
+  `duration_below_expected` exists.
+- **The work directory is the leftover, not a file.** A rip goes into
+  `<name>.unfuckarr.convert/`, because MakeMKV names the files it writes and
+  the only thing marking them as ours is the folder. `is_temp_output` therefore
+  checks every path component rather than the filename — and the startup sweep
+  removes directories as well as files, because a conversion killed by a
+  restart is the 199 GB trap again with a partial Blu-ray inside it.
+- **Nothing is re-encoded by a conversion.** MakeMKV stream-copies, so a UHD
+  disc arrives already in HEVC and a conversion is minutes of I/O rather than
+  hours of encode. Making it smaller stays the shrink path's job, on the
+  ordinary Matroska file the conversion leaves behind, where it is already
+  measured at both ends. Two proven steps beat one step doing two unproven
+  things.
+- **A conversion supersedes compat, hygiene and efficiency, so it decides
+  before all three.** An image is not direct-playable, its tracks carry no
+  tags, and it cannot be shrunk from where it sits; one conversion clears all
+  of it. It is also strictly better than what the compat path would otherwise
+  do to a disc, which is the byte-range encode that came out short live.
+
 ## Verified vs assumed
 
 **Verified on real hardware — `vaapi`:** an AMD Radeon 880M (gfx1150) encodes 1080p MPEG-2 to
@@ -523,6 +589,21 @@ container's own ffmpeg:
   with the hardware encoder — so the timings are arithmetic, and `hevc_vaapi`'s `-qp` scale has
   never been through the search at all. Expect the first live run to want `crf_min`/`crf_max`
   adjusting for VAAPI, whose QP numbers do not mean what libx265's CRF numbers mean.
+- **No disc has ever been converted.** Every part of the path is exercised — the
+  robot-output parsing, the title selection, the duration checks, the extras
+  placement, the recycle and the swap — but against a stand-in that speaks
+  MakeMKV's protocol and copies files ffmpeg rendered, because MakeMKV cannot
+  be installed in CI. What that cannot prove is the only thing MakeMKV is here
+  for: that it picks the right playlist off a real Blu-ray with seamless
+  branching. Convert one disc by hand, with `keep_disc_image` on, and compare
+  the result against the image before trusting it with a library.
+- **The extras heuristic is a length heuristic and nothing more.** "The longest
+  title is the feature" was right on every disc measured, and the discs where
+  it will not be — an anthology, a TV season on one disc, a concert film with
+  a longer bonus concert — are real and are not represented in any test here.
+  `max_extras` and the extras floor limit the damage; nothing prevents it.
+- **Nothing has been converted on the live library**, and the live instance's
+  `disc_action` default (`flag`) means nothing will be until someone sets it.
 - **No Unraid server has installed the CA template.** It is written against the CA conventions
   used elsewhere in this fleet (root `<Container version="2">`, no trailing colon on subcategory
   tokens, per-image `<Registry>` URL) and `scripts/validate_template.py` checks those in CI, but
@@ -558,6 +639,8 @@ unfuckarr/
   governor.py        Per-process GPU encode share from fdinfo, held by SIGSTOP/SIGCONT
   disc.py            Reading .iso/.img without mounting: a UDF reader (metadata
                      partitions included), ISO9660 for DVDs, subfile/concat URLs
+  makemkv.py         Converting a disc image to Matroska through an external
+                     MakeMKV: robot-output parsing, title selection, the rip
   recycle.py         Recycle bin + retention
   remediation.py     decide() and Remediator
   scanner.py         Enumeration, check_file, the scan loop, the brakes

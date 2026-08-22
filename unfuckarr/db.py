@@ -54,7 +54,18 @@ CREATE TABLE IF NOT EXISTS files (
     -- How far above the reference bitrate for its resolution this file sits.
     -- Only an ordering key: the continuous worker takes the fattest first,
     -- because the biggest savings should land first, not eventually.
-    shrink_priority REAL
+    shrink_priority REAL,
+    -- Disc-image conversion state, permanent for the same reason the shrink
+    -- state is: a disc that has been converted no longer exists to convert,
+    -- and a disc the selection has already refused (the title MakeMKV offers
+    -- does not match the runtime, the image will not open) refuses for a
+    -- reason that will still be true in the morning. A failure that is about
+    -- the *installation* rather than the disc — no MakeMKV, an expired key —
+    -- is never written here.
+    converted       REAL,             -- when it became an mkv
+    converted_from  TEXT,             -- the image path it replaced
+    convert_skipped TEXT,             -- why we will not try this disc again
+    convert_attempts INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_files_status  ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_library ON files(library);
@@ -146,6 +157,10 @@ MIGRATIONS = [
     ("files", "shrink_skipped", "TEXT"),
     ("files", "shrink_attempts", "INTEGER DEFAULT 0"),
     ("files", "shrink_priority", "REAL"),
+    ("files", "converted", "REAL"),
+    ("files", "converted_from", "TEXT"),
+    ("files", "convert_skipped", "TEXT"),
+    ("files", "convert_attempts", "INTEGER DEFAULT 0"),
 ]
 
 

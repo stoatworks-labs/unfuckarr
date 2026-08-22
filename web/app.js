@@ -632,6 +632,19 @@ async function openDrawer(path) {
       },
     }, 'Shrink'),
     el('button', {
+      class: 'btn',
+      onclick: () => {
+        if (!confirm(`Convert ${basename(path)} to Matroska?\n\n`
+          + 'MakeMKV copies the main feature out of the disc image \u2014 same '
+          + 'video, same lossless audio, nothing re-encoded \u2014 with the '
+          + 'chapters and every subtitle track, and puts the bonus features in '
+          + 'an extras folder beside it. The menus cannot come across: no '
+          + 'Matroska file holds them, and Emby has never played them. The '
+          + 'image goes to the recycle bin once the result is verified.')) return;
+        fileAction(path, 'convert');
+      },
+    }, 'Convert disc to MKV'),
+    el('button', {
       class: 'btn btn-danger',
       onclick: () => {
         if (!confirm(`Delete ${basename(path)} and ask the *arr for a replacement?\n\nThe file goes to the recycle bin first.`)) return;
@@ -810,6 +823,14 @@ const FIELD_HELP = {
   'efficiency.min_size_mb': 'Do not spend a quality search on a file smaller than this. A question about worthwhileness, not quality.',
   'efficiency.skip_codecs': 'A cost optimisation, not a quality judgement. A search on a file already in one of these almost always fails the saving floor, and takes minutes per file to say so. Empty the list to measure them anyway.',
   'efficiency.allow_hdr': 'Off by default, and worth leaving off for now. The colour description (transfer function, primaries, matrix) is carried onto the encode, but mastering-display and MaxCLL metadata are not yet, and this has never been checked against a real HDR file. A re-encode that loses HDR metadata produces a grey, washed-out file that still plays — a failure nothing reports.',
+  'policy.disc_action': 'What happens to a .iso/.img disc image. `convert` needs MakeMKV configured below; without it this falls back to flagging on its own, so it is safe to leave set. It can never delete \u2014 the same enforcement the hygiene and oversize policies have.',
+  'makemkv.enabled': 'Off until a MakeMKV is configured. It is never bundled: the binary half is not redistributable, and its beta key expires about monthly \u2014 a service that runs unattended cannot depend on something that stops working one morning with nothing changed. Point it at your own installation instead.',
+  'makemkv.command': 'A whole command line, not a path, so a container works: `docker run --rm -v /mnt/user:/mnt/user jlesage/makemkv makemkvcon`. The paths have to mean the same thing on both sides of that mount \u2014 if they do not, MakeMKV is handed a path that does not exist and reports only that it cannot open the disc.',
+  'makemkv.extras': 'Bonus features go to `<movie>/extras/`, where Emby looks for them and where unfuckarr deliberately never follows: a deleted scene checked as if it were a film reads as broken. There is no option that sorts them into `deleted-scenes` and `interviews`, because nothing on the disc says which is which.',
+  'makemkv.extras_min_seconds': 'Below this a title is a logo sting or a menu loop, not a bonus feature.',
+  'makemkv.duration_tolerance_pct': 'How far short of the *arr\u2019s runtime the chosen title may be. Wide on purpose: that runtime is nominal \u2014 for TV it is the broadcast slot, ad breaks included \u2014 so this can only catch a trailer being picked as the feature, which is exactly the failure it is here for.',
+  'makemkv.output_tolerance_pct': 'The finished file against the length MakeMKV said the title was, moments before it wrote it. Tight, because both numbers are measured. This is the check that catches a copy that stopped early.',
+  'makemkv.keep_disc_image': 'Leave the image beside the converted file instead of recycling it. Emby groups the two as versions of one item \u2014 but Sonarr and Radarr track exactly one file each, so the image becomes something no *arr knows about and unfuckarr will not manage it either. It also keeps the 40 GB you converted it to avoid.',
   'shrink.quality': 'The quality the result must measure at: acceptable = VMAF 85, good = 92, excellent = 95. Nothing is replaced unless the finished file actually scores this.',
   'shrink.min_saving_pct': 'Do not touch the file unless this much is really saved. Checked twice: against the search\u2019s projection before encoding starts, and against the finished file before it is allowed to replace anything.',
   'shrink.metric': 'vmaf is the real measurement and needs an ffmpeg built with libvmaf — no distro ffmpeg has one, so the container ships a second static binary for scoring only. ssim is the fallback: always available, but a weaker guarantee.',

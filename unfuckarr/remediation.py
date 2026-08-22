@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import db, governor, quality, recycle, transcode
+from . import db, disc, governor, makemkv, quality, recycle, transcode
 from .checks import CheckResult
 from .checks.compat import resolve as resolve_profile
 from .checks.integrity import looks_repairable
@@ -30,7 +31,7 @@ from .state import bus, clear_task, set_task
 
 log = logging.getLogger(__name__)
 
-Action = str  # none | flag | transcode | repair | shrink | redownload
+Action = str  # none | flag | transcode | repair | shrink | convert | redownload
 
 # A transcode that does not clear the finding would otherwise be repeated on
 # every scan for ever. Two goes, then the file is flagged and left alone.
@@ -41,6 +42,17 @@ MAX_FIX_ATTEMPTS = 2
 # cannot reach the target, the saving is not there) are properties of the
 # content and will be just as true next time, for another few hours of CPU.
 MAX_SHRINK_ATTEMPTS = 1
+
+# A conversion gets one attempt for the same reason a shrink does: the failures
+# that are about the *disc* — MakeMKV offers no title matching the runtime, the
+# image will not open — are properties of the image and will still be true
+# tomorrow. The failures that are about the *installation* never reach the
+# counter, so an expired key does not burn a disc's only attempt.
+MAX_CONVERT_ATTEMPTS = 1
+
+# Long enough for MakeMKV to analyse every playlist on a dual-layer UHD disc,
+# short enough that a hung one is noticed the same evening.
+INFO_TIMEOUT_SECONDS = 1800
 
 
 @dataclass
@@ -92,6 +104,24 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
             return Decision("repair", "corrupt; remuxing", codes)
         return Decision(action, "file is corrupt", codes)
 
+    # Before compat, hygiene and efficiency, because converting the image
+    # answers all three at once and none of them can answer it. An ISO is not
+    # direct-playable, its tracks carry no tags worth the name, and it cannot
+    # be shrunk from where it sits — one conversion clears the lot and leaves
+    # an ordinary Matroska file behind that every other path already handles.
+    # It is also strictly better than what compat would otherwise do to a
+    # disc, which is the byte-range encode that came out short on the live
+    # library.
+    if _is_disc(result):
+        blocked = convert_blocked(settings)
+        if blocked is None:
+            return Decision("convert",
+                            "disc image: converting to Matroska, keeping every "
+                            "track, the chapters and the bonus features",
+                            codes or [f.code for f in result.findings])
+        if policy.disc_action == "convert":
+            log.debug("not converting %s: %s", result.path, blocked)
+
     if compat:
         action = policy.incompatible_action
         return Decision(action, "Emby cannot direct play this", codes)
@@ -118,12 +148,13 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
             # file is a remux measured in seconds; on a 90 GB disc image it is
             # a full conversion of the whole disc, and doing that to fix a
             # language tag is a bad trade nobody asked for. Flag it, and let
-            # the shrink path be what converts a disc, since that at least
-            # reclaims the space to pay for the work.
+            # the conversion be what rewrites a disc — it is the one action
+            # here that has a reason to touch every byte of one.
             return Decision("flag",
                             "stream metadata needs tidying, but this is a disc "
                             "image and rewriting one to fix tags is not worth "
-                            "the work — shrinking it would fix both",
+                            "the work — converting it to Matroska would fix "
+                            "both",
                             [f.code for f in warnings])
         if action != "none":
             return Decision(action, "stream metadata needs tidying",
@@ -142,9 +173,35 @@ def _is_disc(result: CheckResult) -> bool:
     Read off the stored probe summary rather than plumbing MediaInfo into
     `decide`, which is deliberately a pure function of the result and the
     policy so it can be tested without a filesystem.
+
+    The extension is accepted as well, and that is not belt-and-braces: the
+    five images in the live library that libudfread refuses have no probe at
+    all — they are the `disc_not_inspectable` ones — and those are precisely
+    the discs a real MakeMKV has the best chance of reading. "We could not open
+    it" is a reason to try the other tool, not a reason to write it off
+    (invariant 17).
     """
     probe = result.probe or {}
-    return bool(probe.get("disc"))
+    if probe.get("disc"):
+        return True
+    return disc.is_disc_image(result.path)
+
+
+def convert_blocked(settings: Settings) -> str | None:
+    """Why a disc image cannot be converted, or None when it can.
+
+    Settings only — whether the configured command actually runs is a question
+    for `_convert`, because answering it costs a subprocess and `decide` must
+    stay a pure function. Same split as `shrink_blocked` and
+    `quality.resolve_metric`.
+    """
+    if settings.policy.disc_action != "convert":
+        return "disc images are set to flag only"
+    if not settings.makemkv.enabled:
+        return "MakeMKV is switched off"
+    if not settings.makemkv.command.strip():
+        return "no MakeMKV command is configured"
+    return None
 
 
 def shrink_blocked(settings: Settings) -> str | None:
@@ -243,6 +300,8 @@ class Remediator:
                 return self._transcode(job_id, file_row, result, info, decision)
             if decision.action == "shrink":
                 return self._shrink(job_id, file_row, result, info, decision)
+            if decision.action == "convert":
+                return self._convert(job_id, file_row, result, info, decision)
             if decision.action == "redownload":
                 return self._redownload(job_id, file_row, decision.reason)
             self._set_job(job_id, "failed", 0, f"unknown action {decision.action}")
@@ -857,17 +916,358 @@ class Remediator:
         `shrunk` marker already guarantees the file is never revisited. This
         exists purely so the file list is honest immediately afterwards.
         """
+        self._recheck_replacement(final, file_row, already_shrunk=True)
+
+    def _recheck_replacement(self, final: str, file_row: dict[str, Any],
+                             already_shrunk: bool) -> None:
+        """Re-check a file we have just put in place of another.
+
+        ``already_shrunk`` is the difference between the two callers and it
+        matters: after a shrink it is True because the file must never be
+        priced again, and after a conversion it is False because the Matroska
+        file that comes out of a disc has never been measured for a saving and
+        is usually the biggest candidate in the library.
+        """
         from .scanner import check_file, persist_result
 
         s = self._settings()
         try:
             result, info = check_file(
                 final, s, expected_runtime=file_row.get("expected_runtime"),
-                already_shrunk=True)
+                already_shrunk=already_shrunk)
             stat = os.stat(final)
             persist_result(final, result, info, stat.st_size, stat.st_mtime)
         except Exception as exc:  # noqa: BLE001 - never fail the job over this
-            log.warning("post-shrink check failed for %s: %s", final, exc)
+            log.warning("post-replacement check failed for %s: %s", final, exc)
+
+    # -- disc conversion --------------------------------------------------
+
+    def _convert(self, job_id: int, file_row: dict[str, Any],
+                 result: CheckResult, info: MediaInfo | None,
+                 decision: Decision) -> dict[str, Any]:
+        """Turn a disc image into Matroska, with its bonus features beside it.
+
+        The shape is the one every other action here has — gate, do the work,
+        verify, recycle, replace — with two things that are only true of this
+        one:
+
+        1. **It produces more than one file.** The feature replaces the image;
+           the extras go to `extras/`, where Emby looks for them and where
+           `walk_video_files` and the watcher both refuse to follow, because a
+           deleted scene checked as if it were a film is found broken and then
+           repaired, or redownloaded — and a redownload on a file carrying its
+           parent's *arr identity deletes the film.
+        2. **Nothing is re-encoded.** MakeMKV stream-copies, so the picture and
+           the lossless audio come across untouched. Making it smaller is the
+           shrink path's job, on the ordinary Matroska file this leaves behind,
+           where it is already measured at both ends — rather than a second
+           unproven thing happening inside this one.
+
+        What cannot come across is the menus. No Matroska file has ever held a
+        DVD VM program or a BD-J title, and no player in this stack has ever
+        run one: Emby picks a title and plays it. What is actually lost is the
+        navigation, and what is kept — every audio track, every subtitle track,
+        the chapters, and the extras as files — is what anyone was reaching the
+        menu for.
+        """
+        s = self._settings()
+        path = file_row["path"]
+        cfg = s.makemkv
+
+        blocked = convert_blocked(s)
+        if blocked is not None:
+            self._set_job(job_id, "done", 1.0, blocked)
+            return {"action": "flag", "ok": True, "message": blocked}
+
+        if file_row.get("converted"):
+            msg = "already converted"
+            self._set_job(job_id, "done", 1.0, msg)
+            return {"action": "flag", "ok": True, "message": msg}
+        if file_row.get("convert_skipped") and not decision.force:
+            msg = f"already assessed and left alone: {file_row['convert_skipped']}"
+            self._set_job(job_id, "done", 1.0, msg)
+            return {"action": "flag", "ok": True, "message": msg}
+        if decision.force:
+            db.ex("UPDATE files SET convert_skipped=NULL, convert_attempts=0 "
+                  "WHERE path=?", (path,))
+            file_row["convert_skipped"] = None
+            file_row["convert_attempts"] = 0
+        if (file_row.get("convert_attempts") or 0) >= MAX_CONVERT_ATTEMPTS:
+            msg = "a previous conversion of this disc failed — not trying again"
+            self._set_job(job_id, "done", 1.0, msg)
+            return {"action": "flag", "ok": True, "message": msg}
+
+        # Whether the configured command runs at all, asked every time: the
+        # failure this catches is an expired beta key, which arrives one
+        # morning with nothing else changed. Not a property of the disc, so it
+        # never reaches `_count_convert_attempt` and never becomes permanent.
+        try:
+            version = makemkv.available(cfg.command)
+        except makemkv.MakeMKVError as exc:
+            msg = f"MakeMKV is not usable: {exc}"
+            self._set_job(job_id, "failed", 0, msg, error=msg)
+            db.log("makemkv_unavailable", "error", path, msg)
+            return {"action": "flag", "ok": False, "message": msg}
+
+        size = file_row.get("size") or (info.size if info else 0)
+        # A stream copy of one title is smaller than the image it came out of,
+        # but the extras are extra, and for a moment both the image and its
+        # replacement exist. Ask for the image's size again on top.
+        if size and not transcode.free_space_ok(path, size, margin=2.2):
+            msg = ("not enough free space to convert this image and keep the "
+                   "original until the result is verified")
+            self._set_job(job_id, "failed", 0, msg, error=msg)
+            db.log("convert_no_space", "warn", path, msg)
+            return {"action": "flag", "ok": False, "message": msg}
+
+        cancel = threading.Event()
+        self._cancel[path] = cancel
+        work = Path(path).with_name(f"{Path(path).stem}{transcode.TEMP_MARKER}convert")
+        try:
+            return self._convert_inner(job_id, file_row, info, s, work, cancel,
+                                       version)
+        finally:
+            self._cancel.pop(path, None)
+            shutil.rmtree(work, ignore_errors=True)
+
+    def _convert_inner(self, job_id: int, file_row: dict[str, Any],
+                       info: MediaInfo | None, s: Settings, work: Path,
+                       cancel: threading.Event, version: str) -> dict[str, Any]:
+        path = file_row["path"]
+        cfg = s.makemkv
+        expected = float(file_row.get("expected_runtime") or 0)
+
+        set_task(f"remediate:{path}", kind="analysing", path=path, progress=-1,
+                 detail="asking MakeMKV what is on the disc")
+        self._set_job(job_id, "running", 0.0, "reading the disc structure")
+        try:
+            # Not `timeout_hours`: that budget belongs to the copy. Reading
+            # the structure of a disc is minutes at worst, and a hung one
+            # should not hold the worker for an evening.
+            found = makemkv.titles(path, cfg.command, cfg.min_title_seconds,
+                                   timeout=INFO_TIMEOUT_SECONDS)
+        except makemkv.Unavailable as exc:
+            msg = f"MakeMKV is not usable: {exc}"
+            self._set_job(job_id, "failed", 0, msg, error=msg)
+            return {"action": "flag", "ok": False, "message": msg}
+        except makemkv.MakeMKVError as exc:
+            return self._skip_convert(job_id, file_row,
+                                      f"MakeMKV cannot read this image: {exc}")
+
+        # The disc's own measured duration is the better cross-check when there
+        # is one — `disc.stream_duration` agreed with libbluray to within 0.3s
+        # on a real disc — and the *arr's nominal runtime is the fallback.
+        reference = info.duration if info and info.duration > 0 else expected
+        selection = makemkv.select(
+            found, reference, cfg.duration_tolerance_pct,
+            cfg.extras_min_seconds, cfg.max_extras)
+        if selection.main is None:
+            why = selection.rejected[-1][1] if selection.rejected else "no usable title"
+            return self._skip_convert(job_id, file_row,
+                                      f"no title to convert: {why}")
+
+        main = selection.main
+        extras = selection.extras if cfg.extras == "extras_folder" else []
+        db.log("convert_selected", "info", path, {
+            "makemkv": version, "titles": len(found),
+            "main": {"index": main.index, "seconds": round(main.seconds),
+                     "chapters": main.chapters},
+            "extras": [{"index": t.index, "seconds": round(t.seconds)}
+                       for t in extras],
+            "rejected": [{"index": t.index, "why": why}
+                         for t, why in selection.rejected],
+        })
+
+        set_task(f"remediate:{path}", kind="converting", path=path,
+                 progress=0.0, detail=f"title {main.index}")
+        self._set_job(job_id, "running", 0.0, "copying the feature")
+
+        def on_progress(frac: float) -> None:
+            set_task(f"remediate:{path}", progress=frac)
+            db.ex("UPDATE jobs SET progress=? WHERE id=?", (frac, job_id))
+
+        try:
+            produced = makemkv.rip(path, main, str(work / "main"), cfg.command,
+                                   cfg.min_title_seconds,
+                                   timeout=cfg.timeout_hours * 3600,
+                                   on_progress=on_progress, cancel=cancel)
+        except makemkv.MakeMKVError as exc:
+            if cancel.is_set():
+                # A user cancel says nothing about the disc, exactly as it does
+                # not for a transcode.
+                self._set_job(job_id, "cancelled", 0, "cancelled")
+                return {"action": "convert", "ok": False, "message": "cancelled"}
+            reason = f"MakeMKV could not copy the feature: {exc}"
+            self._set_job(job_id, "failed", 0, reason, error=reason)
+            db.log("convert_failed", "error", path, {
+                "reason": reason,
+                "attempts": self._count_convert_attempt(path, file_row)})
+            return {"action": "convert", "ok": False, "message": reason}
+
+        bad = self._verify_conversion(produced, info, reference, main.seconds,
+                                      s, cfg)
+        if bad is not None:
+            Path(produced).unlink(missing_ok=True)
+            db.log("convert_output_bad", "error", path, {
+                "reason": bad,
+                "attempts": self._count_convert_attempt(path, file_row)})
+            self._set_job(job_id, "failed", 0, bad, error=bad)
+            return {"action": "convert", "ok": False, "message": bad}
+
+        # Extras are ripped after the feature has been verified, so a disc that
+        # was never going to work does not spend an hour on its trailers first.
+        saved_extras = self._rip_extras(job_id, path, extras, work, cfg, cancel)
+
+        try:
+            recycled = None
+            if not cfg.keep_disc_image:
+                recycled = recycle.store(
+                    path, f"converted to Matroska ({main.seconds / 60:.0f} min "
+                          f"feature, {len(saved_extras)} extras)",
+                    s.policy.recycle_bin_path, s.policy.recycle_bin_days)
+        except OSError as exc:
+            Path(produced).unlink(missing_ok=True)
+            msg = f"could not recycle the image: {exc}"
+            self._set_job(job_id, "failed", 0, msg, error=msg)
+            return {"action": "convert", "ok": False, "message": msg}
+
+        try:
+            final = transcode.replace(path, produced)
+        except OSError as exc:
+            self._restore_original(path, recycled)
+            msg = f"the converted file disappeared before the swap: {exc}"
+            self._set_job(job_id, "failed", 0, msg, error=msg)
+            return {"action": "convert", "ok": False, "message": msg}
+
+        placed = self._place_extras(path, saved_extras)
+
+        self._move_db_row(path, final)
+        db.ex("UPDATE files SET converted=?, converted_from=?, "
+              "convert_skipped=NULL WHERE path=?", (time.time(), path, final))
+        self._notify_arr_rescan(file_row)
+        # The result is an ordinary Matroska file now, so re-checking it is
+        # what puts it in front of the compat and shrink paths on their own
+        # terms — including, for most discs, a shrink to HEVC that could not
+        # have been measured while it was an image.
+        self._recheck_replacement(final, file_row, already_shrunk=False)
+
+        summary = (f"converted to {Path(final).name}: "
+                   f"{main.seconds / 60:.0f} min, {main.chapters} chapters"
+                   + (f", {len(placed)} extras" if placed else ""))
+        self._set_job(job_id, "done", 1.0, summary)
+        db.log("convert_done", "info", final, {
+            "from": path, "extras": len(placed), "kept_image": cfg.keep_disc_image,
+            "seconds": round(main.seconds), "chapters": main.chapters,
+        })
+        return {"action": "convert", "ok": True, "path": final,
+                "message": summary}
+
+    def _verify_conversion(self, dst: str, info: MediaInfo | None,
+                           reference: float, promised: float, s: Settings,
+                           cfg: Any) -> str | None:
+        """Returns a failure reason, or None when the conversion is good.
+
+        Not `_verify_output`: that compares against a `MediaInfo` for the
+        source, and for the five images libudfread refuses there is no such
+        thing — those are exactly the discs worth handing to MakeMKV.
+
+        So there are two references, and the important one is free.
+        ``promised`` is the length MakeMKV said the title was, moments before
+        it wrote the file, and comparing the two needs nothing to have been
+        readable: a copy that stops early is a file that does not match what
+        the tool that made it said it would be. ``reference`` — the disc's own
+        measured duration, or the *arr's nominal runtime — is the second, and
+        it gets the wide tolerance when it is the nominal one, because a
+        nominal runtime includes ad breaks the file never had.
+        """
+        try:
+            out = probe(dst, s.ffprobe_path)
+        except ProbeError as exc:
+            return f"the converted file is unprobeable: {exc}"
+        if out.video is None:
+            return "the converted file has no video stream"
+        if not out.audio:
+            return "the converted file has no audio"
+        if promised > 0:
+            drift = abs(out.duration - promised) / promised
+            if drift > cfg.output_tolerance_pct / 100:
+                return (f"the converted file is {out.duration / 60:.0f} min "
+                        f"against an expected {promised / 60:.0f} min — "
+                        "the copy stopped early")
+        if reference > 0:
+            measured = info is not None and info.duration > 0
+            tolerance = (cfg.output_tolerance_pct if measured
+                         else cfg.duration_tolerance_pct) / 100
+            drift = abs(out.duration - reference) / reference
+            if drift > tolerance:
+                return (f"the converted file is {out.duration / 60:.0f} min "
+                        f"against an expected {reference / 60:.0f} min — "
+                        "the wrong title")
+        return None
+
+    def _rip_extras(self, job_id: int, path: str, extras: list[Any],
+                    work: Path, cfg: Any,
+                    cancel: threading.Event) -> list[tuple[Any, str]]:
+        """Copy the bonus features out. A failure here is never fatal.
+
+        The feature is already verified by this point, and losing a deleted
+        scene is not a reason to leave a 40 GB image in place.
+        """
+        saved: list[tuple[Any, str]] = []
+        for n, title in enumerate(extras, start=1):
+            if cancel.is_set():
+                break
+            set_task(f"remediate:{path}", kind="converting", path=path,
+                     progress=-1, detail=f"extra {n} of {len(extras)}")
+            db.ex("UPDATE jobs SET message=? WHERE id=?",
+                  (f"copying extra {n} of {len(extras)}", job_id))
+            try:
+                out = makemkv.rip(path, title, str(work / f"extra{n}"),
+                                  cfg.command, cfg.min_title_seconds,
+                                  timeout=cfg.timeout_hours * 3600,
+                                  cancel=cancel)
+            except makemkv.MakeMKVError as exc:
+                db.log("convert_extra_failed", "warn", path,
+                       {"title": title.index, "error": str(exc)})
+                continue
+            saved.append((title, out))
+        return saved
+
+    def _place_extras(self, source: str, saved: list[tuple[Any, str]]) -> list[str]:
+        """Move the bonus features into the `extras/` folder Emby reads.
+
+        Named by length rather than by MakeMKV's title name, which is the
+        volume label and the same for all of them. Nothing here tries to sort
+        them into `deleted-scenes` and `interviews`: the disc does not say
+        which is which, and a wrong guess is worse than no guess.
+        """
+        folder = Path(source).parent / "extras"
+        placed: list[str] = []
+        for n, (title, temp) in enumerate(saved, start=1):
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+                dest = folder / f"Extra {n:02d} ({title.seconds / 60:.0f} min).mkv"
+                shutil.move(temp, dest)
+                placed.append(str(dest))
+            except OSError as exc:
+                db.log("convert_extra_unplaced", "warn", source,
+                       {"title": title.index, "error": str(exc)})
+        return placed
+
+    def _skip_convert(self, job_id: int, file_row: dict[str, Any],
+                      reason: str) -> dict[str, Any]:
+        """Record, permanently, that this image is not worth converting."""
+        path = file_row["path"]
+        db.ex("UPDATE files SET convert_skipped=? WHERE path=?", (reason, path))
+        db.log("convert_skipped", "info", path, reason)
+        self._set_job(job_id, "done", 1.0, reason)
+        return {"action": "flag", "ok": True, "message": reason}
+
+    def _count_convert_attempt(self, path: str, file_row: dict[str, Any]) -> int:
+        attempts = (file_row.get("convert_attempts") or 0) + 1
+        file_row["convert_attempts"] = attempts
+        db.ex("UPDATE files SET convert_attempts=? WHERE path=?", (attempts, path))
+        return attempts
 
     # -- redownload -------------------------------------------------------
 

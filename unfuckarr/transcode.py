@@ -50,7 +50,39 @@ TEMP_MARKER = ".unfuckarr."
 
 
 def is_temp_output(path: str) -> bool:
-    return TEMP_MARKER in Path(path).name
+    """Whether this path is one of ours, in flight.
+
+    Every component is checked, not just the name: a disc conversion rips into
+    a *directory* named with the marker, and the files MakeMKV writes inside it
+    are named by MakeMKV, so the only thing marking them as ours is the folder
+    they are in. Passing a bare filename still works — it is its own only part.
+    """
+    return any(TEMP_MARKER in part for part in Path(path).parts)
+
+
+# Directories holding bonus features rather than library items. Emby indexes
+# these as extras of the item in the parent folder, and unfuckarr must not
+# treat their contents as media of their own: a deleted scene is short, often
+# interlaced, frequently has no audio track worth the name, and would be found
+# corrupt or incompatible and then *repaired* — or, worse, redownloaded, which
+# on a file inheriting its parent's *arr identity would delete the film.
+#
+# The list is deliberately short, and what is *missing* from it is the point.
+# Emby also reads `scenes`, `shorts`, `samples` and `other` as extras folders,
+# but those are equally plausible as somebody's category folder —
+# `/media/movies/Shorts/A Film (2011)/` is a library, not a bonus feature — and
+# skipping one would hide part of a library with nothing said about it. The
+# same goes for `specials`, which is Sonarr's season-zero folder. A name only
+# earns a place here if it cannot reasonably mean anything else.
+EXTRAS_DIRS = {
+    "extras", "featurettes", "behind the scenes", "behind-the-scenes",
+    "deleted scenes", "deleted-scenes", "interviews", "trailers",
+}
+
+
+def is_extras_path(path: str) -> bool:
+    """Whether this file sits under an extras directory at any depth."""
+    return any(part.lower() in EXTRAS_DIRS for part in Path(path).parts[:-1])
 
 
 def abandoned_outputs(media_paths) -> list[str]:
