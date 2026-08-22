@@ -47,6 +47,47 @@ TINFO:2,26,0,"9"
 """
 
 
+REAL_BANNER = (
+    'MSG:1005,0,1,"MakeMKV v1.18.4 linux(x64-release) started",'
+    '"%1 started","MakeMKV v1.18.4 linux(x64-release)"'
+)
+
+
+def test_the_version_is_read_off_a_real_banner():
+    """Captured from makemkvcon 1.18.4 on the deployment target. Both the
+    message and the format parameter begin with "MakeMKV"; the parameter is the
+    clean one."""
+    fields = makemkv._split(REAL_BANNER[4:])
+    named = [f for f in fields if f.startswith("MakeMKV")]
+    assert named[-1] == "MakeMKV v1.18.4 linux(x64-release)"
+    # And the banner is not mistaken for the one message that must never be
+    # mistaken for anything else.
+    assert not makemkv._KEY_TROUBLE.search(REAL_BANNER)
+
+
+# Transcribed from makemkvcon 1.18.4 on the deployment target, run against a
+# real Blu-ray image with a lapsed beta key.
+REAL_EXPIRED = [
+    'MSG:5073,260,0,"Your temporary key has expired and was removed. Please '
+    'restart the application.","Your temporary key has expired and was '
+    'removed. Please restart the application."',
+    'MSG:5021,131332,1,"This application version is too old.  Please download '
+    'the latest version at http://www.makemkv.com/ or enter a registration '
+    'key to continue using the current version.","...",'
+    '"http://www.makemkv.com/"',
+]
+
+
+@pytest.mark.parametrize("line", REAL_EXPIRED)
+def test_a_real_lapsed_key_is_recognised(line):
+    """Both messages, because MakeMKV emits them together and either alone has
+    to be enough. Without this the same run reports no titles at all, which
+    reads as "cannot read this image" and is recorded against the disc for
+    ever — for something a new key fixes."""
+    with pytest.raises(makemkv.KeyExpired):
+        makemkv._check_messages([line])
+
+
 def test_records_split_on_real_quoting():
     """A title name legitimately contains a comma, and MakeMKV escapes a quote
     by doubling it. Splitting on commas loses both."""

@@ -409,6 +409,16 @@ Break any of these and the failure is quiet and expensive.
   worth handing to MakeMKV. The *arr's nominal runtime is the second reference
   and gets a much wider tolerance, for the same reason
   `duration_below_expected` exists.
+- **An expired key reports as "no titles", which reads exactly like an
+  unreadable disc.** Confirmed against makemkvcon 1.18.4 on the deployment
+  target: a lapsed beta key produced `MSG:5073` ("Your temporary key has
+  expired and was removed") and `MSG:5021` ("This application version is too
+  old"), the drive list, and **not one TINFO record**. Without `_KEY_TROUBLE`
+  that is indistinguishable from an image MakeMKV cannot open, and `_convert`
+  would write `convert_skipped` on the disc permanently — on the first disc
+  anyone converted. The patterns are matched on wording rather than MSG code
+  because the codes have moved between releases and the wording has not; both
+  real messages are pinned as test fixtures.
 - **The work directory is the leftover, not a file.** A rip goes into
   `<name>.unfuckarr.convert/`, because MakeMKV names the files it writes and
   the only thing marking them as ours is the folder. `is_temp_output` therefore

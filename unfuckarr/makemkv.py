@@ -65,13 +65,28 @@ ATTR_SEGMENT_COUNT = 25
 ATTR_SEGMENT_MAP = 26
 ATTR_OUTPUT_FILE = 27
 
-# MSG codes that mean "the installation is not usable", as opposed to "this
-# disc is not usable". Text is matched too, because the codes have changed
-# between MakeMKV releases and the wording has not.
+# Messages that mean "the installation is not usable", as opposed to "this disc
+# is not usable". Matched on text rather than MSG code, because the codes have
+# moved between MakeMKV releases and the wording has not.
+#
+# The first two patterns are transcribed from a real makemkvcon 1.18.4 with a
+# lapsed beta key, run against a Blu-ray image from the live library:
+#
+#   MSG:5073,260,0,"Your temporary key has expired and was removed. ..."
+#   MSG:5021,131332,1,"This application version is too old.  Please download
+#                      the latest version at ... or enter a registration key
+#                      to continue using the current version."
+#
+# That run also settles what happens without this check: MakeMKV reported *no
+# titles at all*, which `titles` raises as "cannot read this image" — and the
+# caller records that against the disc, permanently, for something a new key
+# fixes. It would have fired on the first disc anyone converted.
 _KEY_TROUBLE = re.compile(
-    r"(evaluation (period|version) has expired|registration key.*expired"
-    r"|application version is too old|enter a valid registration key"
-    r"|this beta (key|version) has expired)",
+    r"((temporary|registration|beta|activation) key .{0,40}"
+    r"(expired|was removed|is not valid)"
+    r"|evaluation (period|version) has expired"
+    r"|application version is too old"
+    r"|enter a (valid |)registration key)",
     re.I,
 )
 
@@ -229,12 +244,19 @@ def available(command: str, timeout: int = 60) -> str:
     lines = (proc.stdout or "").splitlines() + (proc.stderr or "").splitlines()
     _check_messages(lines)
     for line in lines:
-        # MSG:1005 is the banner: "MakeMKV v1.17.7 linux(x64-release) started".
+        # MSG:1005 is the banner. Captured from a real makemkvcon 1.18.4:
+        #
+        #   MSG:1005,0,1,"MakeMKV v1.18.4 linux(x64-release) started",
+        #                "%1 started","MakeMKV v1.18.4 linux(x64-release)"
+        #
+        # The message field and the format parameter both start with
+        # "MakeMKV"; the parameter is the clean one, so take the last match
+        # rather than the first, which carries " started" on the end.
         if "MakeMKV" in line and "started" in line:
             fields = _split(line[4:]) if line.startswith("MSG:") else []
-            for field_text in fields:
-                if field_text.startswith("MakeMKV"):
-                    return field_text.strip()
+            named = [f.strip() for f in fields if f.startswith("MakeMKV")]
+            if named:
+                return named[-1]
             return line.strip()
     if proc.returncode != 0 and not lines:
         raise Unavailable(f"exited {proc.returncode} with no output")
