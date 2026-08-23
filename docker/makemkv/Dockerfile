@@ -12,8 +12,7 @@
 # `makemkvcon` sees exactly the paths unfuckarr sees, because it is the same
 # container.
 #
-#   docker build -f docker/makemkv/Dockerfile \
-#       -t unfuckarr-makemkv:edge .
+#   docker build -f docker/makemkv/Dockerfile -t unfuckarr-makemkv:edge .
 #
 # Then, in the settings page:
 #
@@ -24,74 +23,60 @@
 # See docker/makemkv/README.md for the rebuild and the beta key.
 
 ARG BASE_IMAGE=ghcr.io/stoatworks-labs/unfuckarr:edge
-ARG MAKEMKV_VERSION=1.18.4
+FROM ${BASE_IMAGE}
 
-FROM ${BASE_IMAGE} AS base
-
-# -- build stage ----------------------------------------------------------
-# Ubuntu 24.04 to match the application image, so what this produces is linked
-# against the glibc it will run on. That match is the whole reason for building
-# rather than lifting the binaries out of jlesage/makemkv: that image is
-# Alpine, and musl-linked binaries do not run here.
-FROM ubuntu:24.04 AS build
-
-ARG MAKEMKV_VERSION
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential pkg-config ca-certificates curl \
-        libssl-dev libexpat1-dev zlib1g-dev \
-        libavcodec-dev libavutil-dev libavformat-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /src
-RUN curl -fsSL -o oss.tar.gz \
-        "https://www.makemkv.com/download/makemkv-oss-${MAKEMKV_VERSION}.tar.gz" \
-    && curl -fsSL -o bin.tar.gz \
-        "https://www.makemkv.com/download/makemkv-bin-${MAKEMKV_VERSION}.tar.gz" \
-    && tar xzf oss.tar.gz \
-    && tar xzf bin.tar.gz
-
-# --disable-gui: this is a headless service, the Qt build is most of the
-# dependencies, and makemkvcon is the entire interface unfuckarr uses.
-RUN cd "makemkv-oss-${MAKEMKV_VERSION}" \
-    && ./configure --prefix=/usr --disable-gui \
-    && make -j"$(nproc)" \
-    && make install DESTDIR=/staging
-
-# The binary package's Makefile prompts for the EULA. The marker below accepts
-# it non-interactively — which is the same acceptance, made by whoever runs
-# this build, and it is the reason this image cannot be shared.
-RUN cd "makemkv-bin-${MAKEMKV_VERSION}" \
-    && mkdir -p tmp \
-    && echo accepted > tmp/eula_accepted \
-    && make install PREFIX=/usr DESTDIR=/staging
-
-# -- application image ----------------------------------------------------
-FROM base
+# MakeMKV comes from the long-running Launchpad PPA rather than being built
+# from makemkv.com's tarballs. Not a preference — building from source is the
+# obvious thing and was the first attempt — but www.makemkv.com answers
+# Cloudflare 525 for everyone at the time of writing, so the tarballs cannot be
+# fetched from anywhere. The PPA carries the same 1.18.4 for noble, which is
+# what this image is, on both amd64 and arm64.
+#
+# It is added as a signed apt source, with the PPA's own key, rather than
+# fetching .deb files over HTTPS and hoping: apt then verifies what it
+# installs, resolves the dependencies against Ubuntu's own archive, and the
+# version stays pinnable. The fingerprint below is the one Launchpad publishes
+# for ~heyarje/makemkv-beta.
+#
+# Note what this changes about the licence position: the PPA is a third party
+# redistributing MakeMKV's proprietary half. Using it is a decision for whoever
+# builds this image. It does not make the result any more shareable — see the
+# bottom of this file.
+ARG MAKEMKV_VERSION=1.18.4-1~noble
+ARG MAKEMKV_PPA_FINGERPRINT=94B56C64CA7278ECFC34E8808540356019F7E55B
+ARG UBUNTU_SERIES=noble
 
 USER root
 
-# Runtime libraries only; the toolchain and the headers stay behind. `curl` is
-# not one of MakeMKV's dependencies — it is the wrapper's, for fetching the beta
-# key, and the application image does not ship it. Without it the wrapper takes
-# its "could not fetch a key" path on every single call, which is a working
-# failure mode and a useless one: there would never be a key to fall back to.
+# `curl` is not one of MakeMKV's dependencies — it is the key wrapper's, and
+# the application image does not ship it. Without it the wrapper takes its
+# "could not fetch a key" path on every single call, which is a working failure
+# mode and a useless one: there would never be a key to fall back to.
 # ca-certificates is already in the base image.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libssl3t64 libexpat1 zlib1g \
-        libavcodec60 libavutil58 libavformat60 \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=build /staging/usr /usr
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl gnupg; \
+    mkdir -p /etc/apt/keyrings; \
+    curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${MAKEMKV_PPA_FINGERPRINT}" \
+      | gpg --dearmor -o /etc/apt/keyrings/makemkv-ppa.gpg; \
+    echo "deb [signed-by=/etc/apt/keyrings/makemkv-ppa.gpg] https://ppa.launchpadcontent.net/heyarje/makemkv-beta/ubuntu ${UBUNTU_SERIES} main" \
+      > /etc/apt/sources.list.d/makemkv-beta.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        "makemkv-bin=${MAKEMKV_VERSION}" "makemkv-oss=${MAKEMKV_VERSION}"; \
+    apt-get purge -y gnupg; \
+    apt-get autoremove -y; \
+    rm -rf /var/lib/apt/lists/*; \
+    # Fail the build rather than ship an image whose whole purpose is missing.
+    test -x /usr/bin/makemkvcon
 
 # `makemkvcon` on the PATH is a wrapper that makes sure a key is in place
-# before running the real one, which lands at /usr/bin/makemkvcon. Deliberately
-# not an entrypoint change: the live deployment replaces the entrypoint with
-# Unraid's tailscale hook and passes the original through ORG_ENTRYPOINT, so an
-# image that adds its own would have to be undone by hand at every recreate.
-# Doing it here means the key is fetched by the right user, with HOME already
-# set, at the only moment it is needed.
+# before running the real one at /usr/bin/makemkvcon. Deliberately not an
+# entrypoint change: the live deployment replaces the entrypoint with Unraid's
+# tailscale hook and passes the original through ORG_ENTRYPOINT, so an image
+# that added its own would have to be undone by hand at every recreate. Doing
+# it here means the key is fetched by the right user, with HOME already set, at
+# the only moment it is needed.
 COPY docker/makemkv/makemkvcon-wrapper.sh /usr/local/bin/makemkvcon
 RUN chmod +x /usr/local/bin/makemkvcon
 

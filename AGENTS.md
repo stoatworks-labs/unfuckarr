@@ -623,6 +623,24 @@ container's own ffmpeg:
   heuristic would have found them too. A seamless-branching disc, where it
   would not, is still untested.
 
+- **The tool now runs from unfuckarr's own image, and `rip` works.** MakeMKV
+  1.18.4 is installed from the `~heyarje/makemkv-beta` PPA as a signed apt
+  source — not from makemkv.com, whose download host has been answering
+  Cloudflare 525 to everyone. Built on the target and driven by this codebase:
+  `titles` read 51 titles off a UHD disc, `select` picked the feature and six
+  extras, and `rip` produced a 4.2 min extra in 5 seconds — **HEVC 3840x2160
+  10-bit, AC3 5.1, 251.8s against the 251s MakeMKV promised (0.32% drift)**.
+  That last figure is `_verify_conversion`'s primary check, measured on real
+  media for the first time.
+
+  Worth drawing out, because it decides what this feature is *for*: on a UHD
+  disc the video is already HEVC, so a conversion is a stream copy that yields
+  HEVC in Matroska with no encode, and the HDR survives because nothing decodes
+  it. `allow_hdr` gates the *shrink*, never this.
+
+  Building it also found that the application image ships no `curl`, which the
+  key wrapper needs and whose absence is silent by design.
+
 - **No disc has ever been converted.** Every part of the path is exercised — the
   robot-output parsing, the title selection, the duration checks, the extras
   placement, the recycle and the swap — but against a stand-in that speaks
