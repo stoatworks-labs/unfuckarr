@@ -66,6 +66,26 @@ Rebuild when unfuckarr updates — the whole point of the derived image is that
 it tracks the published one rather than forking it — and when MakeMKV releases,
 which is roughly monthly alongside the key.
 
+## What has been checked, and what has not
+
+The image has been built on the target with the two upstream downloads stubbed
+out, which exercises everything after them: the runtime packages resolve on
+Ubuntu 24.04, `COPY --from=build` lands, and `makemkvcon` on the PATH is the
+wrapper rather than the binary. That found a real omission — the application
+image does not ship `curl`, so the wrapper could never have fetched a key, and
+its failure path is quiet by design.
+
+The wrapper itself is verified end to end against that image: it fetches a key
+when none is on disk, leaves a fresh one alone, honours `MAKEMKV_APP_KEY`
+without contacting anything, refreshes a stale one, never leaves two `app_Key`
+lines, and when the forum is unreachable it runs anyway, warns on stderr, keeps
+the existing key and bumps the mtime so it does not retry on every call.
+
+**The real build has never completed.** www.makemkv.com has been returning
+Cloudflare 525 to everyone, so the source tarballs cannot be fetched from
+anywhere. Note that the forum is a different host and has stayed up throughout —
+so the key half of this works even while the build half does not.
+
 ## Do not push this image
 
 It contains MakeMKV. Keep it local, or in a registry only you can reach.

@@ -71,10 +71,16 @@ FROM base
 
 USER root
 
-# Runtime libraries only; the toolchain and the headers stay behind.
+# Runtime libraries only; the toolchain and the headers stay behind. `curl` is
+# not one of MakeMKV's dependencies — it is the wrapper's, for fetching the beta
+# key, and the application image does not ship it. Without it the wrapper takes
+# its "could not fetch a key" path on every single call, which is a working
+# failure mode and a useless one: there would never be a key to fall back to.
+# ca-certificates is already in the base image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl3t64 libexpat1 zlib1g \
         libavcodec60 libavutil58 libavformat60 \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /staging/usr /usr
