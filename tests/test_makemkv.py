@@ -184,6 +184,21 @@ def test_another_cut_of_the_feature_is_not_a_bonus_feature():
     assert any("another version" in why for _, why in chosen.rejected)
 
 
+def test_the_copy_that_keeps_the_chapters_wins_a_tie():
+    """Measured on a real disc: No Time to Die offers the same 83.77 GB feature
+    as titles 1 and 52 — identical duration, identical segment map — and only
+    title 1 carries the 20 chapter marks. Ordering by index alone got that
+    right by the luck of the numbering."""
+    with_chapters = Title(index=52, seconds=163.6 * 60, size=83_770_000_000,
+                          segments="294", chapters=20)
+    without = Title(index=1, seconds=163.6 * 60, size=83_770_000_000,
+                    segments="294", chapters=0)
+    chosen = makemkv.select([without, with_chapters])
+    assert chosen.main.index == 52
+    assert chosen.main.chapters == 20
+    assert len(chosen.rejected) == 1
+
+
 def test_titles_below_the_extras_floor_are_left_behind():
     chosen = makemkv.select([title(0, 112, segments="1"),
                              title(1, 0.5, segments="2")],

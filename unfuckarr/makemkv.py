@@ -350,15 +350,25 @@ def select(found: list[Title], expected_seconds: float = 0.0,
     if not usable:
         return Selection(None, [], [(t, "no duration reported") for t in found])
 
+    # Chapters break a tie before the index does, and that is not cosmetic.
+    # Measured on a real disc (No Time to Die, 54 titles): titles 1 and 52 are
+    # the same 83.77 GB under two playlists — identical duration, identical
+    # segment map — but title 1 carries the 20 chapter marks and title 52
+    # carries none. Ordering by index alone kept the right one there by the
+    # luck of the numbering; on a disc that numbers them the other way it would
+    # silently produce a film with no chapters.
+    def richest(t: Title) -> tuple[float, int, int]:
+        return (-t.seconds, -t.chapters, t.index)
+
     seen: dict[str, Title] = {}
     rejected: list[tuple[Title, str]] = []
-    for title in sorted(usable, key=lambda t: (-t.seconds, t.index)):
+    for title in sorted(usable, key=richest):
         if title.key in seen:
             rejected.append((title, f"same content as title {seen[title.key].index}"))
             continue
         seen[title.key] = title
 
-    ordered = sorted(seen.values(), key=lambda t: (-t.seconds, t.index))
+    ordered = sorted(seen.values(), key=richest)
     main = ordered[0]
 
     if expected_seconds > 0 and tolerance_pct > 0:

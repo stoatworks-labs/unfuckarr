@@ -599,6 +599,30 @@ container's own ffmpeg:
   with the hardware encoder — so the timings are arithmetic, and `hevc_vaapi`'s `-qp` scale has
   never been through the search at all. Expect the first live run to want `crf_min`/`crf_max`
   adjusting for VAAPI, whose QP numbers do not mean what libx265's CRF numbers mean.
+- **The read path has now been run against real discs; the write path has not.**
+  With a fresh beta key, makemkvcon 1.18.4 was pointed at two Blu-ray images
+  from the live library and the output parsed by `makemkv.titles` and
+  `makemkv.select`:
+
+  - *Mortal Kombat: Annihilation* — 3 titles. Selected the 94.8 min feature
+    with 17 chapters against a 95 min *arr runtime; one 90 s extra kept, one
+    75 s title rejected under the floor.
+  - *No Time to Die* — **54 titles**. Selected the 163.6 min feature (20
+    chapters, 83.8 GB) against a 163 min runtime, kept 6 extras between 4 and
+    47 minutes, rejected 43 as too short and **4 as duplicates**.
+
+  That duplicate count is the finding. Titles 1 and 52 are the same 83.77 GB
+  under two playlists — same duration, same segment map — so without the
+  segment-map dedupe a conversion would have written **167 GB for one film**.
+  It also exposed a real bug: only title 1 carries the chapter marks, and
+  ordering by index alone kept the right one by luck. `select` now breaks a tie
+  on chapter count first.
+
+  **What these two discs do *not* prove is the case MakeMKV is here for.** Both
+  features are a single segment, so `disc.bluray_main_title`'s largest-`.m2ts`
+  heuristic would have found them too. A seamless-branching disc, where it
+  would not, is still untested.
+
 - **No disc has ever been converted.** Every part of the path is exercised — the
   robot-output parsing, the title selection, the duration checks, the extras
   placement, the recycle and the swap — but against a stand-in that speaks
