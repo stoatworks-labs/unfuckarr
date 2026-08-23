@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (FileResponse, JSONResponse, Response,
+                               StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 
 from . import config, db, quality, recycle
@@ -114,9 +115,26 @@ def get_status() -> dict[str, Any]:
         "recycle": recycle.usage(config.get().policy.recycle_bin_path),
         "watch_pending": service.watcher.pending,
         "shrink": shrink_summary(),
+        "totals": totals_summary(),
         "configured": bool(config.get().sonarr.enabled or config.get().radarr.enabled
                            or config.get().extra_library_paths),
     }
+
+
+def totals_summary() -> dict[str, int]:
+    """What this install has actually done, for the whole time it has run.
+
+    Read from the `totals` counters rather than counted from `jobs`,
+    `activity` or `recycle`, because all three are bounded — pruned or swept —
+    so a derived figure silently resets after a busy week, which is when it
+    would matter most. Every key is present whether or not anything has
+    happened yet, so the header does not change shape on the first repair.
+    """
+    stored = db.totals()
+    return {name: int(stored.get(name, 0)) for name in (
+        "bytes_saved", "files_fixed", "files_shrunk", "discs_converted",
+        "files_deleted", "redownloads",
+    )}
 
 
 def shrink_summary() -> dict[str, Any]:
@@ -416,6 +434,27 @@ def services() -> dict[str, Any]:
 
 
 app.mount("/api", api)
+
+
+@app.get("/support-footer-version.js")
+def support_footer_version() -> Response:
+    """Stamp the running version onto the support footer's script tag.
+
+    Every other app in the fleet does this at build time. There is no build
+    step here — the web UI is plain files served as they are — and a literal in
+    the markup is correct only until the next release, after which every
+    feedback report quietly names the wrong version. So the application, which
+    is the only thing that knows, says it.
+
+    Registered before the static mount, and deliberately not cached: the file
+    is three lines and it must not survive an upgrade.
+    """
+    body = (
+        "document.querySelectorAll('script[src$=\"support-footer.js\"]')"
+        f".forEach(function (t) {{ t.dataset.version = {json.dumps(VERSION)}; }});\n"
+    )
+    return Response(body, media_type="application/javascript",
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.get("/health")
