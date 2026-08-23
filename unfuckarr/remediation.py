@@ -93,6 +93,21 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
 
     if integrity:
         action = policy.corrupt_action
+        # A disc image with integrity findings converts rather than being
+        # remuxed and then thrown away, whenever a conversion is available.
+        # Both of the alternatives are worse than they look: `repair` remuxes
+        # through the byte-range path that was measured coming out short, and
+        # when that fails `corrupt_action` deletes a 40 GB disc and asks for
+        # another copy. The conversion changes nothing until MakeMKV has
+        # produced a title of the right length, and refuses outright on an
+        # image it cannot open — so it is both the gentler answer and the one
+        # that actually finds out.
+        if _is_disc(result) and convert_blocked(settings) is None:
+            return Decision("convert",
+                            "disc image with integrity findings: converting is "
+                            "both the repair and the proof — a remux of a disc "
+                            "is not available and a redownload throws it away",
+                            codes)
         if action == "redownload" and policy.try_repair_before_redownload \
                 and looks_repairable(result):
             return Decision(

@@ -610,3 +610,49 @@ def test_conversions_have_their_own_much_smaller_cap(settings, monkeypatch):
 
     assert len(applied) == 2
     assert out["conversions"] == 2 and out["actions"] == 0
+
+
+# -- what the first real conversion found ---------------------------------
+
+def test_seek_artefacts_only_count_against_an_ordinary_file():
+    """Measured on a real Blu-ray: reading it produced 207 decode errors, all
+    of these two shapes, which made a perfectly good 17 GB disc read as
+    `corrupt` — and corrupt decides before everything else. MakeMKV's stream
+    copy of the same disc probes with zero. On an ordinary file the same lines
+    are the primary evidence of damage and must still count."""
+    from unfuckarr import disc
+
+    real = [
+        "[aist#0:1/dts @ 0x55bb06899440] [dec:dca @ 0x55bb06929000] "
+        "Error submitting packet to decoder: Invalid argument",
+        "[h264 @ 0x55bb06847200] error while decoding MB 0 0, bytestream 9",
+    ]
+    for line in real:
+        assert disc.is_noise(line, on_disc=True), line
+        assert not disc.is_noise(line), f"must still count on a file: {line}"
+
+    # Whereas libbluray's own chatter is noise wherever it appears, because
+    # the strings only occur on a disc read in the first place.
+    assert disc.is_noise("BD-J check: failed to load jvm")
+
+
+@needs_ffmpeg
+def test_a_disc_with_integrity_findings_converts_rather_than_being_deleted(
+        video_factory, settings, tmp_path):
+    """`repair` on a disc remuxes through the byte-range path that came out
+    short, and when that fails the policy deletes a 40 GB image and asks for
+    another copy."""
+    from unfuckarr.checks import CheckResult, Finding
+
+    result = CheckResult(path=str(tmp_path / "Film.iso"))
+    result.add(Finding("integrity", "decode_errors", "error", "207 decode errors"))
+
+    settings.policy.corrupt_action = "redownload"
+    settings.policy.disc_action = "convert"
+    settings.makemkv.enabled = True
+    assert decide(result, settings).action == "convert"
+
+    # Without a MakeMKV there is nothing better to do, so the old behaviour
+    # stands rather than the file being left broken.
+    settings.makemkv.enabled = False
+    assert decide(result, settings).action in ("repair", "redownload")

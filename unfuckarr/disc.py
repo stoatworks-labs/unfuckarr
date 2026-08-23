@@ -860,5 +860,49 @@ NOISE = re.compile(
 )
 
 
-def is_noise(line: str) -> bool:
-    return bool(NOISE.search(line))
+# Filtered *only* when the source is a disc image, and that restriction is the
+# whole point: every one of these is the primary evidence of damage in an
+# ordinary file, and suppressing them everywhere would blind the integrity
+# check completely.
+#
+# On a disc they are artefacts of how it is read. A playlist is opened and
+# seeked into, so the first frames of a sample window decode without their
+# reference frames — `First slice in a frame missing` was already accepted for
+# exactly this reason, and `error while decoding MB`, `non-existing PPS` and
+# `decode_slice_header error` are the same event reported differently. The DTS
+# one is not even about the video: `Error submitting packet to decoder` on a
+# `dec:dca` is ffmpeg refusing a partial first packet of a secondary audio
+# track.
+#
+# Measured on a real Blu-ray from the live library: reading it produced **207
+# decode errors**, all of these two shapes, which made a perfectly good 17 GB
+# disc read as `corrupt` — and `corrupt` decides before anything else, so it
+# was queued for a remux it cannot have and then a redownload. MakeMKV's
+# stream copy of the very same disc probes with **zero** decode errors, which
+# is what settles that the disc is fine and the reading was not.
+#
+# The trade, stated plainly: a genuinely damaged disc image will now read as
+# intact. What catches it instead is the conversion itself — MakeMKV refuses
+# an image it cannot open, and `_verify_conversion` compares the finished file
+# against the length MakeMKV promised. Losing a real 17 GB disc to a false
+# positive has already happened here; the reverse has not.
+SEEK_ARTEFACTS = re.compile(
+    r"error while decoding MB|"
+    r"Error submitting packet to decoder|"
+    r"co located POCs unavailable|"
+    r"non-existing PPS|"
+    r"decode_slice_header error|"
+    r"Invalid NAL unit size",
+    re.IGNORECASE,
+)
+
+
+def is_noise(line: str, on_disc: bool = False) -> bool:
+    """Whether this ffmpeg line says nothing about the media's condition.
+
+    ``on_disc`` widens the filter to the seek artefacts above. It defaults to
+    False so that nothing outside the disc path can accidentally opt in.
+    """
+    if NOISE.search(line):
+        return True
+    return bool(on_disc and SEEK_ARTEFACTS.search(line))

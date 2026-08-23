@@ -623,6 +623,31 @@ container's own ffmpeg:
   heuristic would have found them too. A seamless-branching disc, where it
   would not, is still untested.
 
+- **A conversion has now run end to end, and it found the feature could not
+  fire.** A 17 GB Blu-ray converted in **121 seconds** — 95 min feature, 17
+  chapters, one extra placed in `extras/`, the image kept, the database row
+  moved. But `check_file` on that image returned **`corrupt`**, from 207 decode
+  errors that were entirely artefacts of reading it: DTS `Error submitting
+  packet to decoder` on a secondary audio track, and h264 `error while decoding
+  MB` at the seek points. `corrupt` decides before the disc branch, so
+  `decide` returned **`repair`** — a remux a disc cannot have — and its failure
+  falls through to a redownload that deletes the disc.
+
+  MakeMKV's stream copy of the same disc probes with **zero** decode errors,
+  which is what settles that the disc was fine and the reading was not.
+
+  Two changes, and both are load-bearing. `is_noise` takes an `on_disc` flag
+  and filters those artefacts only for a disc — they are the *primary* evidence
+  of damage in an ordinary file and still count there. And `decide` now sends a
+  disc with integrity findings to the conversion rather than to repair: the
+  conversion changes nothing until MakeMKV has produced a title of the right
+  length, so it is both the gentler answer and the one that finds out.
+
+  Sampled across 15 disc images, **2 read as `corrupt` from read artefacts
+  alone**. Do not read that as "most discs are fine" — read it as: the failure
+  is intermittent, it depends on the audio layout of the disc, and before these
+  changes each occurrence was one scan away from deleting a good Blu-ray.
+
 - **The tool now runs from unfuckarr's own image, and `rip` works.** MakeMKV
   1.18.4 is installed from the `~heyarje/makemkv-beta` PPA as a signed apt
   source — not from makemkv.com, whose download host has been answering
