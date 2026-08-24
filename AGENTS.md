@@ -748,3 +748,10 @@ unraid/              CA template (must be copied into the templates repo to list
 Packaging follows the conventions in `stoatworks-unraid` — but note that repo's generators
 **must not** be pointed at this one: unfuckarr has a hand-written Dockerfile (`hasOwnDocker`),
 because a generated static-site image would serve nothing.
+
+## Notes
+
+`docs/NOTES.md` carries this repo's working notes — current status, decisions
+already made, and the traps that have actually bitten. Read it before changing
+anything non-obvious. Cross-cutting fleet knowledge lives in
+[fleet-notes](https://github.com/stoatworks-labs/fleet-notes).
