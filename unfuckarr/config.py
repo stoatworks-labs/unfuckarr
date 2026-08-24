@@ -281,6 +281,12 @@ class Policy(BaseModel):
     # A file that is merely large is not a fault, so this can never delete —
     # the literal type is the enforcement, exactly as for hygiene_action.
     oversize_action: Literal["none", "flag", "shrink"] = "shrink"
+    # A disc image is not a fault either — it plays — so this can never delete
+    # either, for the same reason and by the same mechanism. `convert` needs
+    # MakeMKV configured; without it the decision falls back to a flag on its
+    # own, so this being the default costs nothing on an install that has not
+    # set one up.
+    disc_action: Literal["none", "flag", "convert"] = "flag"
     # Blocklist the release in Sonarr/Radarr so the same broken file is not
     # grabbed straight back.
     blocklist_on_redownload: bool = True
@@ -305,9 +311,57 @@ class Policy(BaseModel):
     # whatever fits the window you are willing to give it, and use
     # `ShrinkConfig.only_between_hours` if that window is overnight.
     max_shrinks_per_scan: int = 5
+    # Conversions get their own cap for the same reason shrinks do: one is
+    # tens of minutes of solid I/O copying a Blu-ray, and fifty of them is a
+    # scan that runs for two days. Unlike a shrink there is no continuous
+    # worker to hand them to, so this is the only pacing there is.
+    max_conversions_per_scan: int = 2
     # If more than this fraction of a library fails, stop and flag instead of
     # deleting — that is a mount problem, not a media problem.
     abort_if_failure_ratio_over: float = 0.5
+
+
+class MakeMKVConfig(BaseModel):
+    """Converting a disc image to Matroska, through an external MakeMKV.
+
+    Never bundled, because the binary half is not redistributable and its beta
+    key expires about monthly — see `makemkv.py`. `command` is a whole command
+    line rather than a path so a container shim is expressible:
+
+        docker run --rm -v /mnt/user:/mnt/user jlesage/makemkv makemkvcon
+
+    with the caveat that the paths have to mean the same thing on both sides of
+    that mount, or MakeMKV is handed a path that does not exist and says only
+    that it cannot open the disc.
+    """
+
+    enabled: bool = False
+    command: str = "makemkvcon"
+    # Nothing shorter than this is even analysed. Also the floor for what can
+    # be considered an extra, so it is not the extras floor: that is below.
+    min_title_seconds: int = 60
+    # Bonus features. `extras_folder` writes them to `<movie>/extras/`, which
+    # is where Emby looks; `skip` takes the feature only. There is no third
+    # option that sorts them into `deleted-scenes` and `interviews`, because
+    # nothing in the disc metadata says which is which — MakeMKV reports a
+    # length and a segment map, not a kind.
+    extras: Literal["skip", "extras_folder"] = "extras_folder"
+    extras_min_seconds: int = 90
+    max_extras: int = 24
+    # How far short of the *arr's runtime the chosen title may be before the
+    # conversion is refused. Wide, because the *arr runtime is nominal — it is
+    # only here to catch a trailer being picked as the feature.
+    duration_tolerance_pct: float = 25.0
+    # The finished file against the image it came from. Tight, because both
+    # numbers are measured: this is the check that caught every short encode
+    # on the live library.
+    output_tolerance_pct: float = 2.0
+    timeout_hours: int = 8
+    # Leave the image in place instead of recycling it. Emby will group the two
+    # as versions of one item when they are named for it, but Sonarr and Radarr
+    # track exactly one file per episode/movie — so the image becomes something
+    # no *arr knows about, and unfuckarr will not manage it either.
+    keep_disc_image: bool = False
 
 
 class ScheduleConfig(BaseModel):
@@ -340,6 +394,7 @@ class Settings(BaseModel):
     efficiency: EfficiencyConfig = Field(default_factory=EfficiencyConfig)
     transcode: TranscodeConfig = Field(default_factory=TranscodeConfig)
     shrink: ShrinkConfig = Field(default_factory=ShrinkConfig)
+    makemkv: MakeMKVConfig = Field(default_factory=MakeMKVConfig)
     policy: Policy = Field(default_factory=Policy)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     watch_folders: list[WatchFolder] = Field(default_factory=list)

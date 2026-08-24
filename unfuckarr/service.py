@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -98,8 +99,18 @@ class Service:
             freed = 0
             for path in leftovers:
                 try:
-                    freed += os.path.getsize(path)
-                    os.unlink(path)
+                    # A conversion killed part-way leaves a *directory* — the
+                    # work dir MakeMKV was ripping into — and it is the same
+                    # trap as the abandoned transcode output, at the same size:
+                    # invisible to everything that enumerates media, and full
+                    # of a partial copy of a Blu-ray.
+                    if os.path.isdir(path):
+                        freed += sum(f.stat().st_size for f in
+                                     Path(path).rglob("*") if f.is_file())
+                        shutil.rmtree(path)
+                    else:
+                        freed += os.path.getsize(path)
+                        os.unlink(path)
                 except OSError as exc:
                     log.warning("could not remove leftover %s: %s", path, exc)
             if leftovers:

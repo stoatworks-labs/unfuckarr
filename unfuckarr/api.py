@@ -235,7 +235,8 @@ def recheck(path: str, act: bool = False) -> dict[str, Any]:
 
 @api.post("/files/action")
 def force_action(path: str, action: str) -> dict[str, Any]:
-    if action not in ("transcode", "repair", "shrink", "redownload", "flag"):
+    if action not in ("transcode", "repair", "shrink", "convert",
+                      "redownload", "flag"):
         raise HTTPException(400, f"unknown action {action}")
     try:
         return service.force_action(path, action)

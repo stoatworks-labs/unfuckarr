@@ -15,10 +15,11 @@ scanner.collect_library()      → inventory from Sonarr/Radarr APIs + extra pat
   ↓
 scanner.check_file()           → integrity → (emby direct-play OR local compat) → hygiene → efficiency
   ↓                              produces CheckResult: a list of Findings with categories
-remediation.decide()           → CheckResult + Policy → Decision (none|flag|transcode|repair|shrink|redownload)
+remediation.decide()           → CheckResult + Policy → Decision (none|flag|transcode|repair|shrink|convert|redownload)
   ↓
 Remediator.apply()             → transcode.plan() → build_command() → run() → verify → replace
                                  or: quality.search() → encode → quality.verify() → replace
+                                 or: makemkv.titles() → select() → rip() → verify → replace + extras/
                                  or: recycle.store() → arr.delete_file() → arr.blocklist_last_grab()
 ```
 
@@ -158,6 +159,34 @@ Break any of these and the failure is quiet and expensive.
     spirit, `__main__.resolve_host` **fails the start** when `UNFUCKARR_BIND_INTERFACE` names an
     interface that never gets an address — falling back to `0.0.0.0` would silently expose the
     service exactly when the VPN is down. Do not "fix" that into a fallback.
+
+19. **A conversion is the only action that produces more than one file, and only
+    one of them is a library item.** The feature replaces the image; the bonus
+    features go to `extras/`, and `walk_video_files`, the watcher and
+    `transcode.is_extras_path` all refuse to follow them. That is not tidiness.
+    A deleted scene checked as if it were a film is short, often has no usable
+    audio track, and reads as corrupt or incompatible — so it gets *repaired*,
+    or redownloaded, and a redownload on a file carrying its parent's *arr
+    identity deletes the film. `EXTRAS_DIRS` deliberately does not contain
+    `specials`: that is Sonarr's season-zero folder and a real part of the
+    library.
+
+20. **A failure of the MakeMKV installation is never recorded against a disc.**
+    `files.convert_skipped` and `convert_attempts` are permanent, and the
+    failures that earn them are properties of the image — no title matching the
+    runtime, an image MakeMKV cannot open. An expired beta key is not one of
+    those: it arrives one morning with nothing else changed, a new key fixes
+    it, and writing it to every disc it touched would silently retire the whole
+    feature. Hence `makemkv.KeyExpired`, which is an `Unavailable`, and the
+    availability check that runs before every conversion.
+
+21. **The tool is never bundled, and that is a licence fact, not a preference.**
+    MakeMKV's binary half is not redistributable, so a public image cannot ship
+    it. `MakeMKVConfig.command` is a whole command line rather than a path so
+    that a container shim is expressible without this codebase knowing anything
+    about containers — with the trap that the paths must mean the same thing on
+    both sides of that mount, and MakeMKV's error when they do not says only
+    that it cannot open the disc.
 
 ## Traps found the hard way
 
@@ -361,6 +390,53 @@ Break any of these and the failure is quiet and expensive.
 - **The scan is single-flight** via `Service._scan_lock`, and `__main__.py` pins uvicorn to one
   worker. Two workers would mean two scanners fighting over the same library.
 
+### Disc conversion
+
+- **Menus cannot come across, and nothing in this stack ever played them.** No
+  Matroska file has ever held a DVD VM program or a BD-J title; MakeMKV does not
+  preserve them and never has. Emby picks a title and plays it, from an image
+  as much as from a file. So what a conversion actually costs is the
+  navigation, and what it keeps — every audio track including the lossless
+  ones, every subtitle track, the chapters, and the bonus features as files in
+  `extras/` — is what anyone was opening the menu to reach. Do not accept a
+  feature request to "keep the menus": the honest answer is that the format
+  cannot and the player would not.
+- **MakeMKV's own reported duration is the free verification, and it is the
+  better one.** `_verify_conversion` compares the finished file against the
+  length MakeMKV said the title was moments before writing it. That reference
+  needs nothing to have been readable, which matters: the five images
+  libudfread refuses have no `MediaInfo` at all, and they are exactly the ones
+  worth handing to MakeMKV. The *arr's nominal runtime is the second reference
+  and gets a much wider tolerance, for the same reason
+  `duration_below_expected` exists.
+- **An expired key reports as "no titles", which reads exactly like an
+  unreadable disc.** Confirmed against makemkvcon 1.18.4 on the deployment
+  target: a lapsed beta key produced `MSG:5073` ("Your temporary key has
+  expired and was removed") and `MSG:5021` ("This application version is too
+  old"), the drive list, and **not one TINFO record**. Without `_KEY_TROUBLE`
+  that is indistinguishable from an image MakeMKV cannot open, and `_convert`
+  would write `convert_skipped` on the disc permanently — on the first disc
+  anyone converted. The patterns are matched on wording rather than MSG code
+  because the codes have moved between releases and the wording has not; both
+  real messages are pinned as test fixtures.
+- **The work directory is the leftover, not a file.** A rip goes into
+  `<name>.unfuckarr.convert/`, because MakeMKV names the files it writes and
+  the only thing marking them as ours is the folder. `is_temp_output` therefore
+  checks every path component rather than the filename — and the startup sweep
+  removes directories as well as files, because a conversion killed by a
+  restart is the 199 GB trap again with a partial Blu-ray inside it.
+- **Nothing is re-encoded by a conversion.** MakeMKV stream-copies, so a UHD
+  disc arrives already in HEVC and a conversion is minutes of I/O rather than
+  hours of encode. Making it smaller stays the shrink path's job, on the
+  ordinary Matroska file the conversion leaves behind, where it is already
+  measured at both ends. Two proven steps beat one step doing two unproven
+  things.
+- **A conversion supersedes compat, hygiene and efficiency, so it decides
+  before all three.** An image is not direct-playable, its tracks carry no
+  tags, and it cannot be shrunk from where it sits; one conversion clears all
+  of it. It is also strictly better than what the compat path would otherwise
+  do to a disc, which is the byte-range encode that came out short live.
+
 ## Verified vs assumed
 
 **Verified on real hardware — `vaapi`:** an AMD Radeon 880M (gfx1150) encodes 1080p MPEG-2 to
@@ -523,6 +599,88 @@ container's own ffmpeg:
   with the hardware encoder — so the timings are arithmetic, and `hevc_vaapi`'s `-qp` scale has
   never been through the search at all. Expect the first live run to want `crf_min`/`crf_max`
   adjusting for VAAPI, whose QP numbers do not mean what libx265's CRF numbers mean.
+- **The read path has now been run against real discs; the write path has not.**
+  With a fresh beta key, makemkvcon 1.18.4 was pointed at two Blu-ray images
+  from the live library and the output parsed by `makemkv.titles` and
+  `makemkv.select`:
+
+  - *Mortal Kombat: Annihilation* — 3 titles. Selected the 94.8 min feature
+    with 17 chapters against a 95 min *arr runtime; one 90 s extra kept, one
+    75 s title rejected under the floor.
+  - *No Time to Die* — **54 titles**. Selected the 163.6 min feature (20
+    chapters, 83.8 GB) against a 163 min runtime, kept 6 extras between 4 and
+    47 minutes, rejected 43 as too short and **4 as duplicates**.
+
+  That duplicate count is the finding. Titles 1 and 52 are the same 83.77 GB
+  under two playlists — same duration, same segment map — so without the
+  segment-map dedupe a conversion would have written **167 GB for one film**.
+  It also exposed a real bug: only title 1 carries the chapter marks, and
+  ordering by index alone kept the right one by luck. `select` now breaks a tie
+  on chapter count first.
+
+  **What these two discs do *not* prove is the case MakeMKV is here for.** Both
+  features are a single segment, so `disc.bluray_main_title`'s largest-`.m2ts`
+  heuristic would have found them too. A seamless-branching disc, where it
+  would not, is still untested.
+
+- **A conversion has now run end to end, and it found the feature could not
+  fire.** A 17 GB Blu-ray converted in **121 seconds** — 95 min feature, 17
+  chapters, one extra placed in `extras/`, the image kept, the database row
+  moved. But `check_file` on that image returned **`corrupt`**, from 207 decode
+  errors that were entirely artefacts of reading it: DTS `Error submitting
+  packet to decoder` on a secondary audio track, and h264 `error while decoding
+  MB` at the seek points. `corrupt` decides before the disc branch, so
+  `decide` returned **`repair`** — a remux a disc cannot have — and its failure
+  falls through to a redownload that deletes the disc.
+
+  MakeMKV's stream copy of the same disc probes with **zero** decode errors,
+  which is what settles that the disc was fine and the reading was not.
+
+  Two changes, and both are load-bearing. `is_noise` takes an `on_disc` flag
+  and filters those artefacts only for a disc — they are the *primary* evidence
+  of damage in an ordinary file and still count there. And `decide` now sends a
+  disc with integrity findings to the conversion rather than to repair: the
+  conversion changes nothing until MakeMKV has produced a title of the right
+  length, so it is both the gentler answer and the one that finds out.
+
+  Sampled across 15 disc images, **2 read as `corrupt` from read artefacts
+  alone**. Do not read that as "most discs are fine" — read it as: the failure
+  is intermittent, it depends on the audio layout of the disc, and before these
+  changes each occurrence was one scan away from deleting a good Blu-ray.
+
+- **The tool now runs from unfuckarr's own image, and `rip` works.** MakeMKV
+  1.18.4 is installed from the `~heyarje/makemkv-beta` PPA as a signed apt
+  source — not from makemkv.com, whose download host has been answering
+  Cloudflare 525 to everyone. Built on the target and driven by this codebase:
+  `titles` read 51 titles off a UHD disc, `select` picked the feature and six
+  extras, and `rip` produced a 4.2 min extra in 5 seconds — **HEVC 3840x2160
+  10-bit, AC3 5.1, 251.8s against the 251s MakeMKV promised (0.32% drift)**.
+  That last figure is `_verify_conversion`'s primary check, measured on real
+  media for the first time.
+
+  Worth drawing out, because it decides what this feature is *for*: on a UHD
+  disc the video is already HEVC, so a conversion is a stream copy that yields
+  HEVC in Matroska with no encode, and the HDR survives because nothing decodes
+  it. `allow_hdr` gates the *shrink*, never this.
+
+  Building it also found that the application image ships no `curl`, which the
+  key wrapper needs and whose absence is silent by design.
+
+- **No disc has ever been converted.** Every part of the path is exercised — the
+  robot-output parsing, the title selection, the duration checks, the extras
+  placement, the recycle and the swap — but against a stand-in that speaks
+  MakeMKV's protocol and copies files ffmpeg rendered, because MakeMKV cannot
+  be installed in CI. What that cannot prove is the only thing MakeMKV is here
+  for: that it picks the right playlist off a real Blu-ray with seamless
+  branching. Convert one disc by hand, with `keep_disc_image` on, and compare
+  the result against the image before trusting it with a library.
+- **The extras heuristic is a length heuristic and nothing more.** "The longest
+  title is the feature" was right on every disc measured, and the discs where
+  it will not be — an anthology, a TV season on one disc, a concert film with
+  a longer bonus concert — are real and are not represented in any test here.
+  `max_extras` and the extras floor limit the damage; nothing prevents it.
+- **Nothing has been converted on the live library**, and the live instance's
+  `disc_action` default (`flag`) means nothing will be until someone sets it.
 - **No Unraid server has installed the CA template.** It is written against the CA conventions
   used elsewhere in this fleet (root `<Container version="2">`, no trailing colon on subcategory
   tokens, per-image `<Registry>` URL) and `scripts/validate_template.py` checks those in CI, but
@@ -558,6 +716,8 @@ unfuckarr/
   governor.py        Per-process GPU encode share from fdinfo, held by SIGSTOP/SIGCONT
   disc.py            Reading .iso/.img without mounting: a UDF reader (metadata
                      partitions included), ISO9660 for DVDs, subfile/concat URLs
+  makemkv.py         Converting a disc image to Matroska through an external
+                     MakeMKV: robot-output parsing, title selection, the rip
   recycle.py         Recycle bin + retention
   remediation.py     decide() and Remediator
   scanner.py         Enumeration, check_file, the scan loop, the brakes

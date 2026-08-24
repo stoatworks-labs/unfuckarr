@@ -152,7 +152,8 @@ def _decode_pass(source: str, cfg: IntegrityConfig, ffmpeg: str,
     # the first track does not.
     streams = ("0:v:0?", "0:a:0?") if info.is_disc else ("0:v:0?", "0:a?")
     if cfg.depth == "full":
-        res = decode_check_full(source, ffmpeg, streams=streams)
+        res = decode_check_full(source, ffmpeg, streams=streams,
+                                on_disc=info.is_disc)
         windows = [("whole file", res)]
     else:
         # Head, middle and tail. Damage from an interrupted download lands at
@@ -166,7 +167,7 @@ def _decode_pass(source: str, cfg: IntegrityConfig, ffmpeg: str,
             offsets.append(("end", max(0.0, dur - span - 1)))
         windows = [
             (label, decode_check_full(source, ffmpeg, start=off, duration=span,
-                              streams=streams))
+                              streams=streams, on_disc=info.is_disc))
             for label, off in offsets
         ]
         # A container whose index is broken demuxes badly even where the video

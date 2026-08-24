@@ -24,7 +24,7 @@ from watchdog.observers.polling import PollingObserver
 from . import db
 from .config import VIDEO_EXTENSIONS, Settings, WatchFolder
 from .state import bus, state
-from .transcode import is_temp_output
+from .transcode import is_extras_path, is_temp_output
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +48,11 @@ class _Handler(FileSystemEventHandler):
         # A watch folder over the library sees our own transcode output being
         # written; settling on it would start a second job racing the first.
         if is_temp_output(p.name):
+            return
+        # Bonus features are extras of a library item, not items. A disc
+        # conversion writes several of them at once, and every one would
+        # otherwise settle and be checked as if it were a film.
+        if is_extras_path(str(p)):
             return
         self.touch(str(p))
 

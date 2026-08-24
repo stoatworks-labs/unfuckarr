@@ -68,6 +68,28 @@ From there a disc behaves like any other file: it is checked for integrity, meas
 efficiency, and — because an 80 Mbps disc is the best shrink candidate in any library —
 re-encoded to a normal `.mkv` that every client can direct play.
 
+**Converting a disc image, with MakeMKV.** Reading an image is enough to judge it and not enough
+to convert it: the feature on a Blu-ray is a *playlist* naming a sequence of segments, and taking
+the largest one instead picks a trailer on some discs. Point unfuckarr at a MakeMKV and it will
+copy the main feature out properly — stream copy, so the same video and the same lossless audio,
+with the chapters and every subtitle track — put the bonus features in an `extras/` folder beside
+it where Emby looks for them, and recycle the image once the result verifies. Nothing is
+re-encoded; if you also want it smaller, the ordinary shrink path takes it from there, measured
+at both ends like anything else.
+
+**The menus do not survive, and nothing you use ever played them.** No Matroska file can hold a
+DVD or Blu-ray menu — MakeMKV does not preserve them either — so a conversion trades the
+navigation for a file Emby can index. Emby has never rendered a disc menu; handed an image it
+picks a title and plays it. What the menus were *for* — the other audio tracks, the subtitles,
+the deleted scenes — all comes across.
+
+**MakeMKV is not included, and cannot be.** Its binary half is not redistributable, and its beta
+key expires roughly monthly, which is not something an unattended service should depend on. So
+`makemkv.command` is a whole command line you provide — `makemkvcon` on the PATH, or a
+`docker run ... makemkvcon` shim naming a container that has it. If you use a container, mount
+your media at *the same paths* it has here, or MakeMKV is handed a path that does not exist and
+reports only that it cannot open the disc.
+
 **An image nothing can open is reported, never condemned.** It raises an *info* finding, not an
 error, and no policy acts on it. Being unable to read a file is not evidence that the file is bad,
 and this is the one place in the application where confusing those two has already cost real
@@ -111,6 +133,7 @@ hand:
 | Hygiene | Flag only |
 | Not yet measured for a saving | Measure it, and re-encode only if the result is smaller *and* still scores at the quality target |
 | A disc image nothing can open | Report it, and do nothing |
+| A disc image, with MakeMKV configured | Copy the feature out to `.mkv`, bonus features to `extras/`, recycle the image |
 
 Everything is configurable per class, including turning it off.
 

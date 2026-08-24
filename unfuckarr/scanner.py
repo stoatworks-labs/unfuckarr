@@ -42,10 +42,13 @@ def walk_video_files(root: str) -> Iterable[str]:
 
     ``.grab``/``incomplete`` hold partial downloads, Emby/Plex metadata
     directories hold trailers and theme videos that are not library items, and
-    ``*.unfuckarr.*`` is our own in-flight transcode output.
+    ``*.unfuckarr.*`` is our own in-flight transcode output. ``EXTRAS_DIRS``
+    holds bonus features — including the ones a disc conversion writes there —
+    which are extras of a library item rather than items themselves.
     """
     skip_dirs = {"@eaDir", ".grab", "incomplete", "extrafanart", "extrathumbs",
                  ".unfuckarr", "lost+found", ".Trash", ".recycle", "recycle"}
+    skip_dirs |= transcode.EXTRAS_DIRS
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = [d for d in dirnames
                        if d not in skip_dirs and not d.startswith(".")]
@@ -376,6 +379,11 @@ class Scanner:
         # all. Counting shrinks here would also trip the brake permanently on
         # any library that is mostly H.264 — which is most libraries. Shrinks
         # have their own, much smaller cap below instead.
+        # `convert` is absent for exactly the same reason: "most of this
+        # library is disc images" is a description of somebody's collection,
+        # not of a mount that has just gone away, and a disc-heavy library
+        # would otherwise abort every scan it ever ran. It gets its own cap
+        # below too.
         denominator = max(1, population or state.scan.checked)
         destructive = [p for p in pending
                        if p[3].action in ("redownload", "transcode", "repair")]
@@ -393,7 +401,9 @@ class Scanner:
 
         applied = 0
         shrinks = 0
+        conversions = 0
         capped_shrinks = False
+        capped_conversions = False
         # Repairs first, shrinks last. A broken file is urgent and a remux
         # takes seconds; an unmeasured file is neither urgent nor cheap, and
         # one multi-hour shrink must never consume the pass that a corrupt
@@ -404,11 +414,18 @@ class Scanner:
         # files furthest above the reference bitrate for their resolution go
         # first — that is where the measurement is most likely to pay, and
         # where it pays most when it does.
-        def order(item: tuple) -> tuple[bool, float]:
+        # Conversions sit between the two: a disc image is not urgent, but it
+        # is tens of minutes rather than the hours a shrink takes, and it is
+        # what *makes* the disc measurable — so it should not queue behind the
+        # shrinks it will eventually feed. Biggest first within them, on the
+        # same reasoning as fattest-first for shrinks.
+        def order(item: tuple) -> tuple[int, float]:
             _, _, item_info, item_decision = item
+            if item_decision.action == "convert":
+                return (1, -(item_info.size if item_info else 0))
             if item_decision.action != "shrink":
-                return (False, 0.0)
-            return (True, -efficiency_checks.priority(item_info, s.efficiency))
+                return (0, 0.0)
+            return (2, -efficiency_checks.priority(item_info, s.efficiency))
 
         ordered = sorted(pending, key=order)
         for row, result, info, decision in ordered:
@@ -427,6 +444,13 @@ class Scanner:
                                {"cap": s.policy.max_shrinks_per_scan})
                         capped_shrinks = True
                     continue
+            elif decision.action == "convert":
+                if conversions >= s.policy.max_conversions_per_scan:
+                    if not capped_conversions:
+                        db.log("convert_cap_reached", "info", row["path"],
+                               {"cap": s.policy.max_conversions_per_scan})
+                        capped_conversions = True
+                    continue
             elif decision.action != "flag" and applied >= s.policy.max_actions_per_scan:
                 db.log("action_cap_reached", "warn", row["path"],
                        {"cap": s.policy.max_actions_per_scan})
@@ -434,10 +458,12 @@ class Scanner:
             outcome = self.remediator.apply(row, result, info, decision)
             if decision.action == "shrink":
                 shrinks += 1
+            elif decision.action == "convert":
+                conversions += 1
             elif decision.action != "flag":
                 applied += 1
             if decision.action != "flag":
-                state.scan.actions = applied + shrinks
+                state.scan.actions = applied + shrinks + conversions
                 publish_scan()
             bus.publish("remediated", {"path": row["path"], **outcome})
 
@@ -445,6 +471,8 @@ class Scanner:
         db.log("scan_finished", "info", detail={
             "checked": state.scan.checked, "failed": state.scan.failed,
             "actions": applied, "shrinks": shrinks,
+            "conversions": conversions,
         })
         return {"checked": state.scan.checked, "failed": state.scan.failed,
-                "actions": applied, "shrinks": shrinks}
+                "actions": applied, "shrinks": shrinks,
+                "conversions": conversions}

@@ -362,6 +362,7 @@ def decode_check(
     start: float | None = None,
     duration: float | None = None,
     timeout: int = 3600,
+    on_disc: bool = False,
 ) -> DecodeResult:
     """Decode to null and count the complaints ffmpeg makes.
 
@@ -379,7 +380,7 @@ def decode_check(
     cmd += ["-map", "0", "-c", "copy", "-f", "null", "-"]
     # -c copy validates demuxing (container/index damage) cheaply; the caller
     # asks for a real decode by passing decode=True below.
-    return _run_decode(cmd, timeout)
+    return _run_decode(cmd, timeout, on_disc)
 
 
 def decode_check_full(
@@ -389,6 +390,7 @@ def decode_check_full(
     duration: float | None = None,
     timeout: int = 3600,
     streams: tuple[str, ...] = ("0:v:0?", "0:a?"),
+    on_disc: bool = False,
 ) -> DecodeResult:
     """Actually decode the video stream — catches damage a remux would miss.
 
@@ -407,10 +409,11 @@ def decode_check_full(
     for spec in streams:
         cmd += ["-map", spec]
     cmd += ["-f", "null", "-"]
-    return _run_decode(cmd, timeout)
+    return _run_decode(cmd, timeout, on_disc)
 
 
-def _run_decode(cmd: list[str], timeout: int) -> DecodeResult:
+def _run_decode(cmd: list[str], timeout: int,
+                on_disc: bool = False) -> DecodeResult:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError as exc:
@@ -421,7 +424,7 @@ def _run_decode(cmd: list[str], timeout: int) -> DecodeResult:
     messages: list[str] = []
     for line in (proc.stderr or "").splitlines():
         line = line.strip()
-        if not line or disc_mod.is_noise(line):
+        if not line or disc_mod.is_noise(line, on_disc):
             # libbluray narrates every open (BD-J menus it will not run, a
             # playlist whose first clip has no timestamp) and seeking into a
             # GOP always reports a missing first slice. None of it is damage,
@@ -434,7 +437,7 @@ def _run_decode(cmd: list[str], timeout: int) -> DecodeResult:
     # the UI shows something more useful than "it failed".
     if proc.returncode != 0 and not messages:
         tail = [ln.strip() for ln in (proc.stderr or "").splitlines()
-                if ln.strip() and not disc_mod.is_noise(ln)]
+                if ln.strip() and not disc_mod.is_noise(ln, on_disc)]
         messages = tail[-3:] or [f"ffmpeg exited {proc.returncode}"]
     return DecodeResult(
         errors=len(messages),
