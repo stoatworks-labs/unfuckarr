@@ -122,6 +122,16 @@ CREATE TABLE IF NOT EXISTS scans (
     aborted   TEXT
 );
 
+-- Lifetime counters. Deliberately not derived from `jobs` or `activity`,
+-- which `prune()` caps at 2,000 and 5,000 rows, nor from `recycle`, whose rows
+-- go when retention sweeps them. A total that quietly resets after a busy week
+-- is worse than no total: it reads as "nothing has happened here" precisely
+-- when the most has.
+CREATE TABLE IF NOT EXISTS totals (
+    name  TEXT PRIMARY KEY,
+    value INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS recycle (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     original  TEXT NOT NULL,
@@ -198,6 +208,24 @@ def ex(sql: str, params: Iterable[Any] = ()) -> int:
     cur = conn.execute(sql, tuple(params))
     conn.commit()
     return cur.lastrowid or 0
+
+
+def bump(name: str, by: int = 1) -> None:
+    """Add to a lifetime counter.
+
+    Upsert rather than read-modify-write: two workers finishing at once is
+    normal here (the scan thread and the shrink worker), and the read-modify
+    version loses one of them.
+    """
+    if not by:
+        return
+    ex("INSERT INTO totals (name, value) VALUES (?, ?) "
+       "ON CONFLICT(name) DO UPDATE SET value = value + excluded.value",
+       (name, int(by)))
+
+
+def totals() -> dict[str, int]:
+    return {r["name"]: r["value"] for r in q("SELECT name, value FROM totals")}
 
 
 def log(event: str, level: str = "info", path: str | None = None,

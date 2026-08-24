@@ -188,6 +188,27 @@ tbody tr.click { cursor: pointer; }
 .spread { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 
+/* Lifetime totals, directly under the topbar. Sticky with it — it is part of
+   the header, and a figure that scrolls away is one nobody reads. Scrolls
+   sideways rather than wrapping: a header that changes height as numbers grow
+   pushes the whole page down. */
+.totals {
+  display: flex; gap: 22px; align-items: baseline;
+  padding: 8px 20px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  position: sticky; top: 56px; z-index: 19;
+  overflow-x: auto; scrollbar-width: none;
+  font-size: 12px;
+}
+.totals::-webkit-scrollbar { display: none; }
+.totals-item {
+  display: flex; align-items: baseline; gap: 6px; white-space: nowrap;
+  cursor: default;
+}
+.totals-n { font-weight: 600; font-variant-numeric: tabular-nums; }
+.totals-l { color: var(--muted); }
+
 .banner {
   padding: 11px 20px; background: rgba(210,153,34,.15);
   border-bottom: 1px solid var(--warn); color: var(--warn); font-size: 13px;
@@ -256,7 +277,18 @@ pre {
 
 @media (max-width: 760px) {
   .topbar { height: auto; flex-wrap: wrap; padding: 10px 14px; gap: 10px; }
+  /* The topbar wraps to two rows here, so its height is no longer 56px and a
+     sticky strip offset by that overlaps it on scroll. Let this one scroll
+     away instead — the alternative is measuring the header in JS to keep a
+     line of totals on screen on a phone. */
+  .totals { position: static; padding: 8px 14px; gap: 18px; }
   nav { order: 3; width: 100%; flex: none; }
   main { padding: 14px; }
   .sticky-save { margin: 0 -14px -14px; }
 }
+
+/* The support footer appends itself to <body>, outside `main`, so it does not
+   inherit the page's max-width. Match it, or on a wide screen the footer runs
+   the full width of the viewport while everything above it stops at 1400px. */
+.sw-support { max-width: 1400px; margin-inline: auto; padding-inline: 20px; }
+@media (max-width: 760px) { .sw-support { padding-inline: 14px; } }

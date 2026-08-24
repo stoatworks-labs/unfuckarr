@@ -182,6 +182,13 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
     return Decision("none", "file is fine")
 
 
+def _size_of(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def _is_disc(result: CheckResult) -> bool:
     """Whether the checked file was a disc image.
 
@@ -551,6 +558,10 @@ class Remediator:
         # to prevent.
         still_open = set(decision.findings) & {f.code for f in result.findings}
         if result.status in ("ok", "hygiene") and not still_open:
+            # The only place a repair is *known* to have worked, which is why
+            # the counter is here and not beside the ffmpeg call: a run that
+            # exits 0 and leaves the finding in place has fixed nothing.
+            db.bump("files_fixed")
             return
 
         attempts = self._count_attempt(final, file_row)
@@ -891,6 +902,8 @@ class Remediator:
         self._recheck_after_shrink(final, file_row)
 
         saved = info.size - new_size
+        db.bump("files_shrunk")
+        db.bump("bytes_saved", saved)
         summary = (f"{quality.human_size(info.size)} → "
                    f"{quality.human_size(new_size)} "
                    f"({realised:.0f}% smaller), {metric.name.upper()} "
@@ -1166,6 +1179,17 @@ class Remediator:
         # have been measured while it was an image.
         self._recheck_replacement(final, file_row, already_shrunk=False)
 
+        # The honest saving is the image against *everything* that replaced it:
+        # counting the feature alone while the extras sit beside it would
+        # report space that was never reclaimed. Keeping the image means
+        # nothing was reclaimed at all, so there is nothing to count.
+        saved = 0
+        if not cfg.keep_disc_image:
+            replaced = _size_of(final) + sum(_size_of(p) for p in placed)
+            saved = (file_row.get("size") or 0) - replaced
+        db.bump("discs_converted")
+        db.bump("bytes_saved", saved)
+
         summary = (f"converted to {Path(final).name}: "
                    f"{main.seconds / 60:.0f} min, {main.chapters} chapters"
                    + (f", {len(placed)} extras" if placed else ""))
@@ -1173,6 +1197,7 @@ class Remediator:
         db.log("convert_done", "info", final, {
             "from": path, "extras": len(placed), "kept_image": cfg.keep_disc_image,
             "seconds": round(main.seconds), "chapters": main.chapters,
+            "saved": saved,
         })
         return {"action": "convert", "ok": True, "path": final,
                 "message": summary}
@@ -1362,6 +1387,16 @@ class Remediator:
                 except ArrError as exc:
                     db.log("arr_search_failed", "error", path, str(exc))
                     steps.append(f"search failed: {exc}")
+
+        # Two counters, not one. Every redownload removes a file, but a file
+        # no *arr owns is removed without anything being asked to replace it —
+        # and a header that reported those as re-searches would be claiming a
+        # replacement is on its way when none is.
+        if recycled is not None or "deleted from disk" in steps:
+            db.bump("files_deleted")
+        if any(step.startswith(("release blocklisted", "search triggered"))
+               for step in steps):
+            db.bump("redownloads")
 
         # The replacement the *arr fetches is a different file; it deserves a
         # fresh set of fix attempts.

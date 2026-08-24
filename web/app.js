@@ -182,12 +182,56 @@ async function refreshStatus() {
     $('#pauseBtn').textContent = STATUS.state.paused ? 'Resume' : 'Pause';
     $('#scanBtn').disabled = STATUS.state.scan.running;
     $('#scanBtn').textContent = STATUS.state.scan.running ? 'Scanning…' : 'Scan now';
+    updateTotals();
     updateBanner();
     if (ROUTE === '/' || ROUTE === '/files') render();
     else renderLive();
   } catch (err) {
     $('#conn').classList.remove('live');
   }
+}
+
+// Lifetime totals, in the header, because they answer the question the
+// dashboard's status counts cannot: not "what is wrong right now" but "has any
+// of this been worth leaving switched on". They are counters in the database
+// rather than sums over jobs or activity, both of which are pruned.
+function updateTotals() {
+  const t = STATUS.totals;
+  const strip = $('#totals');
+  if (!t) { strip.classList.add('hidden'); return; }
+
+  const items = [
+    [bytes(t.bytes_saved), 'saved',
+     'Space reclaimed by shrinking files and converting disc images, '
+     + 'measured against what replaced them.'],
+    [t.files_fixed, 'fixed',
+     'Files remuxed or transcoded where the re-check afterwards confirmed the '
+     + 'finding was cleared. A run that finished but did not fix anything is '
+     + 'not counted.'],
+    [t.files_shrunk, 'shrunk',
+     'Files re-encoded smaller at the measured quality target.'],
+    [t.discs_converted, 'discs converted',
+     'Disc images turned into Matroska files, with their extras.'],
+    [t.files_deleted, 'deleted',
+     'Files removed from the library. They go to the recycle bin first unless '
+     + 'retention is set to zero.'],
+    [t.redownloads, 're-searched',
+     'Deletions where an *arr was actually asked for a replacement. Lower than '
+     + 'the deleted count when a file belongs to no *arr, because then nothing '
+     + 'is coming to replace it.'],
+  ];
+
+  // Nothing has happened yet: six zeroes is a worse first impression than no
+  // strip at all, and it says nothing a new install does not already know.
+  const everything = items.every(([n]) => !n || n === '—');
+  strip.classList.toggle('hidden', everything);
+  if (everything) return;
+
+  strip.replaceChildren(...items.map(([n, label, title]) => el('div', {
+    class: 'totals-item', title,
+  },
+    el('span', { class: 'totals-n' }, typeof n === 'number' ? n.toLocaleString() : n),
+    el('span', { class: 'totals-l' }, label))));
 }
 
 function updateBanner() {

@@ -28,6 +28,8 @@
   </div>
 </header>
 
+<div id="totals" class="totals hidden"></div>
+
 <div id="banner" class="banner hidden"></div>
 
 <main id="view"></main>
@@ -44,5 +46,17 @@
 <div id="toasts" class="toasts"></div>
 
 <script src="app.js"></script>
+
+<!-- The shared Stoatworks support footer. Classic and deferred, never a
+     module: it reads its configuration off document.currentScript, which is
+     null in a module. support-footer-version.js is served by the application
+     and sets data-version on the tag below — there is no build step here to
+     stamp it in, and a literal beside the tag is right only until the next
+     release. Deferred scripts run in document order, so it lands first. -->
+<script src="support-footer-version.js" defer></script>
+<script src="support-footer.js" defer
+        data-app="unfuckarr"
+        data-repo="https://github.com/stoatworks-labs/unfuckarr"
+        data-note="unfuckarr runs on your own server and this page never leaves your network, so a report cannot be sent from here — it is handed back for you to paste into an issue."></script>
 </body>
 </html>
