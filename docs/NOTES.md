@@ -61,5 +61,10 @@ shared helper. 265 tests green.
   exactly 50, so the raise post-dates them. Expect the next scan to do far more work — worth
   watching rather than assuming.
 - The 269 files already at `fix_attempts` 2 will **stay** given up on: nothing resets the counter
-  short of a redownload. The 26 `multiple_default_audio` ones are now genuinely fixable and want
-  their counter cleared by hand before they will be retried.
+  short of a redownload. **28 of them are now genuinely fixable** (`multiple_default_audio` /
+  `all_subtitles_forced`) and want their counter cleared by hand before they will be retried.
+
+Measured on the live DB, what the fix changes: **238 hygiene files become genuinely fixable**
+(they carry `multiple_default_audio` or `all_subtitles_forced` and nothing the planner already
+handled), and **2,495 stop being rewritten twice for nothing** and are flagged honestly instead.
+Neither number includes the files that were already being fixed correctly.
