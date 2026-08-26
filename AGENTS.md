@@ -188,6 +188,20 @@ Break any of these and the failure is quiet and expensive.
     both sides of that mount, and MakeMKV's error when they do not says only
     that it cannot open the disc.
 
+22. **An action is only offered when there is a fix behind it.** `decide` sends a hygiene
+    warning to the transcoder only when its code is in `transcode.HYGIENE_FIXABLE`, and every
+    code in that set must be one `transcode.apply_hygiene_fixes` acts on
+    (`test_every_fixable_code_is_one_the_planner_acts_on` asserts the pairing). Three of the
+    eight hygiene codes describe the *source* — image-only subtitles, a bitrate that says the
+    file is a re-encode of a re-encode, a frame rate no rewrite can change — and a plan built
+    for one of those has no work in it, so it collapses to a stream copy: every byte rewritten,
+    the original recycled, and the identical warning on the far side. Invariant 9 then counts it
+    as a failed attempt, so it happens *twice* before the file is written off. Live on
+    2026-08-26 that was 269 files parked at `fix_attempts` 2 — 240 of them for
+    `image_subtitles_only` alone — with 2,733 of the 3,749 hygiene files queued to join them,
+    and it read from the outside exactly like a tool that logs problems and fixes nothing.
+    Adding a check is cheap; adding one whose finding no action can clear is not.
+
 ## Traps found the hard way
 
 - **A Blu-ray image is pure UDF, not ISO9660.** Measured across the live library: of 104 disc

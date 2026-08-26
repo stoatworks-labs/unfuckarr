@@ -135,6 +135,7 @@ class TranscodePlan:
     drop_subtitles: list[int] = field(default_factory=list)
     fix_language_tags: bool = False
     set_default_audio: int | None = None
+    clear_forced_subtitles: bool = False
     faststart: bool = False
     is_remux: bool = False
     # Set by the shrink path: the codec and CRF the quality search settled on,
@@ -162,6 +163,8 @@ class TranscodePlan:
             bits.append("tag languages")
         if self.set_default_audio is not None:
             bits.append("set default audio")
+        if self.clear_forced_subtitles:
+            bits.append("clear forced subtitles")
         if self.faststart:
             bits.append("faststart")
         return ", ".join(bits) or "no change"
@@ -222,16 +225,66 @@ def plan(info: MediaInfo, result: CheckResult, tcfg: TranscodeConfig,
     p.faststart = container == "mp4"
     p.drop_subtitles = _subtitles_to_drop(info, container)
 
-    if "audio_missing_language" in codes or "subtitle_missing_language" in codes:
-        p.fix_language_tags = True
-    if "no_default_audio" in codes and info.audio:
-        # Pick the track most likely to be the main one: highest channel count,
-        # tie-broken by stream order.
-        best = max(info.audio, key=lambda a: (a.channels, -a.index))
-        p.set_default_audio = info.audio.index(best)
+    apply_hygiene_fixes(p, info, codes)
 
     if p.video_action == "copy" and p.audio_action == "copy":
         p.is_remux = True
+    return p
+
+
+# The hygiene findings a transcode can actually clear. Everything else the
+# hygiene check raises describes the *source* — image-only subtitles, a bitrate
+# that says the file is a re-encode of a re-encode, a frame rate no rewrite can
+# change — and asking for a remux to fix one produces a byte-for-byte copy of
+# the file, a recycled original, and the identical finding on the far side.
+# Live proof (2026-08-26): 269 files sat at `fix_attempts` 2 having each been
+# remuxed twice for nothing, 240 of them for `image_subtitles_only` alone, and
+# 2,733 of the 3,749 hygiene files were queued to join them. `decide` consults
+# this so a warning with no fix behind it is flagged instead of rewritten.
+HYGIENE_FIXABLE = frozenset({
+    "audio_missing_language",
+    "subtitle_missing_language",
+    "no_default_audio",
+    "multiple_default_audio",
+    "all_subtitles_forced",
+})
+
+
+def apply_hygiene_fixes(p: TranscodePlan, info: MediaInfo,
+                        codes: set[str]) -> TranscodePlan:
+    """Set the stream-metadata half of a plan from the hygiene findings.
+
+    Shared with the shrink path, which rides these fixes along on an encode it
+    is doing anyway rather than leaving them for a second full pass — so the
+    two must not be able to drift apart. Every code touched here is in
+    `HYGIENE_FIXABLE`, and that is the contract `decide` relies on.
+    """
+    if codes & {"audio_missing_language", "subtitle_missing_language"}:
+        p.fix_language_tags = True
+
+    if info.audio:
+        if "no_default_audio" in codes:
+            # Pick the track most likely to be the main one: highest channel
+            # count, tie-broken by stream order.
+            best = max(info.audio, key=lambda a: (a.channels, -a.index))
+            p.set_default_audio = info.audio.index(best)
+        elif "multiple_default_audio" in codes:
+            # Several tracks claim to be default, so the client picks one at
+            # random — often the commentary. Choose between the tracks that
+            # already carry the flag rather than promoting one that does not:
+            # the file is telling us which tracks were meant to be playable,
+            # and only the ambiguity needs settling.
+            defaults = [a for a in info.audio if a.is_default]
+            if defaults:
+                best = max(defaults, key=lambda a: (a.channels, -a.index))
+                p.set_default_audio = info.audio.index(best)
+
+    if "all_subtitles_forced" in codes and info.subtitles:
+        # When every track is forced the flag has stopped meaning anything —
+        # it cannot be distinguishing signage from dialogue if there is nothing
+        # to distinguish it from — and the viewer cannot switch any of them
+        # off. Clearing it costs nothing and gives the choice back.
+        p.clear_forced_subtitles = True
     return p
 
 
@@ -348,6 +401,16 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
         for i in range(len(info.audio)):
             flag = "default" if i == p.set_default_audio else "0"
             cmd += [f"-disposition:a:{i}", flag]
+
+    if p.clear_forced_subtitles:
+        # Output-stream indices, so the dropped tracks are skipped the same way
+        # the language tagging above skips them.
+        out_i = 0
+        for i in range(len(info.subtitles)):
+            if i in p.drop_subtitles:
+                continue
+            cmd += [f"-disposition:s:{out_i}", "0"]
+            out_i += 1
 
     if p.faststart and p.container == "mp4":
         cmd += ["-movflags", "+faststart"]
