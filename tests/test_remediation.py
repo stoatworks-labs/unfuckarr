@@ -12,7 +12,7 @@ import pytest
 from unfuckarr import db, recycle, transcode
 from unfuckarr.checks import CheckResult, Finding
 from unfuckarr.clients.arr import ArrClient
-from unfuckarr.probe import probe
+from unfuckarr.probe import MediaInfo, Stream, probe
 from unfuckarr.remediation import Decision, Remediator
 from unfuckarr.scanner import check_file
 
@@ -44,6 +44,91 @@ def test_plan_re_encodes_a_bad_video_codec(video_factory, settings):
     result.add(Finding("compat", "bad_video_codec", "error", ""))
     p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
     assert p.video_action == "encode"
+
+
+def _two_audio(defaults: tuple[bool, bool]) -> MediaInfo:
+    """A 5.1 main track and a 2.0 commentary, built without ffmpeg because
+    the question is what the planner does with the dispositions, not whether
+    ffmpeg can mux them."""
+    return MediaInfo(
+        path="/media/x.mkv", input_url="/media/x.mkv", container="mkv",
+        duration=3600.0, size=6_000_000_000,
+        streams=[
+            Stream(index=0, codec_type="video", codec_name="h264",
+                   width=1920, height=1080, fps=25.0),
+            Stream(index=1, codec_type="audio", codec_name="ac3", channels=6,
+                   language="eng", is_default=defaults[0]),
+            Stream(index=2, codec_type="audio", codec_name="ac3", channels=2,
+                   language="eng", is_default=defaults[1]),
+        ],
+    )
+
+
+def test_multiple_default_audio_is_actually_fixed(settings):
+    """It sat next to `no_default_audio` in the hygiene check and nowhere in
+    the planner, so the remux copied both flags through and the finding
+    survived every time. Live 2026-08-26: 33 of 39 `transcode_did_not_fix`
+    events in nine hours were this one code."""
+    info = _two_audio((True, True))
+    result = CheckResult(path=info.path)
+    result.add(Finding("hygiene", "multiple_default_audio", "warning", ""))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    assert p.set_default_audio == 0        # the 5.1 track, not the commentary
+    cmd = transcode.build_command(info.path, "/tmp/out.mkv", info, p,
+                                  settings.transcode)
+    assert ["-disposition:a:0", "default"] == cmd[cmd.index("-disposition:a:0"):
+                                                  cmd.index("-disposition:a:0") + 2]
+    assert ["-disposition:a:1", "0"] == cmd[cmd.index("-disposition:a:1"):
+                                            cmd.index("-disposition:a:1") + 2]
+
+
+def test_multiple_default_audio_chooses_among_the_flagged_tracks(settings):
+    """Only the ambiguity needs settling. Promoting a track the file never
+    marked default is a different decision, and not one the finding asked for."""
+    info = _two_audio((False, True))    # only the 2.0 commentary is default
+    result = CheckResult(path=info.path)
+    result.add(Finding("hygiene", "multiple_default_audio", "warning", ""))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    assert p.set_default_audio == 1
+
+
+def test_all_subtitles_forced_is_cleared(settings):
+    info = MediaInfo(
+        path="/media/x.mkv", input_url="/media/x.mkv", container="mkv",
+        duration=3600.0, size=6_000_000_000,
+        streams=[
+            Stream(index=0, codec_type="video", codec_name="h264",
+                   width=1920, height=1080, fps=25.0),
+            Stream(index=1, codec_type="audio", codec_name="ac3", channels=6,
+                   language="eng", is_default=True),
+            Stream(index=2, codec_type="subtitle", codec_name="subrip",
+                   language="eng", is_forced=True),
+            Stream(index=3, codec_type="subtitle", codec_name="subrip",
+                   language="fre", is_forced=True),
+        ],
+    )
+    result = CheckResult(path=info.path)
+    result.add(Finding("hygiene", "all_subtitles_forced", "warning", ""))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    assert p.clear_forced_subtitles
+    cmd = transcode.build_command(info.path, "/tmp/out.mkv", info, p,
+                                  settings.transcode)
+    assert "-disposition:s:0" in cmd and "-disposition:s:1" in cmd
+
+
+def test_every_fixable_code_is_one_the_planner_acts_on(settings):
+    """`decide` flags a hygiene warning whose code is not in HYGIENE_FIXABLE
+    rather than rewriting the file for nothing. If a code is listed here and
+    the planner does nothing with it, that promise is broken silently and the
+    pointless remuxes come straight back."""
+    info = _two_audio((True, True))
+    info.streams.append(Stream(index=3, codec_type="subtitle",
+                               codec_name="subrip", is_forced=True))
+    for code in transcode.HYGIENE_FIXABLE:
+        p = transcode.TranscodePlan(reason="t")
+        transcode.apply_hygiene_fixes(p, info, {code})
+        assert (p.fix_language_tags or p.set_default_audio is not None
+                or p.clear_forced_subtitles), code
 
 
 @needs_ffmpeg

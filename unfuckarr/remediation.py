@@ -171,6 +171,19 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
                             "the work — converting it to Matroska would fix "
                             "both",
                             [f.code for f in warnings])
+        if action == "transcode" and not (
+                {f.code for f in warnings} & transcode.HYGIENE_FIXABLE):
+            # Nothing here has a fix behind it. Sending the file to the
+            # transcoder anyway builds a plan with no metadata work in it,
+            # which collapses to a stream-copy remux: every byte rewritten,
+            # the original recycled, and the same warning waiting on the far
+            # side. `_confirm_fixed` then counts it as a failed attempt
+            # (invariant 9) and it happens a second time before the file is
+            # given up on for good. Say so once instead.
+            return Decision("flag",
+                            "nothing a rewrite can change — these describe "
+                            "how the file was made, not how it was muxed",
+                            [f.code for f in warnings])
         if action != "none":
             return Decision(action, "stream metadata needs tidying",
                             [f.code for f in warnings])
@@ -753,10 +766,6 @@ class Remediator:
             # hygiene tidying rides along for free rather than being left for
             # a second full pass later.
             codes = {f.code for f in result.findings}
-            default_audio = None
-            if "no_default_audio" in codes and info.audio:
-                best = max(info.audio, key=lambda a: (a.channels, -a.index))
-                default_audio = info.audio.index(best)
             plan = transcode.TranscodePlan(
                 reason="shrink",
                 video_action="encode",
@@ -769,10 +778,8 @@ class Remediator:
                 faststart=s.transcode.container == "mp4",
                 drop_subtitles=transcode._subtitles_to_drop(
                     info, s.transcode.container),
-                fix_language_tags=bool(codes & {"audio_missing_language",
-                                                "subtitle_missing_language"}),
-                set_default_audio=default_audio,
             )
+            transcode.apply_hygiene_fixes(plan, info, codes)
             dst = transcode.output_path(path, plan.container)
             if not transcode.free_space_ok(dst, qplan.projected_size):
                 self._cancel.pop(path, None)

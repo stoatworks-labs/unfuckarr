@@ -60,6 +60,31 @@ def test_hygiene_never_deletes(settings):
         config.Policy(hygiene_action="redownload")
 
 
+def test_hygiene_with_no_fix_behind_it_is_flagged_not_remuxed(settings):
+    """`image_subtitles_only` describes how the file was made. The transcoder
+    has no step that changes it, so the plan collapses to a stream copy: every
+    byte rewritten, the original recycled, the same warning on the far side,
+    and `_confirm_fixed` counting a failed attempt. Live 2026-08-26 that was
+    240 files given up on and 2,733 more queued behind them."""
+    settings.policy.hygiene_action = "transcode"
+    r = CheckResult(path="/media/x.mkv")
+    r.add(Finding("hygiene", "image_subtitles_only", "warning", ""))
+    r.add(Finding("hygiene", "very_low_bitrate", "warning", ""))
+    d = decide(r, settings)
+    assert d.action == "flag"
+    assert set(d.findings) == {"image_subtitles_only", "very_low_bitrate"}
+
+
+def test_one_fixable_warning_still_earns_the_transcode(settings):
+    """The unfixable ones must not veto a rewrite that has real work in it —
+    the remux is already paid for, so the tidying rides along."""
+    settings.policy.hygiene_action = "transcode"
+    r = CheckResult(path="/media/x.mkv")
+    r.add(Finding("hygiene", "image_subtitles_only", "warning", ""))
+    r.add(Finding("hygiene", "multiple_default_audio", "warning", ""))
+    assert decide(r, settings).action == "transcode"
+
+
 def test_clean_file_produces_no_action(settings):
     assert decide(CheckResult(path="/media/ok.mkv"), settings).action == "none"
 
