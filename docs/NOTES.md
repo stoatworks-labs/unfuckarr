@@ -723,7 +723,36 @@ Live config: English profile on all 660 items, `ignore_pgs_subs` and `ignore_vob
 (this is what stops Bazarr counting the PGS track as "has subtitles" and skipping the file).
 ⚠️ There is **no `ignore_dvb_subs`**, so the 24 DVB files stay flagged whatever Bazarr does.
 
-⚠️ **Wanted is 692 (505 episodes + 187 movies), not 2,611**, and the gap is not yet explained —
-possibly `use_embedded_subs: true` still suppressing some. Watch it before concluding anything.
-OpenSubtitles' free tier is a few downloads a day, so this drips over weeks; it is not an
-overnight fix.
+### CORRECTION, same day: both of my cautions above were wrong
+
+**"Wanted is 692 and the gap is unexplained"** — it was simply a partially-completed index. Once
+`series_full_scan_subtitles` finished, episodes wanted went to **5,759**. Nothing was suppressing
+anything. Do not read a wanted count while an index task is still running.
+
+**"OpenSubtitles' free tier means this drips over weeks"** — wrong, and wrong because I reasoned
+from one provider instead of looking at which one was actually serving. Measured over one
+afternoon: **2,365 episode subtitles downloaded, and 500 of 500 sampled came from `gestdown`**.
+
+⚠️ **The TV/film asymmetry is structural, not a fault, and it is the thing to understand here:**
+
+| provider | covers | practical yield on this library |
+|---|---|---|
+| `gestdown` (Addic7ed) | **TV only** | effectively unlimited — 2,365 in an afternoon |
+| `yifysubtitles` | **films only** | indexed by *YIFY releases*; this library is Bluray Remux / WEBDL, so it rarely matches |
+| `opensubtitlescom` | both | the rate-limited one |
+| `subsource` | both | matched little |
+
+So TV clears fast and films crawl: **2,365 episodes against 19 films**. Not fixable by
+configuration. Films need either an OpenSubtitles.com VIP account (~1,000/day instead of a
+handful) or another film-capable provider. Keep it in proportion — films are 343 files of 18,400
+and only 174 still want subtitles.
+
+### What it actually achieved, measured
+
+**706 files cleared in a single scan** — `image_subtitles_only` went **2,611 → 1,905** with
+nothing rewritten, nothing transcoded and nothing recycled. The finding stopped being true.
+
+⚠️ **A finding only re-evaluates when the file is re-checked.** Subtitles that land *during* a
+scan clear on the **next** one, not the running one — so `image_subtitles_only` sitting still
+mid-scan is expected, not stalled. At the time of writing **245 of the 1,905 still-open ones
+already have a sidecar on disk** and are waiting for the next pass.
