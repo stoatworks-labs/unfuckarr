@@ -19,7 +19,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from collections.abc import Iterable
+from typing import Any, Callable
 
 from . import governor as governor_mod
 from .checks import CheckResult
@@ -248,6 +249,38 @@ HYGIENE_FIXABLE = frozenset({
     "multiple_default_audio",
     "all_subtitles_forced",
 })
+
+# The compat codes `plan` consumes, in the order it reads them: the video set,
+# the audio set, and the container set. Kept beside the hygiene set because
+# `decide` has to answer the same question about both — is there any work here
+# — and it cannot answer it by building a plan, being a pure function of the
+# result and the policy with no `MediaInfo` to hand.
+COMPAT_ACTIONABLE = frozenset({
+    "bad_video_codec", "video_codec_not_in_profile", "high_bit_depth",
+    "resolution_too_high", "unusual_pixel_format",
+    "bad_audio_codec", "mixed_audio_support",
+    "bad_container", "container_not_in_profile", "no_faststart",
+})
+
+
+def plan_has_work(findings: Iterable[Any]) -> bool:
+    """Whether a plan built from these findings would do anything.
+
+    `plan` reads `{f.code for f in result.findings}` — *every* finding, not
+    just the errors — so this has to as well. Getting that wrong flags a file
+    the transcoder could genuinely have fixed: measured live 2026-08-27 on an
+    X-Files remux where Emby refused without reasons and the only actionable
+    code was `mixed_audio_support`, which is a warning.
+    """
+    for f in findings:
+        code = getattr(f, "code", None)
+        if code in COMPAT_ACTIONABLE or code in HYGIENE_FIXABLE:
+            return True
+        # Emby naming the offending stream is work in itself: `plan` turns
+        # those reasons into a video encode or an audio re-encode.
+        if code == "no_direct_play" and (getattr(f, "data", None) or {}).get("reasons"):
+            return True
+    return False
 
 
 def apply_hygiene_fixes(p: TranscodePlan, info: MediaInfo,

@@ -521,3 +521,23 @@ amount of actual transcoding falls.
 ⚠️ Watch the abort brake on the first scan after the mapping change: files Emby refuses carry an
 **error**-severity finding, so they count as failures in the ratio, and `abort_if_failure_ratio_over`
 is 0.5.
+
+### Same day, caught on the live box: the guard was reading the wrong list
+
+The first cut of the invariant-22 guards asked whether the *errors* contained anything
+actionable. `plan` builds its `codes` from **`result.findings`** — every finding, whatever the
+severity — so the guards and the planner were reading two different lists.
+
+Found by rechecking a real file rather than trusting the unit tests: an X-Files Blu-ray remux
+that Emby refused without reasons, whose only actionable code was **`mixed_audio_support`** — a
+*warning*. The guard saw compat errors of `[no_direct_play]` alone and flagged it, while `plan`
+would have re-encoded the audio and fixed it. Under-acting instead of over-acting, but wrong the
+same way.
+
+Both guards now call `transcode.plan_has_work(result.findings)`, which is the single answer to
+"would a plan built from this do anything" — `COMPAT_ACTIONABLE`, `HYGIENE_FIXABLE`, or a
+`no_direct_play` that actually named its reasons. `decide` cannot simply build the plan and look:
+it is deliberately a pure function of the result and the policy, with no `MediaInfo` to hand.
+
+**Worth keeping:** the unit tests all passed on the broken version, because every one of them used
+an *error*-severity finding. The live recheck is what found it.
