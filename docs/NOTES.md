@@ -623,3 +623,50 @@ whatever its status is called — and a status added later cannot silently reope
 version *and* on the version before it. Both of these were found by watching real work on real
 media — the first by rechecking a file by hand, this one by watching a scan actually run. The
 regression test was checked against the old logic (`assert 1 == 0`) before being trusted.
+
+### Scan 23's final tally, and the deploy that ended it
+
+Cut short at 59 actions by the recreate that deployed PR #12 — the restart is the only thing that
+stops a scan (`/api/scan/stop` sets `aborted` but `pool.map` has already submitted every future).
+What it managed first:
+
+| | |
+|---|---|
+| checked | 8,088 / 8,088 |
+| transcode_done | **29** |
+| transcode_did_not_fix | **1** — and that one was the `unmeasured` false negative, now fixed |
+| transcode_failed | 1 — `pcm_bluray` into Matroska, pre-existing, see below |
+| shrink_done | 13 (shrink total now 700 files / 3.56 TB) |
+| shrink_failed | 1 — the VAAPI `-38` again, source untouched |
+| destructive actions | **none** |
+| abort brake | held |
+
+So **effectively 0 real did-not-fix out of 29**, against 44% (39 of 88) before the work.
+
+`de18d2d` is live and all four fixes verified inside the running container (`_confirm_fixed`'s
+status allowlist gone, `apply_hygiene_fixes`, `plan_has_work`, `_verdict_without_reasons`).
+
+**`Licence to Kill` needs no counter repair** — it sits at `fix_attempts` 1, which still has an
+attempt left, and the next scan's re-check will now pass. It was the only file that hit the
+`unmeasured` false negative.
+
+⚠️ **`max_actions_per_scan` is still 300**, set by hand for the manual run and NOT put back to
+100000. Scan 23's remediation was killed at 59, so a full 300-action pass under the corrected Emby
+mapping has still never been observed — and that mapping moved ~1,300 files into `incompatible`,
+all of which now queue transcodes. Leave it at 300 for at least one scheduled scan.
+
+### Two pre-existing failures, both chipped rather than fixed here
+
+- **VAAPI `Function not implemented` (-38)** on shrink, ~1/day since at least 08-24, on an entirely
+  ordinary file (1080p yuv420p 8-bit H.264 High, 25 fps, stereo) — so not a format edge case.
+  ⚠️ NOTES records that same string as the signature of a *different*, already-fixed bug; check the
+  built command carries neither `hwaccel_output_format` nor `scale_vaapi` before calling it a
+  regression. Leading hypothesis: two VAAPI sessions colliding on `/dev/dri/renderD128` — the
+  continuous shrink worker and scan-triggered transcodes both encode, and `transcode.max_concurrent`
+  is 1 but may not cover the shrink worker.
+- **`pcm_bluray` cannot go into Matroska.** `plan` has `_subtitles_to_drop`/`CONTAINER_SUBTITLES` to
+  stop it copying an unmuxable *subtitle* codec, and **no equivalent for audio** — so the remux
+  copies it through and ffmpeg refuses to write the header. Measured: **11 files** carry
+  `pcm_bluray`. 77 carry some `pcm*`, but `pcm_s16le` (31) and `pcm_s24le` (36) are legal in
+  Matroska — do not "fix" those. Audio is not optional the way a subtitle track is, so the answer is
+  to force `audio_action="encode"`, not to drop the track.
