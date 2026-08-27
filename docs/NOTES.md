@@ -541,3 +541,41 @@ it is deliberately a pure function of the result and the policy, with no `MediaI
 
 **Worth keeping:** the unit tests all passed on the broken version, because every one of them used
 an *error*-severity finding. The live recheck is what found it.
+
+## 2026-08-27: deployed — hygiene fix, Emby mapping, counters reset
+
+PRs **#7, #8, #9, #10 merged**; `unfk` rebuilt from `:edge` (`52472a0`) and recreated twice — once
+for #7/#9 and again for #10, which the first deploy is what found. Backup at
+`/root/unfk-backup-pre-hygiene-2026-08-27/` (config + db + **-wal** + -shm + inspect).
+
+**A shallow clone now lives at `/mnt/user/appdata/.unfk-build`** and `/root/recreate-unfk.sh` names
+it in the rebuild recipe. It is on the cache pool deliberately: `/root` is a RAM disk and does not
+survive a reboot. Rebuild is `git fetch --depth 1 origin main && git reset --hard origin/main`,
+then the usual `docker build -f docker/makemkv/Dockerfile -t unfuckarr-makemkv:edge .`. The
+makemkv image's only build-context dependency is `docker/makemkv/makemkvcon-wrapper.sh`.
+
+**Counters:** 28 files at `fix_attempts` 2 whose open findings are now fixable
+(`multiple_default_audio` / `all_subtitles_forced`) were reset to 0 with the container **stopped**
+— hygiene-at-cap went 269 → 241. Do it stopped: `sqlite3` as root on a live DB leaves `-wal` /
+`-shm` owned by root and the app then cannot write. `PRAGMA wal_checkpoint(TRUNCATE)` first, and
+`chown nobody:users` after if root touched anything. The remaining 241 are genuinely unfixable and
+are now *flagged*, so the counter no longer matters for them.
+
+**Emby mapping corrected** to the single row `/mnt/user/media` → `/media`. `not_in_emby` is gone.
+
+Verified on the live instance after deploy, by rechecking real files with `act=false`:
+
+| file | codes | decision |
+|---|---|---|
+| AVI / mpeg4 ASP | `no_direct_play`, `bad_container`, `bad_video_codec` | transcode |
+| X-Files remux | `no_direct_play`, `mixed_audio_support`, `image_subtitles_only` | transcode |
+| The Night Manager 2160p | `multiple_default_audio`, `hdr_not_shrunk` | transcode — "stream metadata needs tidying" |
+| 8 Mile Remux-2160p | `image_subtitles_only`, `hdr_not_shrunk` | **flag** — "nothing a rewrite can change" |
+
+Both directions, on real media: what can be fixed is fixed, what cannot is said plainly once.
+
+⚠️ **`policy.max_actions_per_scan` is 100000** — effectively unlimited, and it was 50 until
+recently. The next scheduled scan is the first to run under both that and the corrected Emby
+mapping, so it is also the first that could act on the ~1,300 files whose compat verdict just
+changed. `abort_if_failure_ratio_over` (0.5) is the only remaining brake, and Emby's refusals are
+**error**-severity, so they count as failures in that ratio. Watch scan 23.
