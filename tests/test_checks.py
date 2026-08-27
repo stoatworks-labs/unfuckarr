@@ -271,3 +271,96 @@ def test_disabled_checks_produce_nothing(settings):
 def test_probe_error_on_missing_binary(tmp_path):
     with pytest.raises(ProbeError):
         probe(tmp_path / "nope.mkv", ffprobe="/definitely/not/ffprobe")
+
+
+# -- sidecar subtitles ----------------------------------------------------
+
+def _pgs_only(path):
+    from unfuckarr.probe import MediaInfo, Stream
+    return MediaInfo(
+        path=str(path), input_url=str(path), container="mkv",
+        duration=3600.0, size=6_000_000_000,
+        streams=[
+            Stream(index=0, codec_type="video", codec_name="h264",
+                   width=1920, height=1080, fps=25.0),
+            Stream(index=1, codec_type="audio", codec_name="ac3", channels=6,
+                   language="eng", is_default=True),
+            Stream(index=2, codec_type="subtitle",
+                   codec_name="hdmv_pgs_subtitle", language="eng"),
+        ],
+    )
+
+
+def test_image_subtitles_only_fires_without_a_sidecar(tmp_path, settings):
+    from unfuckarr.checks.hygiene import check as hygiene_check
+    media = tmp_path / "Film (1999) Bluray-1080p.mkv"
+    media.write_bytes(b"x")
+    r = CheckResult(path=str(media))
+    hygiene_check(_pgs_only(media), settings.hygiene, r)
+    assert "image_subtitles_only" in {f.code for f in r.findings}
+
+
+def test_a_text_sidecar_clears_image_subtitles_only(tmp_path, settings):
+    """PGS is flagged because Emby must burn it in, which forces a video
+    transcode. A text sidecar removes that need, so the finding is not true —
+    and this is what makes Bazarr's work visible to the scanner."""
+    from unfuckarr.checks.hygiene import check as hygiene_check
+    media = tmp_path / "Film (1999) Bluray-1080p.mkv"
+    media.write_bytes(b"x")
+    (tmp_path / "Film (1999) Bluray-1080p.en.srt").write_text("1\n")
+    r = CheckResult(path=str(media))
+    hygiene_check(_pgs_only(media), settings.hygiene, r)
+    assert "image_subtitles_only" not in {f.code for f in r.findings}
+
+
+def test_a_sidecar_for_a_different_file_does_not_count(tmp_path, settings):
+    """Same folder, different episode. The stem has to match or one subtitled
+    episode would clear the whole season."""
+    from unfuckarr.checks.hygiene import check as hygiene_check
+    media = tmp_path / "Film (1999) Bluray-1080p.mkv"
+    media.write_bytes(b"x")
+    (tmp_path / "Other Film (2001) Bluray-1080p.en.srt").write_text("1\n")
+    r = CheckResult(path=str(media))
+    hygiene_check(_pgs_only(media), settings.hygiene, r)
+    assert "image_subtitles_only" in {f.code for f in r.findings}
+
+
+def test_an_image_sidecar_does_not_count(tmp_path, settings):
+    """A .sup beside the file is the same problem in another wrapper."""
+    from unfuckarr.checks.hygiene import check as hygiene_check
+    media = tmp_path / "Film (1999) Bluray-1080p.mkv"
+    media.write_bytes(b"x")
+    (tmp_path / "Film (1999) Bluray-1080p.en.sup").write_text("x")
+    r = CheckResult(path=str(media))
+    hygiene_check(_pgs_only(media), settings.hygiene, r)
+    assert "image_subtitles_only" in {f.code for f in r.findings}
+
+
+def test_concurrent_lookups_in_different_directories_stay_correct(tmp_path):
+    """The scanner probes on a pool, so the directory cache is used
+    concurrently. This asserts the answers stay right under that; it does not
+    assert the cache is thread-local, because a global one would also answer
+    correctly — being thread-local is about not evicting each other, which is
+    throughput, not correctness."""
+    import threading
+    from unfuckarr.checks.hygiene import has_text_sidecar
+
+    a = tmp_path / "A"; a.mkdir()
+    b = tmp_path / "B"; b.mkdir()
+    (a / "Film.mkv").write_bytes(b"x")
+    (a / "Film.en.srt").write_text("1\n")
+    (b / "Film.mkv").write_bytes(b"x")          # no sidecar
+
+    results = {}
+    barrier = threading.Barrier(2)
+
+    def run(key, path):
+        barrier.wait()
+        for _ in range(40):
+            results[key] = has_text_sidecar(str(path))
+
+    t1 = threading.Thread(target=run, args=("a", a / "Film.mkv"))
+    t2 = threading.Thread(target=run, args=("b", b / "Film.mkv"))
+    t1.start(); t2.start(); t1.join(); t2.join()
+    assert results["a"] is True
+    assert results["b"] is False

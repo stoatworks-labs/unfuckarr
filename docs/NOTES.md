@@ -670,3 +670,60 @@ all of which now queue transcodes. Leave it at 300 for at least one scheduled sc
   `pcm_bluray`. 77 carry some `pcm*`, but `pcm_s16le` (31) and `pcm_s24le` (36) are legal in
   Matroska — do not "fix" those. Audio is not optional the way a subtitle track is, so the answer is
   to force `audio_action="encode"`, not to drop the track.
+
+## 2026-08-27: subtitles — Bazarr, and teaching the check to see sidecars
+
+`image_subtitles_only` was written off as unfixable (invariant 22 flags it rather than remuxing).
+That was right about *rewriting* and wrong about the problem: the fix is to **get a text subtitle**,
+which is Bazarr's job, not unfuckarr's. Measured across the 2,611 flagged files: **2,564 PGS, 23
+VOBSUB, 24 DVB**, and **zero** had a sidecar of any kind.
+
+**unfuckarr's half:** `image_subtitles_only` no longer fires when a text sidecar sits beside the
+media. Without this the finding would survive every subtitle Bazarr ever downloads — Emby happily
+serves an external `.srt` and never burns in the PGS, so the finding simply is not true any more.
+Stem-matched, so one subtitled episode does not clear a season; `.sup` correctly does not count.
+Verified against Bazarr's real output names (`.en.srt`, `.en.hi.srt`, `.en.forced.srt`, `.srt`)
+with `subfolder: current`, which writes beside the media.
+
+The directory listing is cached **thread-locally** — for throughput, not correctness. A global
+cache would answer correctly (the `cached[0] != parent` guard rebuilds on a miss) but two pool
+threads in different directories would evict each other on every call. ⚠️ Deliberately **not** an
+`lru_cache`: a scan runs for hours and Bazarr writes sidecars while it does, so an entry that
+outlived its directory would hide a subtitle that had just arrived.
+
+### ⚠️ Bazarr's config file is NOT the place to change Bazarr's config
+
+`bazarr` (lscr.io/linuxserver/bazarr, host port 6767, appdata `/mnt/user/appdata/bazarr`).
+Editing `config/config.yaml` **does not work** — Bazarr rewrites it from its own state on startup,
+so a stopped-container edit is silently discarded. Use `POST /api/system/settings` with
+form keys like `settings-sonarr-ip`; those persist. The API key is under `auth:` in that file.
+
+**And do not read that file with a regex either.** Keys like `ip`, `port` and `ssl` appear in
+several sections, so a first-match regex reports another section's values — that is how these
+notes nearly recorded "no providers configured" when four were, and `use_sonarr: false` when it
+was true. `GET /api/system/settings` is authoritative.
+
+**What was actually broken:** `radarr.ip` was `https://radarr.tail745ddc.ts.net` — the Address
+field takes a **hostname**, and Bazarr builds `{scheme}://{ip}:{port}`, so it dialled
+`https://https://radarr...:7878`. Both services were also pointed at tailnet hostnames with the
+app's own port, and those names are fronted by `tailscale serve` on **443** —
+`https://sonarr.tail745ddc.ts.net:8989` answers nothing. Bazarr is on the same Docker host, so it
+now uses `sonarr:8989` / `radarr:7878`, ssl off. (Unraid's default bridge *does* resolve container
+names — worth knowing, it is not true of a stock Docker bridge.)
+
+**Two API traps, both of which return success while doing nothing:**
+- A language profile injected after startup must carry **`audio_only_include`**. `database.py`'s
+  migration adds it at boot, so a profile created through the API never gets it, and the subtitle
+  indexer then throws `'audio_only_include'` on every assignment — HTTP 500.
+- `POST /api/series` takes **`seriesid` and `profileid` as parallel lists**, one profile id per
+  series id (movies: `radarrid`). Sending `id=` plus a single `profileid` parses to two empty
+  lists, and the loop does nothing — **HTTP 204, zero rows changed**.
+
+Live config: English profile on all 660 items, `ignore_pgs_subs` and `ignore_vobsub_subs` true
+(this is what stops Bazarr counting the PGS track as "has subtitles" and skipping the file).
+⚠️ There is **no `ignore_dvb_subs`**, so the 24 DVB files stay flagged whatever Bazarr does.
+
+⚠️ **Wanted is 692 (505 episodes + 187 movies), not 2,611**, and the gap is not yet explained —
+possibly `use_embedded_subs: true` still suppressing some. Watch it before concluding anything.
+OpenSubtitles' free tier is a few downloads a day, so this drips over weeks; it is not an
+overnight fix.
