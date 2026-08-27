@@ -231,3 +231,35 @@ def test_the_counters_survive_a_prune():
 
     assert db.q1("SELECT COUNT(*) n FROM jobs")["n"] == 1
     assert db.totals()["files_fixed"] == 5
+
+
+def test_shrinks_from_before_the_counters_existed_are_recovered(tmp_path):
+    """A header reading "0 saved" on a system that has reclaimed terabytes is
+    the exact lie these counters exist to prevent. Measured on the live
+    instance the day they shipped: 386 files and 2.27 TB, reported as nothing.
+    """
+    db.ex("INSERT INTO files (path, size, shrunk, shrunk_from) VALUES (?,?,?,?)",
+          ("/media/a.mkv", 1_000, 111.0, 4_000))
+    db.ex("INSERT INTO files (path, size, shrunk, shrunk_from) VALUES (?,?,?,?)",
+          ("/media/b.mkv", 2_000, 222.0, 5_000))
+    # Never shrunk, and a shrink with no recorded "before" — neither can be counted.
+    db.ex("INSERT INTO files (path, size) VALUES (?,?)", ("/media/c.mkv", 9_000))
+    db.ex("INSERT INTO files (path, size, shrunk) VALUES (?,?,?)",
+          ("/media/d.mkv", 8_000, 333.0))
+
+    db._backfill_totals(db.connect())
+    assert db.totals() == {"files_shrunk": 2, "bytes_saved": 6_000}
+
+    # Runs once: a second pass must not double the saving.
+    db._backfill_totals(db.connect())
+    assert db.totals() == {"files_shrunk": 2, "bytes_saved": 6_000}
+
+
+def test_backfill_leaves_what_it_cannot_know_alone():
+    """Repairs, deletions and redownloads have no per-file record — jobs and
+    activity are both pruned — so they start at zero rather than at a guess."""
+    db.ex("INSERT INTO files (path, size, shrunk, shrunk_from) VALUES (?,?,?,?)",
+          ("/media/a.mkv", 1_000, 111.0, 4_000))
+    db._backfill_totals(db.connect())
+    assert "files_fixed" not in db.totals()
+    assert "redownloads" not in db.totals()

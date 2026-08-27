@@ -182,6 +182,42 @@ def init() -> None:
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {spec}")
     conn.commit()
+    _backfill_totals(conn)
+
+
+def _backfill_totals(conn: sqlite3.Connection) -> None:
+    """Seed the shrink counters from work done before they existed.
+
+    The counters are written as things happen, so on an install that has been
+    running for months they start at zero — and a header reading "0 saved" on a
+    system that has genuinely reclaimed terabytes is exactly the lie they were
+    added to prevent. Measured on the live instance the day they shipped: 386
+    files shrunk and 2.27 TB reclaimed, all of it reported as nothing.
+
+    Only these two can be recovered, and only because `files.shrunk` and
+    `files.shrunk_from` are per-file and permanent. Repairs, deletions and
+    redownloads have no such record — `jobs` and `activity` are both pruned —
+    so they start from zero and say so by being absent rather than wrong.
+
+    Runs once: the guard is the counter's own existence, so a later run adds
+    nothing and a counter reset is not silently undone.
+    """
+    seeded = conn.execute(
+        "SELECT 1 FROM totals WHERE name = 'files_shrunk'").fetchone()
+    if seeded:
+        return
+    row = conn.execute(
+        "SELECT COUNT(*) n, COALESCE(SUM(shrunk_from - size), 0) saved "
+        "FROM files WHERE shrunk IS NOT NULL AND shrunk_from IS NOT NULL"
+    ).fetchone()
+    if not row or not row["n"]:
+        return
+    conn.execute("INSERT OR IGNORE INTO totals (name, value) VALUES ('files_shrunk', ?)",
+                 (int(row["n"]),))
+    conn.execute("INSERT INTO totals (name, value) VALUES ('bytes_saved', ?) "
+                 "ON CONFLICT(name) DO UPDATE SET value = value + excluded.value",
+                 (int(row["saved"]),))
+    conn.commit()
 
 
 def reset_for_tests(path: Path) -> None:
