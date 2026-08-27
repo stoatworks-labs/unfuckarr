@@ -8,12 +8,62 @@ flags them.
 
 from __future__ import annotations
 
+import os
+import threading
+
 from ..config import HygieneConfig
 from ..probe import MediaInfo
 from . import CheckResult, Finding
 
 # ffprobe leaves these in place of a real ISO 639 tag.
 UNKNOWN_LANGS = {"", "und", "unknown", "none", "zxx"}
+
+# Text subtitle files that live beside the media rather than inside it. Emby
+# serves these as a separate stream, so they cost nothing — which is the whole
+# point: `image_subtitles_only` fires because PGS/VOBSUB must be *burned in*,
+# and burning in forces a video transcode. A text sidecar removes that need
+# entirely, so the finding is not true any more.
+SIDECAR_SUBTITLE_EXTS = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".smi"}
+
+# One `os.listdir` per directory rather than a glob per file: a season folder
+# holds ~20 episodes and a scan walks them consecutively, so caching a single
+# directory turns 20 listings into 1.
+#
+# Thread-local, for throughput rather than correctness: a module-global would
+# still answer correctly (the `cached[0] != parent` guard rebuilds on a miss,
+# and the tuple swap is atomic), but the scanner probes on a pool, so two
+# threads in different directories would evict each other on every call and the
+# cache would earn nothing. One entry per thread keeps the locality.
+#
+# Deliberately not an `lru_cache`: a scan runs for hours and Bazarr writes
+# sidecars while it does, so an entry that outlived its directory would hide a
+# subtitle that had just arrived.
+_local = threading.local()
+
+
+def has_text_sidecar(path: str) -> bool:
+    """Whether a text subtitle file sits beside this media file.
+
+    Matches `Film.srt`, `Film.en.srt`, `Film.en.forced.srt` — anything sharing
+    the media file's stem and carrying a text subtitle extension.
+    """
+    parent = os.path.dirname(path)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if not parent or not stem:
+        return False
+    cached = getattr(_local, "dir_cache", None)
+    if cached is None or cached[0] != parent:
+        try:
+            cached = (parent, set(os.listdir(parent)))
+        except OSError:
+            cached = (parent, set())
+        _local.dir_cache = cached
+    for name in cached[1]:
+        if not name.startswith(stem + "."):
+            continue
+        if os.path.splitext(name)[1].lower() in SIDECAR_SUBTITLE_EXTS:
+            return True
+    return False
 
 
 def check(info: MediaInfo, cfg: HygieneConfig, result: CheckResult) -> None:
@@ -47,7 +97,9 @@ def check(info: MediaInfo, cfg: HygieneConfig, result: CheckResult) -> None:
 
     subs = info.subtitles
     if subs:
-        if cfg.flag_image_subtitles_only and all(s.is_image_subtitle for s in subs):
+        if (cfg.flag_image_subtitles_only
+                and all(s.is_image_subtitle for s in subs)
+                and not has_text_sidecar(info.path)):
             result.add(Finding(
                 "hygiene", "image_subtitles_only", "warning",
                 "only image-based subtitles (PGS/VOBSUB) — Emby must burn them in, "
