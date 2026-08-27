@@ -131,6 +131,35 @@ def test_every_fixable_code_is_one_the_planner_acts_on(settings):
                 or p.clear_forced_subtitles), code
 
 
+def test_local_table_runs_when_emby_refuses_without_reasons(settings, monkeypatch):
+    """The fallback that makes the verdict actionable. Without it a refusal
+    with no reasons produces `video_action == "copy"` and a stream copy."""
+    from unfuckarr import scanner as scanner_mod
+
+    info = _two_audio((True, False))
+    info.container = "avi"
+    info.streams[0].codec_name = "mpeg4"
+
+    class StubEmby:
+        def check_direct_play(self, path, cfg, result):
+            result.add(Finding("emby", "no_direct_play", "error", "",
+                               {"reasons": []}))
+            return True
+
+    def fake_integrity(path, cfg, **kw):
+        return CheckResult(path=path), info
+    monkeypatch.setattr(scanner_mod.integrity_checks, "check", fake_integrity)
+
+    settings.emby.enabled = True
+    settings.emby.use_playback_info = True
+    result, _ = scanner_mod.check_file(info.path, settings, emby=StubEmby())
+    codes = {f.code for f in result.findings}
+    assert "no_direct_play" in codes
+    assert "bad_video_codec" in codes, codes
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    assert p.video_action == "encode"
+
+
 @needs_ffmpeg
 def test_repair_plan_never_re_encodes(video_factory, settings):
     path = video_factory("r.mkv", seconds=6)
