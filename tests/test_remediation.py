@@ -384,6 +384,41 @@ def test_output_missing_at_verify_counts_attempts_and_stops(
 
 
 @needs_ffmpeg
+def test_a_fixed_file_the_efficiency_check_has_not_priced_is_not_a_failure(
+        video_factory, settings, monkeypatch):
+    """A transcode output is a brand new file, so `checks/efficiency` has not
+    measured it and the re-check comes back `unmeasured`. That is a state, not
+    a claim (invariant 14) — the findings are gone and the repair worked. The
+    old status allowlist `("ok", "hygiene")` called it a failed attempt, and
+    two of those write off a file that was never broken.
+
+    Live proof 2026-08-27: Licence to Kill, `status: unmeasured`,
+    `findings: []`, logged as `transcode_did_not_fix`."""
+    from unfuckarr import scanner as scanner_mod
+    real_check = scanner_mod.check_file
+
+    def unpriced(p, s, **kw):
+        result, info = real_check(p, s, **kw)
+        result.add(Finding("efficiency", "not_measured", "info", ""))
+        return result, info
+    monkeypatch.setattr(scanner_mod, "check_file", unpriced)
+
+    path = video_factory("priced.mkv", seconds=6)
+    db.ex("INSERT INTO files (path, title) VALUES (?,?)", (str(path), "Priced"))
+    rem = Remediator(lambda: settings)
+
+    result, info = check_file(str(path), settings)
+    result.add(Finding("compat", "bad_container", "error", ""))
+    row = {"path": str(path), "source": "folder", "title": "Priced",
+           "arr_id": None, "arr_parent_id": None, "fix_attempts": 0}
+    out = rem.apply(row, result, info,
+                    Decision("transcode", "incompatible", ["bad_container"]))
+    assert out["ok"], out
+    assert db.q1("SELECT fix_attempts FROM files WHERE path=?",
+                 (out["path"],))["fix_attempts"] == 0
+
+
+@needs_ffmpeg
 def test_hygiene_remux_that_leaves_its_warning_counts_attempts(
         video_factory, settings, monkeypatch):
     """hygiene_action=transcode plus a warning a remux cannot clear (image-only

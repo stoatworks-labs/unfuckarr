@@ -579,3 +579,47 @@ recently. The next scheduled scan is the first to run under both that and the co
 mapping, so it is also the first that could act on the ~1,300 files whose compat verdict just
 changed. `abort_if_failure_ratio_over` (0.5) is the only remaining brake, and Emby's refusals are
 **error**-severity, so they count as failures in that ratio. Watch scan 23.
+
+## 2026-08-27: scan 23, and the bug the hygiene fix uncovered
+
+First scan under the new code and the corrected Emby mapping, fired manually with
+`max_actions_per_scan` **temporarily capped at 300** (it is otherwise 100000, and this was the one
+run that could not be called back — `/api/scan/stop` does not stop work in flight).
+
+**It behaved.** 8,088 files checked, **the abort brake held** at 8,040 findings — which is invariant
+4 earning its keep: a worklist denominator would have read 99% and aborted. The library moved the
+way the sample predicted: hygiene **3,750 → 3,296**, incompatible **4,116 → 4,489**, as Emby's
+error-severity refusals reached files the local table had called untidy.
+
+The fix visible in production, in a plan string and a flag reason:
+
+```
+transcoding  38%  remux, tag languages, set default audio   (Knives Out)
+FLAG  Austin Powers (1997) / 8 Mile (2002) Remux-2160p
+      nothing a rewrite can change — these describe how the file was made, not how it was muxed
+```
+
+**`transcode_did_not_fix`: 0 of the first 11 transcodes, against 44% (39 of 88) before.**
+
+### ⚠️ And then one fired — with an EMPTY findings list
+
+`Licence to Kill (1989) WEBDL-2160p.mkv`, `status: unmeasured`, `findings: []`. The transcode had
+cleared everything and was recorded as having fixed nothing.
+
+`_confirm_fixed` tested `result.status in ("ok", "hygiene")`. A transcode output is a **brand new
+file**, so `checks/efficiency` has not priced it and the re-check comes back **`unmeasured`** —
+which is a state, not a claim (invariant 14). So a successful repair incremented `fix_attempts`,
+and two of those write off a file that was never broken.
+
+**It stayed invisible because the hygiene bug was masking it.** `hygiene` was in that allowlist, so
+while hygiene-triggered remuxes were failing to clear their findings, their outputs came back
+`hygiene` and counted as *success*. Two bugs, each hiding the other, in the same four lines.
+
+Success is now asked of the findings, not of `result.status`: `not result.errors and not
+still_open`. `result.errors` still decides the negative, so a genuinely broken replacement fails
+whatever its status is called — and a status added later cannot silently reopen this.
+
+**Lesson worth keeping, and it is the same one as August:** the unit tests passed on the broken
+version *and* on the version before it. Both of these were found by watching real work on real
+media — the first by rechecking a file by hand, this one by watching a scan actually run. The
+regression test was checked against the old logic (`assert 1 == 0`) before being trusted.

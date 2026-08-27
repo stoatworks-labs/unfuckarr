@@ -576,12 +576,26 @@ class Remediator:
             log.warning("post-transcode check failed for %s: %s", final, exc)
             return
 
-        # "hygiene" is only success when hygiene was not what we were fixing.
-        # A hygiene-triggered remux whose warnings survive has fixed nothing,
-        # and calling it fixed is exactly the infinite loop this method exists
-        # to prevent.
+        # Success is "nothing is wrong with the replacement, and none of the
+        # findings we set out to clear survived" — asked of the findings, not
+        # of `result.status`. An allowlist of statuses was the earlier test and
+        # it read `("ok", "hygiene")`, which is wrong in a way that hid itself:
+        # a *fixed* file whose replacement the efficiency check has not priced
+        # yet comes back `unmeasured`, and `unmeasured` is a state, not a claim
+        # (invariant 14). That counted a successful repair as a failed attempt,
+        # and two of those write off a file that was never broken.
+        #
+        # It stayed invisible while hygiene-triggered remuxes were failing to
+        # clear their findings, because those came back `hygiene` — which the
+        # allowlist called success. Fixing that (invariant 22) is what surfaced
+        # this. Live proof: 2026-08-27, Licence to Kill, `status: unmeasured`,
+        # `findings: []`, logged as `transcode_did_not_fix`.
+        #
+        # `result.errors` still decides the negative: corrupt and incompatible
+        # are error-severity, so a replacement that is genuinely broken fails
+        # here whatever its status is called.
         still_open = set(decision.findings) & {f.code for f in result.findings}
-        if result.status in ("ok", "hygiene") and not still_open:
+        if not result.errors and not still_open:
             # The only place a repair is *known* to have worked, which is why
             # the counter is here and not beside the ffmpeg call: a run that
             # exits 0 and leaves the finding in place has fixed nothing.
