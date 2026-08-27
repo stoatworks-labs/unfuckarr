@@ -139,9 +139,7 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
 
     if compat:
         action = policy.incompatible_action
-        if action == "transcode" and all(
-                f.code == "no_direct_play" and not (f.data or {}).get("reasons")
-                for f in compat):
+        if action == "transcode" and not transcode.plan_has_work(result.findings):
             # Emby refused the file and would not say why, and the local codec
             # table — which `scanner.check_file` runs precisely for this case —
             # found nothing wrong either. There is no named defect to build a
@@ -185,8 +183,7 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
                             "the work — converting it to Matroska would fix "
                             "both",
                             [f.code for f in warnings])
-        if action == "transcode" and not (
-                {f.code for f in warnings} & transcode.HYGIENE_FIXABLE):
+        if action == "transcode" and not transcode.plan_has_work(result.findings):
             # Nothing here has a fix behind it. Sending the file to the
             # transcoder anyway builds a plan with no metadata work in it,
             # which collapses to a stream-copy remux: every byte rewritten,

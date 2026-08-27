@@ -113,6 +113,27 @@ def test_emby_no_with_stated_reasons_transcodes(settings):
     assert decide(r, settings).action == "transcode"
 
 
+def test_a_compat_warning_the_planner_uses_still_earns_the_transcode(settings):
+    """`mixed_audio_support` is severity *warning*, and `plan` reads every
+    finding regardless of severity — so a guard that looked only at the errors
+    flagged a file the transcoder could genuinely fix. Measured live
+    2026-08-27 on an X-Files remux Emby refused without reasons."""
+    r = CheckResult(path="/media/x.mkv")
+    r.add(Finding("emby", "no_direct_play", "error", "", {"reasons": []}))
+    r.add(Finding("compat", "mixed_audio_support", "warning", ""))
+    assert decide(r, settings).action == "transcode"
+
+
+def test_a_hygiene_file_with_a_usable_compat_warning_is_not_flagged(settings):
+    """Same trap on the other branch: hygiene decides only when compat raised
+    no errors, but a compat *warning* can still be the work in the plan."""
+    settings.policy.hygiene_action = "transcode"
+    r = CheckResult(path="/media/x.mkv")
+    r.add(Finding("hygiene", "image_subtitles_only", "warning", ""))
+    r.add(Finding("compat", "bad_audio_codec", "warning", ""))
+    assert decide(r, settings).action == "transcode"
+
+
 def test_clean_file_produces_no_action(settings):
     assert decide(CheckResult(path="/media/ok.mkv"), settings).action == "none"
 
