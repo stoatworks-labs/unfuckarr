@@ -137,6 +137,12 @@ def sync_inventory(rows: list[dict[str, Any]]) -> tuple[int, int]:
 
 # -- per-file check -------------------------------------------------------
 
+def _verdict_without_reasons(result: CheckResult) -> bool:
+    """Emby refused the file but would not say why."""
+    return any(f.code == "no_direct_play" and not (f.data or {}).get("reasons")
+               for f in result.findings)
+
+
 def check_file(path: str, s: Settings, expected_runtime: int | None = None,
                emby: EmbyClient | None = None,
                already_shrunk: bool = False) -> tuple[CheckResult, MediaInfo | None]:
@@ -162,7 +168,15 @@ def check_file(path: str, s: Settings, expected_runtime: int | None = None,
             answered = emby.check_direct_play(path, s.emby_compat, result)
         except EmbyError as exc:
             result.add(Finding("emby", "emby_unreachable", "info", str(exc)))
-    if not answered:
+    # A "no" with no `TranscodeReasons` behind it settles *whether* the file
+    # plays and says nothing about *what* to change — and the whole planner
+    # reads the reasons. Emby 4.9.5.0 answers that way for every file measured
+    # (2026-08-27, 63 of 63 no-direct-play verdicts across a 160-file sample),
+    # so the local codec table has to supply the actionable half or the plan
+    # collapses to a stream copy that cannot possibly clear the verdict. This
+    # does not weaken invariant 7: the two only ever run together when they
+    # already agree the file is bad, so they cannot contradict each other.
+    if not answered or _verdict_without_reasons(result):
         compat_checks.check(info, s.emby_compat, result)
 
     hygiene_checks.check(info, s.hygiene, result)

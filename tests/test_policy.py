@@ -85,6 +85,34 @@ def test_one_fixable_warning_still_earns_the_transcode(settings):
     assert decide(r, settings).action == "transcode"
 
 
+def test_emby_no_for_no_stated_reason_and_nothing_else_is_flagged(settings):
+    """Emby 4.9.5.0 returns `TranscodeReasons: None` on every refusal. The
+    planner reads the reasons and nothing else, so with none of them and a
+    clean local codec table there is no change to make — and a transcode would
+    be a stream copy run twice against every incompatible file in the library."""
+    r = CheckResult(path="/media/x.mkv")
+    r.add(Finding("emby", "no_direct_play", "error",
+                  "Emby would transcode this: Emby did not say why",
+                  {"reasons": []}))
+    assert decide(r, settings).action == "flag"
+
+
+def test_emby_no_with_the_local_table_naming_the_defect_still_transcodes(settings):
+    """`scanner.check_file` runs the local codec table for exactly this case,
+    so the verdict keeps its authority and the plan gets something to act on."""
+    r = CheckResult(path="/media/x.avi")
+    r.add(Finding("emby", "no_direct_play", "error", "", {"reasons": []}))
+    r.add(Finding("compat", "bad_video_codec", "error", ""))
+    assert decide(r, settings).action == "transcode"
+
+
+def test_emby_no_with_stated_reasons_transcodes(settings):
+    r = CheckResult(path="/media/x.mkv")
+    r.add(Finding("emby", "no_direct_play", "error", "",
+                  {"reasons": ["VideoCodecNotSupported"]}))
+    assert decide(r, settings).action == "transcode"
+
+
 def test_clean_file_produces_no_action(settings):
     assert decide(CheckResult(path="/media/ok.mkv"), settings).action == "none"
 

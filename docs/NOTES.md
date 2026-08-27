@@ -474,3 +474,50 @@ Measured on the live DB, what the fix changes: **238 hygiene files become genuin
 (they carry `multiple_default_audio` or `all_subtitles_forced` and nothing the planner already
 handled), and **2,495 stop being rewritten twice for nothing** and are flagged honestly instead.
 Neither number includes the files that were already being fixed correctly.
+
+## 2026-08-27: Emby answers, but this build never says why
+
+Found while preparing to fix the malformed Emby path mapping recorded above — and it is the
+reason that mapping must **not** be corrected as a config-only change.
+
+**The mapping is wrong in a knowable way.** Emby reports every item under `/mnt/user/media/...`
+(measured: **19,774 of 19,774**, 19,429 tv + 345 movies, nothing outside it), unfuckarr sees
+`/media/...`. The live settings hold one row, `from: /mnt/user/media/movies`,
+`to: "/media/movies, /mnt/user/media/tv = /media/tv"` — two mappings typed into a single `to`
+field, so movies map to a nonsense prefix and tv does not match at all. The correct answer is a
+single row **`/mnt/user/media` → `/media`**, which resolves **160 of 160** sampled library paths
+against the live index. Two rows would also work; one is the actual bind mount and cannot drift.
+
+**⚠️ But Emby 4.9.5.0 returns `TranscodeReasons: None` on every refusal.** Measured across a
+160-file sample: Emby answered all 160, refused 63, and gave reasons for **zero** of them. Example
+— an AVI carrying mpeg4 ASP + mp3, which is genuinely undirectplayable:
+`{'SupportsDirectPlay': False, 'SupportsDirectStream': False, 'TranscodeReasons': None}`.
+
+That matters because **invariant 7 skips the local codec table entirely when Emby answers**, and
+`transcode.plan` derives `needs_video` / `bad_audio_codec` / `bad_container` from the reasons and
+nothing else. No reasons → no codes → `video copy + audio copy` → `is_remux = True` → a stream
+copy that cannot clear the verdict, counted as a failed attempt by invariant 9, run twice, then
+given up on. **For every incompatible file in the library.** Compat repair works *today* only
+because the mapping is broken and Emby never answers at all.
+
+Fixed before touching the mapping: `scanner.check_file` now also runs the local codec table when
+Emby refused without reasons (`_verdict_without_reasons`). Invariant 7 is intact — the two only
+ever run together when they already agree the file is bad, so they cannot contradict each other.
+And `decide` flags rather than transcodes when the *only* compat evidence is a reasonless refusal
+the local table could not corroborate: no named defect, no plan, invariant 22.
+
+What the sample says the corrected mapping will do, once this is deployed:
+
+| Emby says | currently `incompatible` (60) | currently `ok` (60) | currently `hygiene` (40) |
+|---|---|---|---|
+| needs transcode | 53 | 5 | 5 |
+| direct play | 7 | 55 | 35 |
+
+So roughly **12% of the incompatible backlog gets cleared** (Emby direct-plays them; ~480 files
+stop being transcoded), and **~1,300 files move the other way** — but the ones the local table
+cannot corroborate are *flagged*, not rewritten. Expect the `incompatible` count to rise while the
+amount of actual transcoding falls.
+
+⚠️ Watch the abort brake on the first scan after the mapping change: files Emby refuses carry an
+**error**-severity finding, so they count as failures in the ratio, and `abort_if_failure_ratio_over`
+is 0.5.

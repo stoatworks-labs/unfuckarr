@@ -139,6 +139,20 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
 
     if compat:
         action = policy.incompatible_action
+        if action == "transcode" and all(
+                f.code == "no_direct_play" and not (f.data or {}).get("reasons")
+                for f in compat):
+            # Emby refused the file and would not say why, and the local codec
+            # table — which `scanner.check_file` runs precisely for this case —
+            # found nothing wrong either. There is no named defect to build a
+            # plan around, so the plan would be a stream copy that cannot clear
+            # the verdict, run twice, for every file in this state. Invariant
+            # 22: an action is only offered when there is a fix behind it.
+            return Decision("flag",
+                            "Emby will not direct play this and did not say "
+                            "why, and nothing in the file looks wrong — there "
+                            "is no change to make",
+                            codes)
         return Decision(action, "Emby cannot direct play this", codes)
 
     # Before hygiene: a shrink re-encodes the whole file and carries the
