@@ -756,3 +756,77 @@ nothing rewritten, nothing transcoded and nothing recycled. The finding stopped 
 scan clear on the **next** one, not the running one — so `image_subtitles_only` sitting still
 mid-scan is expected, not stalled. At the time of writing **245 of the 1,905 still-open ones
 already have a sidecar on disk** and are waiting for the next pass.
+
+## 2026-09-03: the download queue, and the three good files Cleanuparr was about to bin
+
+**New: `unfuckarr/intake.py`.** Watches the Sonarr/Radarr *queue* for downloads that finished and
+that the *arr will not import. Deliberately narrow — no stalled, slow or metadata-stuck handling.
+
+**Why narrow.** Cleanuparr is already running on lilnasx (container up 7 days, queue cleaner
+enabled on a 30-minute cron, pointed at Sonarr 4.0 / Radarr / Lidarr and qbt), with stall (3
+strikes, reset-on-progress), slow (3 strikes, 500 KB floor) and downloading-metadata (3 strikes)
+rules all on. Duplicating those would put two tools on one queue, and the race is not theoretical:
+the loser's `DELETE` hits a queue id that no longer exists, or it blocklists the *replacement* the
+winner's re-search just grabbed. Allan chose "only what Cleanuparr misses" when asked.
+
+**What it misses, and why it misses it.** `failed_import_max_strikes` is 0 in
+`queue_cleaner_configs` and `-1` in `arr_configs` — but Cleanuparr is *still recording*
+`failedimport` strikes. At 17:30 and 18:00 that day it struck three items that were
+**complete, healthy 41-minute episodes**: `Trains.That.Changed.The.World` S01E01/E02/E04,
+1.34–2.00 GB, h264 in mkv, 2437–2526 s, all opening cleanly. Their block was Sonarr saying
+
+> Found matching series via grab history, but release was matched to series by ID. Automatic
+> import is not possible. See the FAQ for details.
+
+which is a request for a *manual import*, not a complaint about the file. A third strike would
+have deleted ~5 GB of good media and blocklisted three clean releases. **That is the gap**: every
+tool in this space tells "bad release" from "the *arr cannot place a good release" by matching the
+status message, and that is a guess that is wrong in the expensive direction.
+
+**So: only the files can condemn a release** (now invariant 23). `triage` is pure and has no route
+to `bad_release` at all — it decides only whether the files are worth opening. `inspect` opens
+them, and it is the only thing that can condemn one. Every path that cannot see the files ends in
+`unrecognised`: flag, act on nothing. Verified twice against the live queue from a throwaway
+container (`docker run --rm -v /mnt/user/media:/media:ro -v /tmp/uf-new:/app-new:ro --entrypoint
+python unfuckarr-makemkv:edge`): once through the normal path, and once with the message table
+bypassed so **only** file evidence decided. All three came back `manual` both ways.
+
+### Traps found writing it
+
+- **A metadata-stuck torrent reports `size: 0` AND `sizeleft: 0`.** Any `1 - sizeleft/size`
+  progress figure divides by zero or reads as 100% complete. Seen live on three qbt torrents.
+- **Sonarr puts a season pack's *total* size on every episode's queue record.** So judging
+  completeness by the largest single file makes every episode of a twenty-part pack 5% of "its"
+  release — the first version of `looks_like_sample` condemned all twenty. Fixed by measuring
+  every video in the directory, and leaving `looks_like_sample` to do names only.
+- **An empty directory where the *arr recorded gigabytes is a path problem, not a bad release.**
+  Between "the release evaporated" and "the mapping lands somewhere that merely exists", the
+  second is far likelier — and this instance already has form (the Emby mapping hid 17,569 of
+  17,715 files). It returns `unrecognised`.
+- **An unreachable *arr must not read as an empty *arr.** `_mark_gone` only retires items from
+  sources that actually answered; otherwise an outage loses `blocked_since` on every item and
+  restarts every timer on reconnection.
+- **`blocked_since` is keyed on the download client's id, not the queue row's.** The *arr
+  renumbers its queue on restart.
+
+### What is NOT verified
+
+**No removal has ever run against a real queue.** `remove_from_queue` is exercised only against an
+httpx mock; the `fix` action is assumed. No `bad_release` has been produced from live data either
+— the queue held none that day. Every `ARR_SIDE_MARKERS` entry except the by-ID match is from
+documentation rather than the wire.
+
+### Deploy note
+
+`intake` needs a **path mapping** on the *arr: it reports `outputPath` as SABnzbd/qbt see it
+(`/downloads/...`). On lilnasx the downloads are at `/mnt/user/media/downloads/complete`, already
+inside the `/mnt/user/media → /media` bind, so the mapping is
+`/downloads` → `/media/downloads/complete` and **no new volume is needed**. Without it every
+blocked download reads as `unrecognised`.
+
+Ships `enabled: true, action: "flag"` — it classifies and touches nothing until told otherwise.
+
+### Incidental, worth fixing
+
+`/mnt/user/appdata/Cleanuparr/cleanuparr.db` holds the qBittorrent **username and password in
+plaintext** in `download_clients`, and appdata is world-readable (`drwxrwxrwx` on the parent).

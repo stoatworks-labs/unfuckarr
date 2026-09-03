@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import config, db, quality, recycle, transcode
+from . import config, db, intake, quality, recycle, transcode
 from .clients.arr import ArrClient, ArrError
 from .clients.emby import EmbyClient, EmbyError
 from .config import Settings, WatchFolder
@@ -32,6 +32,7 @@ class Service:
     def __init__(self) -> None:
         self.remediator = Remediator(config.get)
         self.scanner = Scanner(config.get, self.remediator)
+        self.intake = intake.IntakeWatcher(config.get)
         self.watcher = WatchManager(config.get, self._on_watch_ready)
         self._scan_lock = threading.Lock()
         self._scan_thread: threading.Thread | None = None
@@ -40,6 +41,8 @@ class Service:
         self._watch_pool = threading.Semaphore(2)
         self._estimate_lock = threading.Lock()
         self._shrink_thread: threading.Thread | None = None
+        self._intake_thread: threading.Thread | None = None
+        self._intake_lock = threading.Lock()
 
     # -- lifecycle --------------------------------------------------------
 
@@ -57,6 +60,10 @@ class Service:
                                                daemon=True,
                                                name="unfuckarr-shrink")
         self._shrink_thread.start()
+        self._intake_thread = threading.Thread(target=self._intake_worker,
+                                               daemon=True,
+                                               name="unfuckarr-intake")
+        self._intake_thread.start()
         self.refresh_services()
         s = config.get()
         if s.schedule.scan_enabled and s.schedule.scan_at_startup:
@@ -242,6 +249,44 @@ class Service:
             return
         outcome = self.remediator.apply(record, result, info, decision)
         bus.publish("remediated", {"path": path, **outcome})
+
+    # -- the download queue -----------------------------------------------
+
+    def _intake_worker(self) -> None:
+        """Watch the *arr queue for imports that will never happen.
+
+        Its own thread rather than a tick inside `_scheduler` because a pass
+        opens media files — ffprobe on the largest video in each blocked
+        download — and a slow array must not delay the recycle sweep or the
+        next scheduled scan behind it.
+
+        Nothing at all for the first minute: at startup the *arrs may still be
+        coming up themselves, and a queue read that fails is a warning in the
+        log for no reason.
+        """
+        self._sched_stop.wait(60)
+        while not self._sched_stop.is_set():
+            s = config.get()
+            wait = max(60, s.intake.poll_minutes * 60)
+            if s.intake.enabled and not state.paused:
+                try:
+                    self.run_intake_pass()
+                except Exception as exc:  # noqa: BLE001 - the worker must not die
+                    log.exception("intake pass failed")
+                    db.log("intake_worker_error", "error", detail=str(exc))
+                    wait = max(wait, 300)
+            self._sched_stop.wait(wait)
+
+    def run_intake_pass(self, force: bool = False) -> dict[str, Any]:
+        """One queue sweep. Single-flight, like a scan."""
+        if not self._intake_lock.acquire(blocking=False):
+            return {"ok": False, "message": "a queue pass is already running"}
+        try:
+            result = self.intake.run_pass(force=force)
+            self.intake.sweep()
+            return {"ok": True, **result.as_dict()}
+        finally:
+            self._intake_lock.release()
 
     def _restore_last_scan(self) -> None:
         """Carry the last scan time across a restart.

@@ -132,6 +132,43 @@ CREATE TABLE IF NOT EXISTS totals (
     value INTEGER NOT NULL DEFAULT 0
 );
 
+-- The download queue, as this application last saw it. One row per download,
+-- keyed by the *client's* id rather than the queue row's: a queue id changes
+-- when the *arr restarts, and `blocked_since` has to survive that or the
+-- min-blocked timer resets every time Sonarr is updated.
+--
+-- Rows are kept after the item leaves the queue so that "we already acted on
+-- this" is answerable, and so a verdict the user disagreed with is still
+-- there to look at. `sweep_intake` ages them out.
+CREATE TABLE IF NOT EXISTS intake (
+    source        TEXT NOT NULL,      -- sonarr | radarr
+    download_id   TEXT NOT NULL,      -- the download client's id/hash
+    queue_id      INTEGER,
+    title         TEXT,
+    protocol      TEXT,
+    indexer       TEXT,
+    download_client TEXT,
+    arr_parent_id INTEGER,
+    arr_episode_ids TEXT,             -- JSON list
+    output_path   TEXT,               -- as the *arr reports it
+    local_path    TEXT,               -- after path mapping
+    size          INTEGER,
+    state         TEXT,               -- trackedDownloadState
+    messages      TEXT,               -- JSON list of statusMessages
+    verdict       TEXT,               -- working|manual|bad_release|unrecognised
+    reason        TEXT,
+    evidence      TEXT,               -- JSON: what opening the files found
+    first_seen    REAL NOT NULL,
+    last_seen     REAL NOT NULL,
+    blocked_since REAL,               -- when it first stopped making progress
+    gone          REAL,               -- when it left the queue
+    acted         REAL,               -- when we removed it; NULL if never
+    outcome       TEXT,
+    PRIMARY KEY (source, download_id)
+);
+CREATE INDEX IF NOT EXISTS idx_intake_verdict ON intake(verdict);
+CREATE INDEX IF NOT EXISTS idx_intake_seen ON intake(last_seen DESC);
+
 CREATE TABLE IF NOT EXISTS recycle (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     original  TEXT NOT NULL,
