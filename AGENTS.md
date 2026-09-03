@@ -255,6 +255,26 @@ Break any of these and the failure is quiet and expensive.
 
 ## Traps found the hard way
 
+- **A scan starting up holds the SQLite write lock long enough to fail an API write.**
+  `scanner.sync_inventory` rewrites the whole library in one transaction — 18,440 rows on the
+  live instance — and any other write arriving in that window waits out `busy_timeout` (30s) and
+  raises `database is locked`. Two consequences, both found deploying `intake` on 2026-09-03:
+  `db.ex` **must roll back** on failure, or Python's implicit transaction stays open on that
+  thread's connection and, because FastAPI reuses worker threads, poisons every later request
+  that lands on it (`conn.in_transaction` was measured True after the failure); and any periodic
+  worker must not let a bookkeeping write throw away work it has already done — `intake.run_pass`
+  lost a completed pass to its own summary log line. **The busy timeout is honoured** — a blocked
+  write fails after exactly `busy_timeout`, measured — so a *fast* `database is locked` means
+  something other than plain contention, and a slow one means a lock genuinely held that long.
+  The real fix, not yet done, is for `sync_inventory` to commit in batches.
+
+  Diagnostic note worth keeping: the first theory was a dangling `q1` cursor holding a read
+  transaction, which does produce an instant `database is locked` — but only when the cursor is
+  held in a variable. `db.q1` returns `connect().execute(...).fetchone()`, whose cursor is a
+  temporary that CPython frees at once, so it was never exposed. The repro that "confirmed" it
+  had been written to hold the cursor, which the real code never does. Reproduce against the
+  actual helper, not a paraphrase of it.
+
 - **A Blu-ray image is pure UDF, not ISO9660.** Measured across the live library: of 104 disc
   images, 98 were pure UDF (`BEA01`/`NSR03`/`TEA01` at sector 16), 5 carried an ISO9660 bridge as
   well, and exactly one was ISO9660 with a BDMV directory. An identifier that looks for `CD001`
