@@ -134,6 +134,7 @@ hand:
 | Not yet measured for a saving | Measure it, and re-encode only if the result is smaller *and* still scores at the quality target |
 | A disc image nothing can open | Report it, and do nothing |
 | A disc image, with MakeMKV configured | Copy the feature out to `.mkv`, bonus features to `extras/`, recycle the image |
+| A finished download the *arr will not import | Open it. If nothing importable arrived: remove, blocklist, re-search. If the file is fine: flag it for a manual import and never touch it. |
 
 Everything is configurable per class, including turning it off.
 
@@ -141,6 +142,10 @@ Everything is configurable per class, including turning it off.
 not a re-encode — getting that wrong turns twenty seconds of work into six hours. Only the stream
 that actually fails gets re-encoded. Output is verified (streams present, duration within 2% of
 the source) before it is allowed to replace anything.
+
+**Blocked imports are opened, not pattern-matched.** The queue watcher will not remove a
+download because of what the status message said — it opens what arrived and decides on that.
+See [the download queue](#the-download-queue--imports-that-will-never-happen).
 
 **Shrinking is measured, not guessed.** This is the only thing unfuckarr does to a file that
 nothing is wrong with, so it is not allowed to guess — about which files to touch, or about what
@@ -211,6 +216,11 @@ Unattended deletion needs to be wrong safely, so there are three layers:
 - **Action cap.** No single scan may act on more than `max_actions_per_scan` files (default 50).
   Shrinking is not rationed this way at all — see below — so a long re-encode can never consume
   the pass that a corrupt file is waiting on.
+- **Queue brakes, separately.** The download-queue watcher has its own pair, for the same
+  reasons: no more than 5 removals per pass, and an abort if more than half the queue is blocked
+  at once — with a floor, because two blocked items out of two is a ratio of 100% that means
+  nothing at all. And nothing is removed on the strength of a status message: see the queue
+  section below.
 - **Failure-ratio abort.** If more than half a library fails one pass, the scan stops and changes
   *nothing*. That is what an unmounted array looks like, and it is the failure mode that costs
   people their library. Shrinks are deliberately *not* counted here: an unmounted array produces
@@ -261,6 +271,58 @@ outright.
 
 Unraid user shares are SMB/NFS and deliver no inotify events, so unfuckarr detects a network
 mount and polls instead. Force it either way with `UNFUCKARR_WATCH_POLL=1` / `=0`.
+
+## The download queue — imports that will never happen
+
+There is a failure mode nothing above can see, because it never produces a file. The download
+finishes, the *arr refuses to import it, and the item sits in the queue for ever. No file
+appears, so the scanner has nothing to check. Nothing *failed*, so the *arr's own failed-download
+handling never fires. The episode just stays missing until you notice.
+
+unfuckarr watches the queue for exactly that, and **only** that. Stalled torrents, slow torrents
+and stuck metadata are deliberately not handled here: they are a download-client question, tools
+like [Cleanuparr](https://github.com/Cleanuparr/Cleanuparr) already do them well on a strike
+model, and two tools removing from one queue race each other — the loser's delete hits a queue id
+that no longer exists, or blocklists the replacement the winner just grabbed.
+
+**The bit that matters is telling two things apart.** A blocked import has two causes that look
+identical from the queue:
+
+- **The release is unusable** — it unpacked to nothing, it is still in a rar, it is only the
+  sample, the video will not open. Another copy is the fix: remove it, blocklist the release,
+  let the *arr search again.
+- **The release is fine and the *arr cannot place it** — it matched the series by ID, it cannot
+  parse the name, the destination is read-only, it is not an upgrade on what you already have.
+  Another copy blocks in exactly the same way. Blocklisting throws away good media and burns a
+  clean release for nothing.
+
+Every other tool in this space tells these apart by matching the status message. unfuckarr does
+not have to guess, because opening media files is what it already does: the message decides only
+whether the files are worth *looking at*, and then it looks. **Only evidence from the files
+themselves can condemn a release.** A message alone never removes anything, and when the path
+does not resolve or the files cannot be read, the answer is "could not tell" — flagged, and
+acted on by nobody.
+
+That is not a hypothetical distinction. On the author's own library, three complete 41-minute
+episodes (1.3–2.0 GB each, h264 in mkv, all playing perfectly) sat blocked behind Sonarr's
+*"release was matched to series by ID. Automatic import is not possible"* — a request for a
+manual import, not a complaint about the file. The queue cleaner running alongside had already
+struck all three twice on its way to deleting them.
+
+Set the queue action to `fix` and it acts; it ships on `flag`, which classifies everything and
+touches nothing, so you can read a week of its verdicts before letting it act. The same two
+brakes as everywhere else apply — a per-pass cap, and an abort if more than half the queue is
+blocked at once, because that is SABnzbd or qBittorrent or the mount, not a run of bad releases.
+Nothing is considered until it has been blocked for 30 minutes, since the *arrs retry imports on
+their own schedule and most blocks clear themselves.
+
+> [!IMPORTANT]
+> This needs a **path mapping**. The *arr reports the download's location as its download client
+> sees it (`/downloads/...`), which is rarely what unfuckarr's container sees. Add a mapping under
+> the Sonarr/Radarr settings pointing that at the same files here — often the downloads already
+> sit inside the media mount, e.g. `/downloads` → `/media/downloads/complete`, so no new volume is
+> needed. Without one, every blocked download reads as "could not tell" and nothing useful
+> happens.
 
 ## Install
 

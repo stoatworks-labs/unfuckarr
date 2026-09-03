@@ -25,6 +25,22 @@ Remediator.apply()             → transcode.plan() → build_command() → run(
 
 `Scanner._remediate()` sits between decide and apply and holds the safety brakes.
 
+The queue path is separate and touches no library file:
+
+```
+intake.IntakeWatcher.run_pass()
+  ↓
+arr.queue()                    → every queue record from both *arrs
+  ↓
+intake.normalise()             → QueueItem, path-mapped to what this container can see
+  ↓
+intake.triage()                → pure; working | manual | unrecognised. NEVER bad_release
+  ↓
+intake.inspect()               → opens the files; the ONLY route to bad_release (invariant 23)
+  ↓
+arr.remove_from_queue()        → remove + blocklist + let the *arr re-search, in one call
+```
+
 The watch folder path is the same pipeline with a different trigger:
 `watcher.WatchManager` → settle timer → `service._check_arrival()` → `check_file` → `decide` → `apply`.
 
@@ -201,6 +217,41 @@ Break any of these and the failure is quiet and expensive.
     `image_subtitles_only` alone — with 2,733 of the 3,749 hygiene files queued to join them,
     and it read from the outside exactly like a tool that logs problems and fixes nothing.
     Adding a check is cheap; adding one whose finding no action can clear is not.
+
+23. **In `intake`, only the files can condemn a release — never the status message.** The queue
+    has two failures that look identical from the outside: a release that is unusable (unpacked
+    to nothing, still in a rar, only a sample, video that will not open), where another copy is
+    the fix; and a release that is *fine* and the *arr cannot place (matched by ID, cannot parse
+    the name, path denied, not an upgrade), where another copy blocks in exactly the same way and
+    blocklisting throws away good media. Every other tool in this space — Cleanuparr, decluttarr,
+    the *arr's own settings — tells them apart by matching the status message, which is a guess,
+    and it is wrong in the expensive direction. So `triage` is pure and **has no route to
+    `bad_release` at all**; it decides only whether the files are worth opening. `inspect` opens
+    them, and it is the only function that can condemn one.
+    `test_triage_can_never_return_bad_release` asserts the asymmetry.
+
+    The corollary is invariant 17 in its natural home: when the path does not resolve, when the
+    directory will not read, when ffprobe will not run, the answer is `unrecognised` — flag, act
+    on nothing. "I could not look" is not "the release is bad". An empty directory where the *arr
+    recorded gigabytes is `unrecognised` too, and specifically **not** `bad_release`: between "the
+    release evaporated" and "the path mapping lands somewhere that merely exists", the second is
+    far likelier and the first is not worth a blocklist to find out.
+
+    Live proof, 2026-09-03, which is why the module is shaped this way: three complete usenet
+    downloads (1.3–2.0 GB, ~41 min each, h264 in mkv, all opening cleanly) sat in Sonarr's queue
+    as `importBlocked` carrying *"Found matching series via grab history, but release was matched
+    to series by ID. Automatic import is not possible."* The queue cleaner running beside
+    unfuckarr had already recorded two `failedimport` strikes against each. A third would have
+    deleted 5 GB of good media and blocklisted three clean releases. Both halves of this module —
+    the message table and, independently, opening the files with the message table bypassed —
+    return `manual` for all three.
+
+24. **`intake` never touches a stalled, slow or metadata-stuck download, and that is scope, not
+    an omission.** Those are a download-client question, they are what the dedicated queue
+    cleaners already do well on a strike model, and **two tools removing from one queue race each
+    other**: the loser's `DELETE` hits a queue id that no longer exists, or — much worse —
+    blocklists the replacement the winner's re-search has just grabbed. If this ever grows to
+    cover them, the queue cleaner beside it has to be switched off in the same change.
 
 ## Traps found the hard way
 
@@ -481,6 +532,26 @@ any test:
 Keep this section honest. "It is running in production" is not the same claim as "the code path
 has run", and this project has now been wrong about that once.
 
+**Verified against the live Sonarr, 2026-09-03 — `intake`:** the queue shape was read off
+Sonarr 4.0.19.2979 before a line was written (`downloadId`, `trackedDownloadState`,
+`statusMessages`, `outputPath`, and the trap that a metadata-stuck torrent reports `size: 0`
+*and* `sizeleft: 0`, so any `1 - sizeleft/size` progress figure divides by zero or reads as
+complete). The classifier was then run against the live queue from a throwaway container with
+the real media mounted read-only: three `importBlocked` downloads, all classified `manual`, and
+still `manual` on a second run with the message table bypassed so only the file evidence
+decided — 1.3–2.0 GB, 2437–2526 s, h264/mkv, opening cleanly. What that does **not** cover: no
+`bad_release` has been produced from live data (the queue held none), and **no removal has ever
+been executed against a real queue** — `remove_from_queue` is exercised only against a mock. The
+`fix` action is therefore assumed, not verified. Also assumed: every entry in `ARR_SIDE_MARKERS`
+except the by-ID match, which is the one that was read off the wire.
+
+**Deployment note found the same day:** the *arr reports `outputPath` as its download client
+sees it (`/downloads/...`), so `intake` needs a path mapping on the *arr to reach the files.
+On the live install the downloads sit at `/mnt/user/media/downloads/complete`, inside the
+existing `/mnt/user/media → /media` bind, so the mapping is `/downloads` → `/media/downloads/complete`
+and no new volume is needed. Without a mapping every blocked download reads as `unrecognised`,
+which is the safe direction but does nothing useful.
+
 **Verified in CI** — the test suite, green, run against real ffmpeg output on every push:
 
 - That the measurement decides, not a bitrate guess: a modest HEVC file and a fat MPEG-2 one
@@ -517,6 +588,19 @@ has run", and this project has now been wrong about that once.
   (`unfuckarr starting as unfuckarr:unfuckarr (1000:1000)`). Multi-arch amd64 + arm64 on tags.
   This is the only container proof available — there is no runtime on the dev machine.
 - That the scheduled-scan time survives a restart.
+- **`intake`, 46 tests**: that `triage` has no route to `bad_release`; that the live by-ID
+  message and the permissions/upgrade/parse family all read as `manual`; that an empty, packed,
+  junk-only, sample-only, unopenable or far-too-small download reads as `bad_release` while a
+  complete healthy one never does even with the policy set to `fix`; that a **season pack** is
+  not read as a sample (Sonarr puts the pack's total size on every episode's record, so judging
+  completeness by the largest single file condemned all twenty — the completeness test measures
+  every video present instead); that an empty directory where the *arr recorded gigabytes is a
+  path problem rather than a bad release; both brakes (the blocked-ratio abort with its
+  small-queue floor, and the per-pass cap); that a paused service acts on nothing; that an item
+  is acted on once; that `blocked_since` survives a renumbered queue and resets when a download
+  goes back to downloading; and that **an unreachable *arr does not retire what it was
+  tracking** — reading an outage as an empty queue would lose `blocked_since` on every item and
+  restart every timer on reconnection.
 - **The shrink path, including a full pass against real media** — search, encode, structural
   verification, realised-saving check, VMAF verification of the finished file, recycle, replace,
   and the permanent marker. Plus every brake individually: never twice, never reassessed, a
@@ -732,6 +816,8 @@ unfuckarr/
                      partitions included), ISO9660 for DVDs, subfile/concat URLs
   makemkv.py         Converting a disc image to Matroska through an external
                      MakeMKV: robot-output parsing, title selection, the rip
+  intake.py          The download queue: imports the *arr will not make, and
+                     the evidence that tells a bad release from a good one
   recycle.py         Recycle bin + retention
   remediation.py     decide() and Remediator
   scanner.py         Enumeration, check_file, the scan loop, the brakes

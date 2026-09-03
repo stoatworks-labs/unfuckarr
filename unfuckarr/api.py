@@ -115,6 +115,7 @@ def get_status() -> dict[str, Any]:
         "recycle": recycle.usage(config.get().policy.recycle_bin_path),
         "watch_pending": service.watcher.pending,
         "shrink": shrink_summary(),
+        "intake": intake_summary(),
         "totals": totals_summary(),
         "configured": bool(config.get().sonarr.enabled or config.get().radarr.enabled
                            or config.get().extra_library_paths),
@@ -283,6 +284,108 @@ def shrink_estimate(path: str) -> dict[str, Any]:
 
 
 # -- scans ----------------------------------------------------------------
+
+# -- the download queue ---------------------------------------------------
+
+def intake_summary() -> dict[str, Any]:
+    row = db.q1(
+        "SELECT COUNT(*) n, "
+        "       SUM(gone IS NULL) live, "
+        "       SUM(verdict='bad_release' AND acted IS NULL AND gone IS NULL) bad, "
+        "       SUM(verdict='manual' AND gone IS NULL) manual, "
+        "       SUM(verdict='unrecognised' AND gone IS NULL) unrecognised, "
+        "       SUM(acted IS NOT NULL) acted "
+        "FROM intake")
+    if row is None:
+        return {}
+    cfg = config.get().intake
+    return {
+        **{k: (row[k] or 0) for k in ("n", "live", "bad", "manual",
+                                      "unrecognised", "acted")},
+        # The dashboard and the queue page both need to say whether anything
+        # will actually happen, and neither should have to fetch the whole
+        # settings document to find out.
+        "enabled": cfg.enabled,
+        "action": cfg.action,
+    }
+
+
+@api.get("/intake")
+def list_intake(verdict: str | None = None, live: bool = True,
+                limit: int = Query(200, le=1000)) -> list[dict[str, Any]]:
+    """What the queue watcher has seen, newest first."""
+    sql = "SELECT * FROM intake"
+    where, params = [], []
+    if verdict:
+        where.append("verdict = ?")
+        params.append(verdict)
+    if live:
+        where.append("gone IS NULL")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY last_seen DESC LIMIT ?"
+    params.append(limit)
+
+    out = []
+    for r in db.q(sql, params):
+        d = {k: r[k] for k in r.keys()}
+        for field_name in ("messages", "evidence", "arr_episode_ids"):
+            if d.get(field_name):
+                try:
+                    d[field_name] = json.loads(d[field_name])
+                except (TypeError, json.JSONDecodeError):
+                    d[field_name] = None
+        out.append(d)
+    return out
+
+
+@api.post("/intake/scan")
+def intake_scan(force: bool = False) -> dict[str, Any]:
+    """Sweep the queue now. ``force`` acts even when the policy says flag."""
+    return service.run_intake_pass(force=force)
+
+
+@api.post("/intake/act")
+def intake_act(download_id: str, source: str) -> dict[str, Any]:
+    """Remove, blocklist and re-search one item, whatever its verdict.
+
+    The manual override. It exists because the classifier is deliberately
+    unwilling to act on anything it cannot prove, so `unrecognised` is a
+    normal outcome and someone has to be able to say "yes, bin it".
+    """
+    row = db.q1("SELECT * FROM intake WHERE source=? AND download_id=?",
+                (source, download_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="not in the queue")
+    if row["gone"]:
+        raise HTTPException(status_code=409,
+                            detail="this download has left the queue")
+    from .intake import QueueItem, Verdict
+
+    item = QueueItem(
+        source=row["source"], download_id=row["download_id"],
+        queue_id=row["queue_id"] or 0, title=row["title"] or "",
+        state=row["state"] or "", tracked_status="", status="",
+        size=row["size"] or 0, output_path=row["output_path"] or "",
+        local_path=row["local_path"] or "",
+        arr_parent_id=row["arr_parent_id"],
+    )
+    ok = service.intake._act(
+        item, Verdict("bad_release", "removed from the web UI"))
+    return {"ok": ok}
+
+
+@api.post("/intake/ignore")
+def intake_ignore(download_id: str, source: str) -> dict[str, Any]:
+    """Mark an item as the *arr's problem so no pass reconsiders it."""
+    changed = db.ex(
+        "UPDATE intake SET verdict='manual', reason=? WHERE source=? "
+        "AND download_id=?",
+        ("marked as needing a manual import from the web UI", source,
+         download_id))
+    bus.publish("intake", {"ignored": download_id})
+    return {"ok": True, "changed": changed}
+
 
 @api.post("/scan/start")
 def scan_start(library: str | None = None) -> dict[str, Any]:

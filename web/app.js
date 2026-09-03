@@ -748,6 +748,142 @@ function closeDrawer() {
 
 /* ---------- activity ---------- */
 
+/* ---------- download queue ---------- */
+
+const VERDICTS = {
+  bad_release: {
+    label: 'Bad release', kind: 'bad',
+    blurb: 'unfuckarr opened what arrived and there is nothing importable in '
+         + 'it. Another copy is the fix.',
+  },
+  manual: {
+    label: 'Needs a manual import', kind: 'warn',
+    blurb: 'The download is fine and the *arr will not place it. Another copy '
+         + 'blocks in exactly the same way, so this is never removed '
+         + 'automatically.',
+  },
+  unrecognised: {
+    label: 'Could not tell', kind: 'info',
+    blurb: 'Blocked for a reason unfuckarr does not recognise, or the files '
+         + 'could not be reached. Flagged, never acted on.',
+  },
+  working: { label: 'Working', kind: '', blurb: 'The *arr is still on it.' },
+};
+
+async function viewQueue() {
+  const v = $('#view');
+  v.replaceChildren(el('div', { class: 'empty' }, 'Loading…'));
+
+  let rows;
+  try {
+    rows = await api('/intake?live=true&limit=500');
+  } catch (err) {
+    v.replaceChildren(el('div', { class: 'empty' }, err.message));
+    return;
+  }
+  v.replaceChildren();
+
+  const cfg = STATUS?.intake || {};
+  v.append(el('div', { class: 'card' },
+    el('div', { class: 'card-head' },
+      el('h3', {}, 'Download queue'),
+      el('button', {
+          class: 'btn btn-ghost',
+          onclick: async (e) => {
+            e.target.disabled = true;
+            try {
+              const r = await api('/intake/scan', { method: 'POST' });
+              toast(r.ok ? `Checked ${r.queued} queued, ${r.blocked} blocked.`
+                         : r.message, r.ok ? 'ok' : 'bad');
+              viewQueue();
+            } catch (err) { toast(err.message, 'bad'); }
+        },
+      }, 'Check now')),
+    el('div', { class: 'muted small' },
+      'Downloads that finished and that Sonarr or Radarr will not import. '
+      + 'Stalled and slow downloads are deliberately not handled here.'),
+    cfg.enabled === false
+      ? el('div', { class: 'muted small', style: 'margin-top:.6rem' },
+          'Switched off in Settings — nothing is being watched.')
+      : cfg.action === 'flag'
+        ? el('div', { class: 'muted small', style: 'margin-top:.6rem' },
+            'Reporting only — nothing is removed automatically. Set the queue '
+            + 'action to “fix” in Settings to let it act, or use the buttons '
+            + 'below to act on one.')
+        : null));
+
+  if (!rows.length) {
+    v.append(el('div', { class: 'empty' }, 'Nothing in the queue.'));
+    return;
+  }
+
+  const order = ['bad_release', 'unrecognised', 'manual', 'working'];
+  rows.sort((a, b) => order.indexOf(a.verdict) - order.indexOf(b.verdict));
+
+  for (const group of order) {
+    const inGroup = rows.filter((r) => r.verdict === group);
+    if (!inGroup.length) continue;
+    const meta = VERDICTS[group] || { label: group, kind: '' };
+    v.append(el('div', { class: 'card' },
+      el('h3', {}, `${meta.label} (${inGroup.length})`),
+      el('div', { class: 'muted small', style: 'margin-bottom:.6rem' },
+        meta.blurb),
+      el('div', { class: 'table-wrap' },
+        el('table', {},
+          el('tbody', {}, inGroup.map((r) => queueRow(r, meta)))))));
+  }
+}
+
+function queueRow(r, meta) {
+  const ev = r.evidence || {};
+  const bits = [];
+  if (ev.videos !== undefined) bits.push(`${ev.videos} video`);
+  if (ev.archives) bits.push(`${ev.archives} archive`);
+  if (ev.duration) bits.push(duration(ev.duration));
+  if (ev.video_bytes) bits.push(bytes(ev.video_bytes));
+
+  return el('tr', {},
+    el('td', {},
+      el('div', {}, r.title || r.download_id),
+      el('div', { class: 'muted small' }, r.reason || ''),
+      bits.length ? el('div', { class: 'muted small' }, bits.join(' · ')) : null,
+      el('div', { class: 'muted small' },
+        `${r.source} · ${r.protocol || '?'} · ${r.indexer || '?'}`
+        + (r.blocked_since ? ` · blocked ${ago(r.blocked_since)}` : ''))),
+    el('td', { style: 'text-align:right;white-space:nowrap' },
+      r.acted
+        ? el('span', { class: 'pill pill-ok' }, 'removed')
+        : el('div', { class: 'row' },
+            meta.kind !== 'warn' ? el('button', {
+              class: 'btn btn-ghost btn-sm',
+              title: 'Remove from the queue and the client, blocklist the '
+                   + 'release, and let the *arr search again',
+              onclick: async () => {
+                if (!confirm(`Remove and blocklist:\n\n${r.title}\n\nThe *arr `
+                           + 'will search for a replacement.')) return;
+                try {
+                  await api(`/intake/act?source=${encodeURIComponent(r.source)}`
+                    + `&download_id=${encodeURIComponent(r.download_id)}`,
+                    { method: 'POST' });
+                  toast('Removed and blocklisted.', 'ok');
+                  viewQueue();
+                } catch (err) { toast(err.message, 'bad'); }
+              },
+            }, 'Remove + blocklist') : null,
+            el('button', {
+              class: 'btn btn-ghost btn-sm',
+              title: 'Never consider this one again',
+              onclick: async () => {
+                try {
+                  await api(`/intake/ignore?source=${encodeURIComponent(r.source)}`
+                    + `&download_id=${encodeURIComponent(r.download_id)}`,
+                    { method: 'POST' });
+                  viewQueue();
+                } catch (err) { toast(err.message, 'bad'); }
+              },
+            }, 'Leave it'))));
+}
+
 function viewActivity() {
   const v = $('#view');
   v.replaceChildren(buildLivePanel());
@@ -1012,6 +1148,43 @@ async function viewSettings() {
     el('div', { class: 'cols' },
       settingField('hygiene.min_fps', s.hygiene.min_fps),
       settingField('hygiene.max_fps', s.hygiene.max_fps))));
+
+  v.append(el('div', { class: 'card' },
+    el('h3', {}, 'Download queue'),
+    el('div', { class: 'hint', style: 'margin-bottom:12px' },
+      'Downloads that finished and that Sonarr or Radarr will not import. '
+      + 'Stalled, slow and metadata-stuck downloads are deliberately left '
+      + 'alone — they are a download-client question, and two tools removing '
+      + 'from one queue race each other.'),
+    settingField('intake.enabled', s.intake.enabled,
+      { label: 'Watch the queue for imports that will never happen' }),
+    el('div', { class: 'cols' },
+      settingField('intake.action', s.intake.action, { options: ['flag', 'fix'] }),
+      settingField('intake.poll_minutes', s.intake.poll_minutes),
+      settingField('intake.min_blocked_minutes', s.intake.min_blocked_minutes),
+      settingField('intake.max_actions_per_pass', s.intake.max_actions_per_pass),
+      settingField('intake.abort_if_blocked_ratio_over',
+        s.intake.abort_if_blocked_ratio_over),
+      settingField('intake.abort_ratio_min_items', s.intake.abort_ratio_min_items)),
+    el('div', { class: 'hint', style: 'margin:-4px 0 12px' },
+      '“fix” removes the download, blocklists the release and lets the *arr '
+      + 'search again — but only ever for a download unfuckarr has opened and '
+      + 'found unusable. A complete file the *arr merely refuses is always '
+      + 'left for a manual import. Nothing happens until a download has been '
+      + 'blocked for the wait above, and if more than the ratio above is '
+      + 'blocked at once the whole pass flags instead, on the assumption that '
+      + 'the download client or the mount is what broke.'),
+    settingField('intake.blocklist', s.intake.blocklist,
+      { label: 'Blocklist the release so the same copy is not grabbed again' }),
+    settingField('intake.remove_from_client', s.intake.remove_from_client,
+      { label: 'Remove it from the download client too' }),
+    settingField('intake.never_act_phrases', s.intake.never_act_phrases,
+      { list: true, label: 'Never act when a status message contains' }),
+    el('div', { class: 'hint', style: 'margin:-6px 0 0' },
+      'One phrase per line. Only ever makes it less likely to act. Note that '
+      + 'this needs a path mapping on the *arr above, pointing the download '
+      + "client's output path at where this container can see it — without "
+      + 'one, every blocked download reads as “could not tell”.')));
 
   // Policy
   v.append(el('div', { class: 'card' },
@@ -1339,6 +1512,7 @@ async function recheckServices() {
 const ROUTES = {
   '/': viewDashboard,
   '/files': viewFiles,
+  '/queue': viewQueue,
   '/activity': viewActivity,
   '/recycle': viewRecycle,
   '/settings': viewSettings,

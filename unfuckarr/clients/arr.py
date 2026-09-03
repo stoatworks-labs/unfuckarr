@@ -192,6 +192,60 @@ class ArrClient:
             body = {"name": "SeriesSearch", "seriesId": entity_id}
         self._request("POST", "command", json=body)
 
+    def queue(self, page_size: int = 200) -> list[dict[str, Any]]:
+        """Every record in the download queue, raw.
+
+        ``includeUnknown*Items`` matters: a download the *arr can no longer
+        match to a series or movie is *precisely* the kind that gets stuck,
+        and it is left out of the default response — so without these the
+        queue looks healthier than it is.
+
+        Paged, because a queue can genuinely be longer than one page after an
+        indexer outage and a partial view would make the abort ratio in
+        ``intake`` read against a denominator that is not the queue.
+        """
+        params: dict[str, Any] = {
+            "pageSize": page_size,
+            "includeUnknownSeriesItems": True,
+            "includeUnknownMovieItems": True,
+        }
+        out: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            data = self._request("GET", "queue", params={**params, "page": page})
+            if data is None:
+                break
+            if isinstance(data, list):
+                out.extend(data)
+                break
+            records = data.get("records") or []
+            out.extend(records)
+            total = data.get("totalRecords") or 0
+            if len(out) >= total or not records or page > 20:
+                break
+            page += 1
+        return out
+
+    def remove_from_queue(self, queue_id: int, blocklist: bool = True,
+                          remove_from_client: bool = True,
+                          skip_redownload: bool = False) -> None:
+        """Cancel a queue item, optionally blocklisting the release.
+
+        With ``blocklist`` on and ``skip_redownload`` off this is the queue
+        equivalent of ``history/failed/{id}``: the *arr blocklists the release
+        *and* queues a replacement search, which is what invariant 2 requires.
+        Doing it in two calls instead would leave a window in which a plain
+        search can re-grab the release we are in the middle of rejecting.
+
+        Verified against Sonarr 4.0.19.2979 and the Radarr on this tailnet.
+        """
+        params = {
+            "removeFromClient": remove_from_client,
+            "blocklist": blocklist,
+            "skipRedownload": skip_redownload,
+        }
+        self._request("DELETE", f"queue/{queue_id}", params=params)
+
     def rescan(self, entity_id: int) -> None:
         """Make the *arr re-read the folder — needed after we replace a file
         in place with a transcode, or its size and quality go stale."""

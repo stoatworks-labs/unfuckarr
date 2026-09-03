@@ -279,3 +279,74 @@ def test_walk_skips_incomplete_and_metadata_directories(tmp_path):
 
     found = list(walk_video_files(str(tmp_path)))
     assert found == [str(tmp_path / "Film.mkv")]
+
+
+# -- the download queue ---------------------------------------------------
+
+def _intake_row(client, **kw):
+    row = {
+        "source": "sonarr", "download_id": "hash1", "queue_id": 7,
+        "title": "Some.Show.S01E01", "state": "importBlocked",
+        "verdict": "manual", "reason": "wants a manual import",
+        "evidence": '{"videos": 1}', "first_seen": time.time(),
+        "last_seen": time.time(),
+    }
+    row.update(kw)
+    cols = ", ".join(row)
+    db.ex(f"INSERT INTO intake ({cols}) VALUES "
+          f"({', '.join('?' * len(row))})", tuple(row.values()))
+
+
+def test_intake_lists_and_decodes_its_json(client):
+    _intake_row(client)
+    r = client.get("/api/intake")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["evidence"] == {"videos": 1}
+
+
+def test_intake_hides_downloads_that_have_left_the_queue(client):
+    _intake_row(client, download_id="gone", gone=time.time())
+    assert client.get("/api/intake?live=true").json() == []
+    assert len(client.get("/api/intake?live=false").json()) == 1
+
+
+def test_intake_filters_by_verdict(client):
+    _intake_row(client, download_id="a", verdict="manual")
+    _intake_row(client, download_id="b", verdict="bad_release")
+    assert len(client.get("/api/intake?verdict=bad_release").json()) == 1
+
+
+def test_status_carries_an_intake_summary(client):
+    _intake_row(client, download_id="a", verdict="bad_release")
+    body = client.get("/api/status").json()
+    assert body["intake"]["bad"] == 1
+
+
+def test_acting_on_a_departed_download_is_rejected(client):
+    _intake_row(client, download_id="gone", gone=time.time())
+    r = client.post("/api/intake/act?source=sonarr&download_id=gone")
+    assert r.status_code == 409
+
+
+def test_acting_on_an_unknown_download_is_a_404(client):
+    r = client.post("/api/intake/act?source=sonarr&download_id=nope")
+    assert r.status_code == 404
+
+
+def test_ignoring_marks_it_manual(client):
+    _intake_row(client, verdict="unrecognised")
+    r = client.post("/api/intake/ignore?source=sonarr&download_id=hash1")
+    assert r.status_code == 200
+    assert db.q1("SELECT verdict FROM intake")["verdict"] == "manual"
+
+
+def test_intake_settings_round_trip(client):
+    payload = client.get("/api/settings").json()
+    payload["intake"]["action"] = "fix"
+    payload["intake"]["min_blocked_minutes"] = 45
+    r = client.put("/api/settings", json=payload)
+    assert r.status_code == 200
+    assert config.get().intake.action == "fix"
+    assert config.get().intake.min_blocked_minutes == 45

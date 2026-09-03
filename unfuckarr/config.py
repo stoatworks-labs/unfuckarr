@@ -364,6 +364,56 @@ class MakeMKVConfig(BaseModel):
     keep_disc_image: bool = False
 
 
+class IntakeConfig(BaseModel):
+    """Watching the *arr download queue for imports that will never happen.
+
+    Narrow on purpose. This does **not** do stalled or slow downloads or stuck
+    torrent metadata — those are a download-client question, they are what
+    Cleanuparr and decluttarr already do well, and two tools removing from one
+    queue race each other. It does the one class those tools get wrong: a
+    download that finished and that the *arr refuses to import.
+
+    ``action`` is ``flag`` by default and that is not timidity. The whole
+    argument for this feature is that it tells a bad release apart from a good
+    one the *arr cannot place — so the first thing anyone should do is read a
+    week of its verdicts and see whether it agrees with them.
+    """
+
+    enabled: bool = True
+    # flag  – report only; touch nothing.
+    # fix   – remove the item, blocklist the release, let the *arr re-search.
+    # Typed so it can never do anything else: there is no "delete" here, and
+    # the recycle bin is not involved because nothing has entered the library.
+    action: Literal["flag", "fix"] = "flag"
+    poll_minutes: int = 10
+    # How long an import must have been blocked before it is even considered.
+    # The *arr retries imports on its own schedule and a great many blocks
+    # clear themselves within a few minutes; acting on a snapshot means acting
+    # on downloads that were about to import.
+    min_blocked_minutes: int = 30
+    # The same brake as `Policy.max_actions_per_scan`, for the same reason.
+    max_actions_per_pass: int = 5
+    # And the same brake as `Policy.abort_if_failure_ratio_over`. If most of
+    # the queue is blocked at once that is SABnzbd, qBittorrent or the mount —
+    # not a run of bad releases — and the correct response is to flag every
+    # one of them and touch nothing. A queue is small, so this also needs a
+    # floor: two blocked items out of two is a ratio of 1.0 and means nothing.
+    abort_if_blocked_ratio_over: float = 0.5
+    abort_ratio_min_items: int = 4
+    # Remove the download from the client as well as the *arr's queue. Off
+    # means the *arr forgets it and the client keeps seeding/holding it, which
+    # is usually not what anyone wants but is the safer half of the operation.
+    remove_from_client: bool = True
+    # Blocklist the release so the same broken copy is not grabbed straight
+    # back, and let the *arr queue the replacement search itself. Invariant 2
+    # in its queue form — see `ArrClient.remove_from_queue`.
+    blocklist: bool = True
+    # Extra phrases that mean "this is the *arr's problem, not the release's",
+    # merged with `intake.ARR_SIDE_MARKERS`. Case-insensitive substrings.
+    # Only ever makes the module *less* likely to act.
+    never_act_phrases: list[str] = Field(default_factory=list)
+
+
 class ScheduleConfig(BaseModel):
     scan_enabled: bool = True
     scan_interval_hours: int = 24
@@ -395,6 +445,7 @@ class Settings(BaseModel):
     transcode: TranscodeConfig = Field(default_factory=TranscodeConfig)
     shrink: ShrinkConfig = Field(default_factory=ShrinkConfig)
     makemkv: MakeMKVConfig = Field(default_factory=MakeMKVConfig)
+    intake: IntakeConfig = Field(default_factory=IntakeConfig)
     policy: Policy = Field(default_factory=Policy)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     watch_folders: list[WatchFolder] = Field(default_factory=list)
