@@ -830,3 +830,49 @@ Ships `enabled: true, action: "flag"` — it classifies and touches nothing unti
 
 `/mnt/user/appdata/Cleanuparr/cleanuparr.db` holds the qBittorrent **username and password in
 plaintext** in `download_clients`, and appdata is world-readable (`drwxrwxrwx` on the parent).
+
+## 2026-09-03: intake DEPLOYED, and the lock bug the deploy found
+
+**PRs #16 and #17 merged; `unfk` rebuilt from `:edge` (`3e8930b`) and recreated twice.** Backup at
+`/root/unfk-backup-pre-intake-2026-09-03/` (config + db + **-wal** + -shm + inspect), plus
+`unfuckarr.db.pre-3e8930b` before the second recreate. Previous image kept as
+**`unfuckarr-makemkv:rollback-2026-08-27`** — rollback is `docker tag` it back to
+`unfuckarr-makemkv:edge` and re-run `/root/recreate-unfk.sh`.
+
+**Live settings:** `intake.enabled=true`, **`action="flag"`** (classifies, removes nothing),
+`poll_minutes=10`, `min_blocked_minutes=30`. Path mappings added to **both** *arrs:
+`/downloads` → `/media/downloads/complete`. That works because the downloads already live inside
+the existing `/mnt/user/media → /media` bind — no new volume. Container confirmed to see 2,413
+entries there.
+
+**The deploy found a real bug, and it was not in the new code.** The first live `intake` pass
+fetched the queue, classified it, wrote its verdicts — then died on the *last* statement of the
+pass, the activity-log line describing what it had just done: `database is locked`, HTTP 500,
+result discarded. Cause: a scan starting up holds the write lock while `sync_inventory` rewrites
+the whole library (18,440 rows), so a write arriving in that window waits out `busy_timeout` and
+raises. Two fixes in #17 — `db.ex` now **rolls back** (a failed statement was leaving Python's
+implicit transaction open on that thread's connection, and FastAPI reuses worker threads, so one
+transient lock error poisoned every later request landing on it), and `run_pass` no longer throws
+away a completed pass because its summary line could not be written.
+
+**Diagnostic lesson, worth more than the fix.** The first theory was a dangling `q1` cursor
+holding a read transaction — which *does* produce an instant `database is locked` with the busy
+handler bypassed, and I "confirmed" it with a repro that held the cursor in a variable.
+`db.q1` is `connect().execute(...).fetchone()`, whose cursor is a temporary CPython frees at
+once, so it was never exposed. What caught it: the regression tests written for that theory
+**passed on the unfixed code**. A regression test that does not fail without the fix has not
+reproduced anything. Reproduce against the actual helper, not a paraphrase of it.
+
+Measured while chasing it: `busy_timeout` **is** honoured — against a held `BEGIN EXCLUSIVE` a
+write fails after exactly the timeout. So a *fast* `database is locked` is not plain contention.
+
+**Still not fixed:** `sync_inventory` should commit in batches instead of holding the write lock
+across the whole library. That window is the root cause and it recurs on every scan start.
+
+**Interrupting scans is cheap and the reconciler earns its keep.** Two restarts killed two
+in-flight transcodes; startup removed **28 abandoned outputs totalling 9.26 GB** and marked 2
+interrupted jobs failed.
+
+**Not yet exercised live:** the queue was empty by the time everything was deployed (the three
+`importBlocked` Trains episodes imported on their own), so no `bad_release` and no removal has
+run against a real queue. `action` stays `flag` until a week of verdicts has been read.
