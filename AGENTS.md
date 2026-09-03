@@ -255,6 +255,29 @@ Break any of these and the failure is quiet and expensive.
 
 ## Traps found the hard way
 
+- **The recycle bin's size is what is on disk, not `SUM(size)` from the table.** The two disagree,
+  and the disk is the one holding the space: measured live on 2026-09-03 the database reported
+  **0 files and 0 bytes** while a 14.5 GB Blu-ray remux sat in `/media/.recycle/2026-09-03/` with
+  no row. `recycle.contents()` reads the bin and is what `usage()`, the size limit and the UI all
+  work from; `tracked_*` is reported alongside so the difference is visible rather than the
+  smaller number being quietly shown.
+
+- **An orphaned bin file's mtime is not when it was recycled.** `shutil.move` preserves the
+  original's mtime, so a row-less file's mtime is when the *video* was made. Ordering "oldest
+  first" by it put a film recycled today behind an episode recycled a fortnight earlier — caught
+  by running the real thing, not by a test. The dated folder name is the only honest record for a
+  file with no row, and `BinEntry.order` uses it with mtime only as a within-day tiebreaker.
+
+- **Retention was gated behind scheduled scans.** `service._scheduler` did
+  `if state.paused or not s.schedule.scan_enabled: continue` *before* the recycle sweep, two
+  lines above a comment reading "Retention runs on the same tick; it is cheap and needs no scan
+  to have happened". So turning scheduled scans off — an ordinary thing to do — silently stopped
+  the bin ever being swept and it grew without limit. Housekeeping now runs before that gate, and
+  is skipped only while paused. It also called `sweep(days)` with **no bin path**, so the orphan
+  half looked in the default `/config/recycle` rather than the configured bin: on any install
+  following the README, an orphan was never purged by anything except "Empty now" in the UI.
+
+
 - **A scan starting up holds the SQLite write lock long enough to fail an API write.**
   `scanner.sync_inventory` rewrites the whole library in one transaction — 18,440 rows on the
   live instance — and any other write arriving in that window waits out `busy_timeout` (30s) and

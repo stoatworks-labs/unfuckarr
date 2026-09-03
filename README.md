@@ -205,6 +205,18 @@ Unattended deletion needs to be wrong safely, so there are three layers:
   Retention defaults to 14 days and any entry can be restored from the web UI. Set it to 0 to
   unlink immediately.
 
+  **Give it a size limit too.** Retention is a promise about *time*, and after one bad night
+  fourteen days of it quietly becomes a promise about several hundred GB. `recycle_bin_max_gb`
+  is a promise about space, which is what actually runs out: set it and the oldest entries are
+  pruned to make room *before* a new file is stored, so it is a ceiling rather than a high-water
+  mark. 0 means no limit. A single file bigger than the whole limit is still kept, after
+  everything else has been pruned for it — refusing would turn a recoverable delete into a
+  permanent one, which is the opposite of the point.
+
+  The recycle bin page shows the total, the limit, how full it is, and — separately — anything in
+  the bin that the database has no record of, because those cannot be restored from the UI even
+  though they are still occupying the disk and are still pruned.
+
   **Put the bin inside your media mount.** Set `UNFUCKARR_RECYCLE_BIN_PATH` (or the Recycle bin
   field in the Unraid template) to something like `/media/.recycle`. On the same filesystem as
   the media, recycling a file is a *rename* and costs nothing; anywhere else it is a full copy of

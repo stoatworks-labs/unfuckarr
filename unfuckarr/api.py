@@ -112,13 +112,28 @@ def get_status() -> dict[str, Any]:
         "counts": counts,
         "total": sum(counts.values()),
         "libraries": libraries,
-        "recycle": recycle.usage(config.get().policy.recycle_bin_path),
+        "recycle": recycle_summary(),
         "watch_pending": service.watcher.pending,
         "shrink": shrink_summary(),
         "intake": intake_summary(),
         "totals": totals_summary(),
         "configured": bool(config.get().sonarr.enabled or config.get().radarr.enabled
                            or config.get().extra_library_paths),
+    }
+
+
+def recycle_summary() -> dict[str, Any]:
+    """Bin usage plus the configured ceiling.
+
+    The ceiling rides along so the recycle page can draw "x of y used" without
+    fetching the whole settings document — the same reason the intake summary
+    carries its action.
+    """
+    policy = config.get().policy
+    return {
+        **recycle.usage(policy.recycle_bin_path),
+        "limit_gb": policy.recycle_bin_max_gb,
+        "days": policy.recycle_bin_days,
     }
 
 

@@ -342,18 +342,42 @@ class Service:
         self._recompute_next_scan()
         while not self._sched_stop.wait(30.0):
             s = config.get()
+
+            # Retention and the size limit first, and outside the scan gate
+            # below. They are about the recycle bin, not about scanning: this
+            # used to sit after an early `continue`, so turning scheduled
+            # scans off — a perfectly ordinary thing to do — silently stopped
+            # the bin ever being swept, and it grew without limit. The comment
+            # here has always said it "needs no scan to have happened"; the
+            # code disagreed. Still skipped while paused, because paused means
+            # the user has asked for nothing to happen.
+            if not state.paused:
+                try:
+                    self.housekeeping(s)
+                except Exception:  # noqa: BLE001
+                    log.exception("recycle housekeeping failed")
+
             if state.paused or not s.schedule.scan_enabled:
                 state.next_scan_at = None
                 continue
             due = state.next_scan_at
             if due is not None and time.time() >= due and not self.scanning:
                 self.start_scan("scheduled")
-            # Retention runs on the same tick; it is cheap and needs no
-            # scan to have happened.
-            try:
-                recycle.sweep(s.policy.recycle_bin_days)
-            except Exception:  # noqa: BLE001
-                log.exception("recycle sweep failed")
+
+    @staticmethod
+    def housekeeping(s: Settings) -> None:
+        """Retention and the size ceiling. Its own method so it is testable —
+        driving `_scheduler` means waiting on a 30-second timer."""
+        # `recycle_bin_path` was missing from this call, and without it the
+        # orphan half of the sweep looked in the *default* bin
+        # (/config/recycle) rather than the configured one — so on any install
+        # that moved its bin, which is every install following the README, a
+        # bin file whose row is gone was never purged by anything. Only
+        # "Empty now" in the UI ever passed the path.
+        recycle.sweep(s.policy.recycle_bin_days, s.policy.recycle_bin_path)
+        recycle.enforce_limit(
+            max(0, s.policy.recycle_bin_max_gb) * 1024 ** 3,
+            s.policy.recycle_bin_path)
 
     def _recompute_next_scan(self) -> None:
         s = config.get()
