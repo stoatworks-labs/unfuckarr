@@ -981,7 +981,10 @@ function buildRecycleTotals() {
       + 'and by the size limit.'));
   }
 
-  return el('div', { class: 'card' }, kids);
+  // A plain block, not a `card`: this is appended *inside* the recycle
+  // card, and nesting one gives a box inside a box — its own border,
+  // background and 16px of padding.
+  return el('div', { style: 'margin-bottom:12px' }, kids);
 }
 
 async function viewRecycle() {
