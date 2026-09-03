@@ -8,12 +8,15 @@ scan is writing.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable
+
+log = logging.getLogger(__name__)
 
 DB_DIR = Path(os.environ.get("UNFUCKARR_CONFIG_DIR", "/config"))
 DB_PATH = DB_DIR / "unfuckarr.db"
@@ -277,10 +280,35 @@ def q1(sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:
 
 
 def ex(sql: str, params: Iterable[Any] = ()) -> int:
+    """One write, committed.
+
+    The rollback is the part that matters. A statement that fails — and the
+    one that realistically fails here is a write that waited out
+    `busy_timeout` against a lock somebody else is holding — leaves Python's
+    implicit transaction **open** on this thread's connection
+    (`conn.in_transaction` stays True; measured on the live instance
+    2026-09-03). Connections are per-thread and long-lived, and FastAPI reuses
+    its worker threads, so without this a single transient `database is
+    locked` leaves that thread holding an open transaction against every
+    later request that lands on it.
+
+    What makes the lock get held that long in the first place is a scan
+    starting: `scanner.sync_inventory` writes the whole library — 18,440 rows
+    on the live instance — and an API write that arrives during it can wait
+    out all 30 seconds and fail. That is worth fixing separately; this makes
+    sure the failure costs one statement rather than a connection.
+    """
     conn = connect()
-    cur = conn.execute(sql, tuple(params))
-    conn.commit()
-    return cur.lastrowid or 0
+    try:
+        cur = conn.execute(sql, tuple(params))
+        conn.commit()
+        return cur.lastrowid or 0
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001 - the original error is the useful one
+            log.debug("rollback failed after a failed write", exc_info=True)
+        raise
 
 
 def bump(name: str, by: int = 1) -> None:

@@ -690,7 +690,18 @@ class IntakeWatcher:
 
         out.acted = acted
         level = "warn" if (out.bad or out.errors or out.aborted) else "info"
-        db.log("intake_pass", level, None, out.as_dict())
+        # A pass that has already done its work must not be thrown away
+        # because the line describing it could not be written. The write that
+        # realistically fails is exactly this one: a scan starting up holds
+        # the write lock while `sync_inventory` rewrites the whole library —
+        # 18,440 rows live — and a pass landing in that window waits out
+        # `busy_timeout` and raises. Live on 2026-09-03 that turned a
+        # completed pass into an HTTP 500 and lost the result.
+        try:
+            db.log("intake_pass", level, None, out.as_dict())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not record the intake pass: %s", exc)
+            out.errors.append(f"could not write to the activity log: {exc}")
         bus.publish("intake", out.as_dict())
         return out
 
