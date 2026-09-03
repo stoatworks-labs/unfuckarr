@@ -293,6 +293,24 @@ class Policy(BaseModel):
     # Deletes move here first. 0 disables the bin and unlinks immediately.
     recycle_bin_days: int = 14
     recycle_bin_path: str = ""
+    # A ceiling on the bin, in GB — GiB, i.e. 1024³, because that is what
+    # every size in this application's UI is rendered in, and a limit that
+    # displayed as 18.6 GB when you typed 20 is a bug report waiting to
+    # happen. 0 is no limit — retention alone decides.
+    # When set, the oldest entries are pruned to make room *before* a new file
+    # is stored, so the limit is a limit rather than a high-water mark that
+    # the next scheduler tick tidies up 30 seconds later.
+    #
+    # It is a second, independent brake on the same thing `recycle_bin_days`
+    # brakes: 14 days of retention is a promise about *time*, and on a library
+    # that has just had a bad night it can quietly become a promise about
+    # several hundred GB. This one is a promise about space, and space is what
+    # actually runs out.
+    #
+    # One file bigger than the whole limit is still stored, after everything
+    # else has been pruned for it — refusing would turn a recoverable delete
+    # into a permanent one, which is the opposite of the point.
+    recycle_bin_max_gb: int = 0
     # Refuse to act on more than this many files in one scan. A mount that
     # disappears mid-scan makes every file look broken; this is the brake.
     max_actions_per_scan: int = 50

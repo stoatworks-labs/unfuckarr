@@ -213,6 +213,11 @@ def _size_of(path: str) -> int:
         return 0
 
 
+def _max_bin_bytes(settings: Settings) -> int:
+    """The recycle bin's size ceiling in bytes, or 0 for no limit."""
+    return max(0, settings.policy.recycle_bin_max_gb) * 1024 ** 3
+
+
 def _is_disc(result: CheckResult) -> bool:
     """Whether the checked file was a disc image.
 
@@ -472,7 +477,8 @@ class Remediator:
             try:
                 recycled = recycle.store(
                     path, f"replaced by transcode ({plan.describe})",
-                    s.policy.recycle_bin_path, s.policy.recycle_bin_days)
+                    s.policy.recycle_bin_path, s.policy.recycle_bin_days,
+                    _max_bin_bytes(s))
             except OSError as exc:
                 Path(dst).unlink(missing_ok=True)
                 msg = f"could not recycle the original: {exc}"
@@ -909,7 +915,8 @@ class Remediator:
             recycled = recycle.store(
                 path, f"replaced by shrink ({plan.describe}, "
                       f"{metric.name.upper()} {mean:.1f})",
-                s.policy.recycle_bin_path, s.policy.recycle_bin_days)
+                s.policy.recycle_bin_path, s.policy.recycle_bin_days,
+                _max_bin_bytes(s))
         except OSError as exc:
             Path(dst).unlink(missing_ok=True)
             msg = f"could not recycle the original: {exc}"
@@ -1184,7 +1191,8 @@ class Remediator:
                 recycled = recycle.store(
                     path, f"converted to Matroska ({main.seconds / 60:.0f} min "
                           f"feature, {len(saved_extras)} extras)",
-                    s.policy.recycle_bin_path, s.policy.recycle_bin_days)
+                    s.policy.recycle_bin_path, s.policy.recycle_bin_days,
+                    _max_bin_bytes(s))
         except OSError as exc:
             Path(produced).unlink(missing_ok=True)
             msg = f"could not recycle the image: {exc}"
@@ -1375,7 +1383,8 @@ class Remediator:
             try:
                 recycled = recycle.store(path, f"redownload: {reason}",
                                          s.policy.recycle_bin_path,
-                                         s.policy.recycle_bin_days)
+                                         s.policy.recycle_bin_days,
+                                         _max_bin_bytes(s))
                 steps.append("moved to recycle bin")
             except OSError as exc:
                 return {"action": "redownload", "ok": False,

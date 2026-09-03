@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import db
@@ -46,7 +47,168 @@ def same_filesystem(configured: str, sample: str) -> bool | None:
         return None
 
 
-def store(path: str, reason: str, configured_bin: str, days: int) -> str | None:
+DATED_DIR = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+@dataclass
+class BinEntry:
+    """One file actually sitting in the bin."""
+
+    path: Path
+    size: int
+    when: float                 # recycled-at: the row, else the dated folder
+    mtime: float = 0.0          # tiebreaker within a day
+    row_id: int | None = None   # None for a file the database has no row for
+
+    @property
+    def order(self) -> tuple[float, float]:
+        return (self.when, self.mtime)
+
+
+def contents(configured_bin: str) -> list[BinEntry]:
+    """Everything in the bin, read from **disk** rather than the database.
+
+    Disk, because the two disagree and the disk is the one holding the space.
+    Live on 2026-09-03 the database reported 0 files and 0 bytes while a
+    14.5 GB Blu-ray remux sat in `/media/.recycle/2026-09-03/` with no row —
+    so a "total size" taken from `SUM(size)` would have read zero next to
+    14.5 GB of real disk.
+
+    Rows still matter: they carry the time the file was recycled, which is
+    what "oldest" means, and the id needed to keep the table consistent when
+    something is pruned. A file with no row falls back to its dated folder —
+    see below for why not its mtime.
+
+    Only dated directories are read, so anything else that ends up under the
+    bin path is neither counted nor ever deleted.
+    """
+    root = bin_path(configured_bin)
+    if not root.is_dir():
+        return []
+    rows = {r["stored"]: r for r in
+            db.q("SELECT id, stored, deleted FROM recycle WHERE stored != ''")}
+    out: list[BinEntry] = []
+    try:
+        dated = sorted(root.iterdir())
+    except OSError as exc:
+        log.warning("could not read the recycle bin at %s: %s", root, exc)
+        return []
+    for day in dated:
+        if not day.is_dir() or not DATED_DIR.fullmatch(day.name):
+            continue
+        # The folder name is when the file was *recycled*, and for a file with
+        # no row it is the only honest answer. Not its mtime: `shutil.move`
+        # preserves the original's, so an orphan's mtime is when the video was
+        # made — which put a film recycled today behind an episode recycled a
+        # fortnight ago when the limit came to choose. Observed doing exactly
+        # that, 2026-09-03, before this was written.
+        try:
+            day_start = time.mktime(time.strptime(day.name, "%Y-%m-%d"))
+        except ValueError:
+            continue
+        try:
+            entries = list(day.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            row = rows.get(str(entry))
+            out.append(BinEntry(
+                path=entry,
+                size=stat.st_size,
+                when=(row["deleted"] if row else day_start),
+                mtime=stat.st_mtime,
+                row_id=(row["id"] if row else None),
+            ))
+    return out
+
+
+def _forget(entry: BinEntry) -> None:
+    if entry.row_id is not None:
+        db.ex("DELETE FROM recycle WHERE id = ?", (entry.row_id,))
+
+
+def enforce_limit(max_bytes: int, configured_bin: str,
+                  incoming: int = 0) -> tuple[int, int]:
+    """Prune the oldest entries until the bin fits. Returns (files, bytes).
+
+    ``incoming`` is the size of a file about to be added, so the room is made
+    *before* the bin goes over rather than after — which is what "auto-prune
+    if you are going to exceed that size" has to mean if the limit is to be a
+    limit rather than a high-water mark.
+
+    Oldest first, by the time the file was recycled — the row's timestamp, or
+    the dated folder for a file that has no row. Orphans are pruned on exactly
+    the same footing as tracked files: they occupy the same disk, and a limit
+    that could only see half the bin would quietly stop being a limit.
+
+    **A single file larger than the whole limit is still stored**, after the
+    bin has been emptied for it. Refusing would turn a recoverable delete into
+    a permanent one, which is the opposite of what a recycle bin is for, so
+    the limit is exceeded and said so loudly instead.
+    """
+    if max_bytes <= 0:
+        return 0, 0
+    entries = contents(configured_bin)
+    total = sum(e.size for e in entries) + incoming
+    if total <= max_bytes:
+        return 0, 0
+
+    files = freed = 0
+    for entry in sorted(entries, key=lambda e: e.order):
+        if total <= max_bytes:
+            break
+        try:
+            entry.path.unlink()
+        except OSError as exc:
+            log.warning("could not prune %s: %s", entry.path, exc)
+            continue
+        _forget(entry)
+        total -= entry.size
+        freed += entry.size
+        files += 1
+        db.log("recycle_pruned", "warn", str(entry.path), {
+            "bytes": entry.size, "reason": "the recycle bin is at its size limit",
+            "tracked": entry.row_id is not None,
+        })
+
+    _tidy_empty_dirs(configured_bin)
+    if files:
+        db.log("recycle_limit_enforced", "warn", detail={
+            "files": files, "bytes": freed, "limit": max_bytes,
+        })
+    if total > max_bytes:
+        # Only reachable when one file is bigger than the whole limit.
+        log.warning("recycle bin is %.1f GB over its %.1f GB limit after "
+                    "pruning everything it could",
+                    (total - max_bytes) / 1e9, max_bytes / 1e9)
+        db.log("recycle_limit_exceeded", "warn", detail={
+            "over_bytes": total - max_bytes, "limit": max_bytes,
+        })
+    return files, freed
+
+
+def _tidy_empty_dirs(configured_bin: str) -> None:
+    root = bin_path(configured_bin)
+    if not root.is_dir():
+        return
+    for day in list(root.iterdir()):
+        if not day.is_dir() or not DATED_DIR.fullmatch(day.name):
+            continue
+        try:
+            if not any(day.iterdir()):
+                day.rmdir()
+        except OSError:
+            pass
+
+
+def store(path: str, reason: str, configured_bin: str, days: int,
+          max_bytes: int = 0) -> str | None:
     """Move ``path`` into the bin. Returns the stored path, or None if the
     file was unlinked outright (retention disabled) or was already gone."""
     src = Path(path)
@@ -60,6 +222,10 @@ def store(path: str, reason: str, configured_bin: str, days: int) -> str | None:
               "VALUES (?,?,?,?,?)", (path, "", size, time.time(), reason))
         db.log("file_deleted", "warn", path, {"reason": reason, "recycled": False})
         return None
+
+    # Make room before the move, not after: a limit enforced only on the next
+    # scheduler tick is a high-water mark, and the tick is 30 seconds away.
+    enforce_limit(max_bytes, configured_bin, incoming=size)
 
     root = bin_path(configured_bin) / time.strftime("%Y-%m-%d")
     root.mkdir(parents=True, exist_ok=True)
@@ -156,7 +322,7 @@ def _sweep_orphans(configured_bin: str, cutoff: float) -> int:
     removed = 0
     for dated in sorted(root.iterdir()):
         # "2026-08-19" — anything else in there is not ours to delete.
-        if not dated.is_dir() or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", dated.name):
+        if not dated.is_dir() or not DATED_DIR.fullmatch(dated.name):
             continue
         for entry in list(dated.iterdir()):
             if not entry.is_file() or str(entry) in known:
@@ -196,9 +362,22 @@ def usage(configured_bin: str) -> dict[str, object]:
         free = shutil.disk_usage(probe).free
     except OSError:
         pass
+    # What is actually there, which is not the same number as the database's.
+    # `bytes` is the honest one and is what the UI shows as the bin's size;
+    # `tracked_bytes` is what can still be restored from the UI. They differ
+    # whenever a row is lost — measured live on 2026-09-03 as 0 tracked bytes
+    # against 14.5 GB on disk — and the difference is worth showing rather
+    # than quietly reporting the smaller one.
+    entries = contents(configured_bin)
+    on_disk = sum(e.size for e in entries)
+    orphaned = sum(e.size for e in entries if e.row_id is None)
     return {
-        "count": row["c"] if row else 0,
-        "bytes": row["s"] if row else 0,
+        "count": len(entries),
+        "bytes": on_disk,
+        "tracked_count": row["c"] if row else 0,
+        "tracked_bytes": row["s"] if row else 0,
+        "orphan_count": sum(1 for e in entries if e.row_id is None),
+        "orphan_bytes": orphaned,
         "path": str(path),
         "configured": bool(configured_bin),
         "writable": os.access(probe, os.W_OK),

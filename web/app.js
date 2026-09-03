@@ -937,6 +937,53 @@ async function loadJobs() {
 
 /* ---------- recycle bin ---------- */
 
+function buildRecycleTotals() {
+  const r = (STATUS && STATUS.recycle) || {};
+  const limit = (SETTINGS && SETTINGS.policy && SETTINGS.policy.recycle_bin_max_gb)
+    || (STATUS && STATUS.recycle && STATUS.recycle.limit_gb) || 0;
+  const used = r.bytes || 0;
+  const cap = limit * 1024 ** 3;
+
+  const stats = [
+    ['', bytes(used), 'Total size'],
+    ['', (r.count || 0).toLocaleString(), 'Files in the bin'],
+    ['', bytes(r.free || 0), 'Free on that disk'],
+  ];
+  if (limit) stats.splice(1, 0, ['', `${limit} GB`, 'Size limit']);
+
+  const kids = [
+    el('div', { class: 'grid grid-stats' },
+      stats.map(([kind, n, label]) => el('div', { class: `stat ${kind}` },
+        el('div', { class: 'n' }, n),
+        el('div', { class: 'l' }, label)))),
+  ];
+
+  // How full the bin is against its limit, when there is one.
+  if (cap > 0) {
+    const frac = Math.min(1, used / cap);
+    kids.push(el('div', { class: 'bar', style: 'margin:10px 0 4px' },
+      el('i', { style: `width:${(frac * 100).toFixed(1)}%` })));
+    kids.push(el('div', { class: 'muted small' },
+      `${bytes(used)} of ${bytes(cap)} used`
+      + (used > cap
+        ? ' — over the limit. One file larger than the whole limit is kept'
+          + ' rather than deleted outright.'
+        : `. The oldest entries are pruned automatically to stay under it.`)));
+  }
+
+  // The database and the disk can disagree, and the disk is the one holding
+  // the space. Only worth saying when they actually do.
+  if (r.orphan_count) {
+    kids.push(el('div', { class: 'small sev-warning', style: 'margin-top:8px' },
+      `${r.orphan_count} file(s) totalling ${bytes(r.orphan_bytes || 0)} are in `
+      + 'the bin with no database record, so they cannot be restored from here. '
+      + 'They still count towards the total and are still pruned by retention '
+      + 'and by the size limit.'));
+  }
+
+  return el('div', { class: 'card' }, kids);
+}
+
 async function viewRecycle() {
   const v = $('#view');
   v.replaceChildren(buildLivePanel());
@@ -954,6 +1001,7 @@ async function viewRecycle() {
     el('div', { class: 'muted small', style: 'margin-bottom:12px' },
       'Files deleted by unfuckarr are kept here until the retention window in Settings expires, so an automatic decision can be undone. '
       + `Currently ${(STATUS && STATUS.recycle && STATUS.recycle.path) || 'unknown'}.`),
+    buildRecycleTotals(),
     el('div', { id: 'recBody', class: 'empty' }, 'Loading…'));
   v.append(card);
 
@@ -981,7 +1029,11 @@ async function viewRecycle() {
               } catch (e) { toast(e.message, 'bad'); }
             },
           }, 'Restore') : el('span', { class: 'muted small' }, 'not kept')))))))
-    : el('div', { class: 'empty', id: 'recBody' }, 'The recycle bin is empty.'));
+    : el('div', { class: 'empty', id: 'recBody' },
+        (STATUS && STATUS.recycle && STATUS.recycle.count)
+          ? 'Nothing here can be restored — every file in the bin is one the '
+            + 'database has no record of. They are still counted and still pruned.'
+          : 'The recycle bin is empty.'));
 }
 
 /* ---------- settings ---------- */
@@ -995,6 +1047,7 @@ const FIELD_HELP = {
   'policy.incompatible_action': 'What to do with an intact file Emby would have to transcode.',
   'policy.hygiene_action': 'What to do about missing language tags, default-track flags and similar. These never justify deleting a file.',
   'policy.recycle_bin_days': 'Deleted files are kept this long so an automatic decision can be undone. 0 deletes immediately.',
+  'policy.recycle_bin_max_gb': 'A ceiling on the bin, in GB. 0 means no limit \u2014 retention alone decides. When set, the oldest entries are pruned to make room BEFORE a new file is stored, so it is a limit rather than something the next tick tidies up. Worth setting alongside the retention window: 14 days is a promise about time, and after one bad night that quietly becomes a promise about several hundred GB \u2014 this one is a promise about space, which is what actually runs out. Files with no database record count and are pruned too. One file larger than the whole limit is still kept, after everything else has been pruned for it: refusing would turn a recoverable delete into a permanent one.',
   'policy.recycle_bin_path': 'Where deleted and replaced files are kept. Point it at a path INSIDE your media mount and on the same share \u2014 e.g. /media/.recycle. Then recycling is a rename and costs nothing; anywhere else it is a full copy of every file, and on Unraid the default (/config/recycle) is appdata on the cache, which a handful of 40 GB remuxes will fill. Usually set by UNFUCKARR_RECYCLE_BIN_PATH alongside the volume mappings.',
   'policy.oversize_action': 'What to do with a file that has not been measured for a saving yet. This can never delete: the worst it can do is re-encode, and only when a measured quality check says the result is indistinguishable from the original.',
   'policy.max_actions_per_scan': 'Hard cap on how many files one scan may transcode or delete. Shrinks are counted separately, below.',
@@ -1206,6 +1259,7 @@ async function viewSettings() {
       { label: 'Blocklist the release so the same bad file is not grabbed again' }),
     el('div', { class: 'cols' },
       settingField('policy.recycle_bin_days', s.policy.recycle_bin_days),
+      settingField('policy.recycle_bin_max_gb', s.policy.recycle_bin_max_gb),
       settingField('policy.recycle_bin_path', s.policy.recycle_bin_path,
         { label: 'Recycle bin path', placeholder: '/media/.recycle' }),
       settingField('policy.max_actions_per_scan', s.policy.max_actions_per_scan),
