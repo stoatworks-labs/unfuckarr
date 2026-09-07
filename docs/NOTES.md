@@ -876,3 +876,39 @@ interrupted jobs failed.
 **Not yet exercised live:** the queue was empty by the time everything was deployed (the three
 `importBlocked` Trains episodes imported on their own), so no `bad_release` and no removal has
 run against a real queue. `action` stays `flag` until a week of verdicts has been read.
+
+## 2026-09-07: the 18-hour Xena shrink — Mesa spins on closed-caption SEIs
+
+Xena S06E19 (1080p WEB-DL, 44 min, 1.37 GB) sat at 22% after 4.7 h with an ETA of 16 h. The
+ETA was honest: the encode ran at **0.7 fps**. Not the box (load 9 on 24 cores, Emby idle), not
+the GPU (VCN engine at 0.1% via `drm-engine-enc`, fence ring advancing twice a second), not the
+governor (inert, correctly). The `enc0:0:hevc_vaapi` thread was at 100% of one core inside
+`libgallium-25.3.3.so`; `eu-stack` on lilnasx plus `llvm-nm` on the library put every sample in
+`vlVaHandleVAEncPackedHeaderDataBufferTypeHEVC`, Mesa's parser for the packed headers ffmpeg
+hands the driver each frame.
+
+**Cause.** The Xena WEB-DLs carry EIA-608 captions in an SEI on every frame. ffmpeg's h264
+decoder lifts that onto each frame as A/53 side data and `hevc_vaapi` (default
+`-sei hdr+a53_cc`) re-emits it as an 80-byte packed SEI per frame — visible in `-v trace` as a
+"Packed header buffer (4)" the caption-free files never show. Mesa's `parseEncSeiH265` then
+spins ~0.7 s on each one.
+
+| test on lilnasx, unfuckarr's exact command | speed |
+|---|---|
+| Young Sheldon S06E22 remux | 15.3x |
+| Xena S06E19 | 0.028x |
+| Xena S06E18 | 0.026x |
+| Xena S06E19 with `-hwaccel vaapi` decode | 0.023x |
+| Xena S06E19, software x265 ultrafast | 5.8x |
+| **Xena S06E19 with `-sei hdr`** | **19.1x** |
+
+**Fix.** `video_encode_args` now passes `-sei hdr` to `hevc_vaapi` and `-sei -a53_cc` to
+`h264_vaapi`. The embedded captions are the only loss; the files this bites have a text subtitle
+track beside them. Software encoders are untouched. Regression test
+`test_vaapi_never_reemits_closed_captions`. No upstream Mesa report found. Shrinkray runs the
+same ffmpeg build on the same GPU and is exposed to the same thing.
+
+**Why nothing caught it.** The stall detector keys off *any* progress line and `out_time` kept
+advancing, so a crawl is not a stall. The quality search before the encode took 1.5 h for the
+same reason (15 sample encodes at 0.7 fps) and nothing times a search. Worth a ceiling on
+sample-encode speed one day: a 15 s sample that takes over a minute on a GPU is a symptom.

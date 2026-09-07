@@ -345,6 +345,17 @@ def video_encode_args(codec: str, hw: str, crf: int, preset: str,
         args += ["-vf", f"format={surface},hwupload", "-qp", str(crf)]
         if surface == "p010" and codec == "hevc":
             args += ["-profile:v", "main10"]
+        # Never re-emit A/53 closed captions. ffmpeg lifts the caption SEI off
+        # every source frame as side data and the VAAPI encoders pass it back
+        # to the driver as a packed SEI header per frame; Mesa's radeonsi
+        # parser (vlVaHandleVAEncPackedHeaderDataBufferTypeHEVC, 25.3.3) then
+        # spins ~0.7 s of CPU on each one. Measured on the Radeon 880M: a
+        # captioned 1080p WEB-DL encodes at 0.7 fps with the default
+        # `-sei hdr+a53_cc` and at 19x realtime with the captions dropped;
+        # the same command on a caption-free source runs at 15x either way.
+        # The captions are the only loss, and every source this has bitten
+        # carried a text subtitle track beside them.
+        args += ["-sei", "hdr" if codec == "hevc" else "-a53_cc"]
     elif hw == "nvenc":
         args += ["-preset", "p5", "-cq", str(crf), "-pix_fmt", pix_fmt]
     elif hw == "qsv":
