@@ -239,6 +239,25 @@ def test_vaapi_uploads_rather_than_assuming_a_hardware_decode(video_factory,
     assert "scale_vaapi" not in joined
 
 
+def test_vaapi_never_reemits_closed_captions():
+    """Captioned sources must not crawl through Mesa's packed-SEI parser.
+
+    Measured on a Radeon 880M with Mesa 25.3.3: a 1080p WEB-DL carrying
+    EIA-608 captions encodes at 0.7 fps under the default ``-sei hdr+a53_cc``
+    (the encoder thread spins in the driver on the per-frame A/53 SEI, the
+    video engine idles at 0.1%) and at 19x realtime with the captions dropped.
+    The same command on a caption-free source runs at 15x either way, so this
+    is the only change that helps, and it is only about the SEI.
+    """
+    hevc = transcode.video_encode_args("hevc", "vaapi", 27, "medium", "mkv")
+    assert hevc[hevc.index("-sei") + 1] == "hdr"
+    h264 = transcode.video_encode_args("h264", "vaapi", 23, "medium", "mkv")
+    assert h264[h264.index("-sei") + 1] == "-a53_cc"
+    # Software encoders are not affected and keep their captions.
+    assert "-sei" not in transcode.video_encode_args("hevc", "none", 27,
+                                                     "medium", "mkv")
+
+
 # -- end to end -----------------------------------------------------------
 
 @needs_ffmpeg
