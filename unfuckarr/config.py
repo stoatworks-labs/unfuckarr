@@ -260,7 +260,8 @@ class TranscodeConfig(BaseModel):
     replace_original: bool = True
     max_concurrent: int = 1
     nice_level: int = 10
-    # Abort a transcode that has produced nothing for this long.
+    # Abort a transcode that has read no further into its source for this
+    # long (or, where /proc cannot say, whose out_time has not moved).
     stall_timeout_seconds: int = 900
 
 

@@ -440,6 +440,7 @@ class Remediator:
                 cmd, info.duration, on_progress=on_progress,
                 stall_timeout=s.transcode.stall_timeout_seconds,
                 nice_level=s.transcode.nice_level, cancel=cancel,
+                source=path,
             )
             self._cancel.pop(path, None)
 
@@ -837,6 +838,7 @@ class Remediator:
                 cmd, info.duration, on_progress=on_progress,
                 stall_timeout=s.transcode.stall_timeout_seconds,
                 nice_level=s.transcode.nice_level, cancel=cancel,
+                source=path,
                 governor=gov,
             )
             self._cancel.pop(path, None)
