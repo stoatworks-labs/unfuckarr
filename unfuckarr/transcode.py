@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -493,6 +494,92 @@ def colour_args(info: MediaInfo) -> list[str]:
 
 
 _TIME_RE = re.compile(r"out_time_ms=(\d+)")
+_POS_RE = re.compile(r"^pos:\s*(\d+)", re.MULTILINE)
+
+# Where the kernel describes a process's open files. A parameter so a test
+# can stand up a fake tree; the real one only exists on Linux.
+PROC_ROOT = "/proc"
+
+
+def source_of(cmd: list[str]) -> str | None:
+    """The input path of an ffmpeg command: the argument after its last
+    ``-i``. A disc image's input is a ``bluray:`` URL rather than a path, so
+    callers that know the real file should pass it instead."""
+    src = None
+    for i, arg in enumerate(cmd[:-1]):
+        if arg == "-i":
+            src = cmd[i + 1]
+    return src
+
+
+class SourcePosition:
+    """How far ffmpeg has read into its input, from ``/proc/<pid>/fdinfo``.
+
+    ffmpeg 8's ``out_time`` is the *minimum* last-muxed timestamp across all
+    output streams (7.x reported the maximum). Any source with a sparse
+    subtitle track — a forced PGS track on a Blu-ray remux has a handful of
+    packets in the first five minutes — therefore reports an out_time that
+    sits still for most of the job, and progress derived from it froze at
+    1.5% with a 47,000 s ETA on a job that was 86% done. The kernel's read
+    position on the source file has no such opinion about streams: it works
+    for a remux and an encode alike, costs one small file read per poll, and
+    needs nothing from ffmpeg.
+    """
+
+    def __init__(self, pid: int, source: str | None,
+                 proc_root: str = PROC_ROOT) -> None:
+        self.dir = os.path.join(proc_root, str(pid))
+        self.targets: set[str] = set()
+        self.size = 0
+        if source:
+            self.targets = {source, os.path.realpath(source)}
+            try:
+                self.size = os.stat(source).st_size
+            except OSError:
+                self.size = 0
+        self._fd: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.targets) and self.size > 0
+
+    def _find_fd(self) -> str | None:
+        # The fd stays put for the life of the process, so remember it and
+        # only rescan when the cached one stops pointing at the source.
+        fd_dir = os.path.join(self.dir, "fd")
+        if self._fd is not None and self._points_at_source(fd_dir, self._fd):
+            return self._fd
+        self._fd = None
+        try:
+            names = os.listdir(fd_dir)
+        except OSError:
+            return None
+        for name in names:
+            if self._points_at_source(fd_dir, name):
+                self._fd = name
+                break
+        return self._fd
+
+    def _points_at_source(self, fd_dir: str, name: str) -> bool:
+        try:
+            return os.readlink(os.path.join(fd_dir, name)) in self.targets
+        except OSError:
+            return False
+
+    def read(self) -> int | None:
+        """Bytes of the source read so far, or None when the kernel cannot
+        tell us (no /proc, process gone, source not open yet)."""
+        if not self.usable:
+            return None
+        fd = self._find_fd()
+        if fd is None:
+            return None
+        try:
+            with open(os.path.join(self.dir, "fdinfo", fd)) as fh:
+                m = _POS_RE.search(fh.read())
+        except OSError:
+            return None
+        return int(m.group(1)) if m else None
 
 
 @dataclass
@@ -509,13 +596,23 @@ def run(cmd: list[str], total_duration: float,
         stall_timeout: int = 900,
         nice_level: int = 10,
         cancel: threading.Event | None = None,
-        governor: "governor_mod.Governor | None" = None) -> tuple[bool, str]:
+        governor: "governor_mod.Governor | None" = None,
+        source: str | None = None,
+        poll_interval: float = 1.0,
+        proc_root: str = PROC_ROOT) -> tuple[bool, str]:
     """Run ffmpeg, reporting progress and killing a stalled job.
 
-    ffmpeg's ``-progress pipe:1`` emits key=value blocks; ``out_time_ms`` is
-    the only field we need. A job that emits nothing for ``stall_timeout``
-    seconds is killed — a hung read on a dead NFS mount otherwise sits there
-    for ever holding the worker.
+    Progress is how far ffmpeg has read into ``source`` (the input after
+    ``-i`` when not given), read from ``/proc``; see :class:`SourcePosition`
+    for why ``out_time`` from ``-progress pipe:1`` cannot be trusted. Where
+    there is no ``/proc`` — a developer's Mac — ``out_time`` is what we have.
+
+    A job whose read position has not advanced for ``stall_timeout`` seconds
+    is killed — a hung read on a dead NFS mount otherwise sits there for ever
+    holding the worker. The check runs on a timer, not on ffmpeg's output: a
+    blocking ``readline()`` returns only at EOF, so a hung child that emits
+    nothing could never be caught that way, and one that keeps printing a
+    frozen counter must not count as alive either.
     """
     started = time.time()
     preexec = None
@@ -527,12 +624,11 @@ def run(cmd: list[str], total_duration: float,
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1, preexec_fn=preexec,
     )
-    last_output = time.time()
     stderr_tail: list[str] = []
+    position = SourcePosition(proc.pid, source or source_of(cmd), proc_root)
 
     # Hold this encode to its share of the GPU's encode engine, on its own
-    # thread: the loop below is blocked on ffmpeg's progress output, and a
-    # governed process produces that output in bursts by design.
+    # thread, so its stop/resume cadence is independent of the poll below.
     gov_stop = threading.Event()
     gov_thread = None
     if governor is not None and governor.active:
@@ -552,40 +648,76 @@ def run(cmd: list[str], total_duration: float,
     err_thread = threading.Thread(target=drain_stderr, daemon=True)
     err_thread.start()
 
+    # ffmpeg's progress lines arrive through a queue so the loop below wakes
+    # every poll_interval whether or not ffmpeg said anything. None marks EOF.
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def drain_stdout() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.put(line)
+        lines.put(None)
+
+    out_thread = threading.Thread(target=drain_stdout, daemon=True)
+    out_thread.start()
+
     killed_for = ""
-    assert proc.stdout is not None
+    last_advance = started
+    last_pos: int | None = None
+    last_out_time: int | None = None
     while True:
-        line = proc.stdout.readline()
-        if not line:
-            if proc.poll() is not None:
-                break
-            if cancel is not None and cancel.is_set():
-                killed_for = "cancelled"
-                proc.kill()
-                break
-            if time.time() - last_output > stall_timeout:
-                killed_for = f"no progress for {stall_timeout}s"
-                proc.kill()
-                break
-            time.sleep(0.2)
-            continue
-        last_output = time.time()
-        m = _TIME_RE.search(line)
-        if m and on_progress and total_duration > 0:
-            done = int(m.group(1)) / 1_000_000
-            frac = max(0.0, min(1.0, done / total_duration))
-            elapsed = time.time() - started
-            eta = (elapsed / frac - elapsed) if frac > 0.01 else None
-            on_progress(frac, eta)
+        try:
+            line = lines.get(timeout=poll_interval)
+        except queue.Empty:
+            line = ""
+        if line is None:
+            break
         if cancel is not None and cancel.is_set():
             killed_for = "cancelled"
             proc.kill()
             break
+        m = _TIME_RE.search(line) if line else None
+        out_time = int(m.group(1)) if m else None
+        # Once per progress block or per quiet poll, not once per line.
+        if line and out_time is None:
+            continue
+
+        now = time.time()
+        pos = position.read()
+        # Forward progress is whatever drives the progress bar: the read
+        # position where the kernel reports one, the muxed timestamp where
+        # it does not. A change in either direction counts — the Matroska
+        # demuxer seeks to the tail for its cues at open and comes back.
+        if pos is not None:
+            if pos != last_pos:
+                last_advance = now
+            last_pos = pos
+        elif out_time is not None:
+            if out_time != last_out_time:
+                last_advance = now
+            last_out_time = out_time
+        if now - last_advance > stall_timeout:
+            killed_for = f"no progress for {stall_timeout}s"
+            proc.kill()
+            break
+
+        if out_time is not None and on_progress:
+            frac = None
+            if pos is not None:
+                frac = pos / position.size
+            elif total_duration > 0:
+                frac = out_time / 1_000_000 / total_duration
+            if frac is not None:
+                frac = max(0.0, min(1.0, frac))
+                elapsed = now - started
+                eta = (elapsed / frac - elapsed) if frac > 0.01 else None
+                on_progress(frac, eta)
 
     gov_stop.set()
     if gov_thread is not None:
         gov_thread.join(timeout=5)
     proc.wait()
+    out_thread.join(timeout=2)
     err_thread.join(timeout=2)
     if killed_for:
         return False, killed_for

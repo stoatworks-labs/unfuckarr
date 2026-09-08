@@ -912,3 +912,30 @@ same ffmpeg build on the same GPU and is exposed to the same thing.
 advancing, so a crawl is not a stall. The quality search before the encode took 1.5 h for the
 same reason (15 sample encodes at 0.7 fps) and nothing times a search. Worth a ceiling on
 sample-encode speed one day: a 15 s sample that takes over a minute on a GPU is a symptom.
+
+## 2026-09-08: progress froze at 1.5%, and the stall detector had never been able to fire
+
+"Pirates of the Caribbean - On Stranger Tides (2011)" (20 streams, a UHD remux) sat at **1.5%
+with a 47,000 s ETA** while ffmpeg was 86% through the file. `out_time_ms` in the `-progress`
+output was stuck at 121,997,000. **ffmpeg 8's `out_time` is the *minimum* last-muxed timestamp
+across all output streams** (7.x reported the maximum); PGS stream 18 has 2 packets in the first
+300 s, so the counter stops at the last forced subtitle and stays there. `-sn` makes it advance;
+the `-fflags` are irrelevant. Every BD/UHD remux with a sparse forced-subtitle track does this.
+
+**Fix.** `transcode.run` no longer derives progress from `out_time`. It reads the kernel's read
+position on the source — `/proc/<pid>/fdinfo/<fd>` for the fd whose `readlink` is the source
+path — over the source size. Works for a remux and an encode alike, costs one small file read a
+second, needs nothing from ffmpeg. `out_time` is only the fallback where `/proc` is absent (a
+Mac). `SourcePosition` in `transcode.py`; the two call sites pass `source=path`, and the default
+is the argument after `-i`, which for a disc image is a `bluray:` URL and so would not match.
+
+**The second bug was worse and older.** The stall check sat inside `if not line:` after a
+blocking `readline()`, which returns `''` only at EOF. A hung ffmpeg never trips it; a live one
+printing a frozen counter every `-stats_period` looked healthy. `cancel` had the same blind
+spot. The loop now ticks on a timer (stdout through a reader thread and a queue with a
+`poll_interval`) and **the stall clock resets only when the read position moves** — or, without
+`/proc`, when `out_time` moves. Lines arriving is not progress. The 2026-09-07 note that "the
+stall detector keys off any progress line" described what was intended, not what ran.
+
+Tests in `tests/test_transcode_run.py`, none needing ffmpeg: a Python child prints the stuck
+counter and writes its own fake `/proc/<pid>/{fd,fdinfo}` tree, standing in for the kernel.
