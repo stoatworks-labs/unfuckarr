@@ -174,7 +174,8 @@ the box they report `hdr_not_shrunk` and are left alone.
 - **`/api/scan/stop` does not stop the work.** It sets `aborted`, which *is* enough to guarantee
   no remediation (`_run_inner` returns before `_remediate`) — but `pool.map` submits all futures
   up front and `ThreadPoolExecutor.__exit__` waits for every one, so the probes keep running for
-  hours. **Only a container restart actually stops it.**
+  hours. **Only a container restart actually stops it.** *(Corrected 2026-09-14 — the symptom
+  was real, the explanation was not; see "2026-09-14: the scan that read 100% for six days".)*
 - **`state.paused` is IN-MEMORY only** — it does NOT survive a restart, and on restart an
   overdue `next_scan_at` starts a scan immediately. To durably hold scans use
   `schedule.scan_enabled` (persisted to `/mnt/user/appdata/unfuckarr/config.json`).
@@ -939,3 +940,82 @@ stall detector keys off any progress line" described what was intended, not what
 
 Tests in `tests/test_transcode_run.py`, none needing ffmpeg: a Python child prints the stuck
 counter and writes its own fake `/proc/<pid>/{fd,fdinfo}` tree, standing in for the kernel.
+
+## 2026-09-14: the scan that read 100% for six days, and a stop that now stops
+
+Reported as "scan progress gets stuck on completion and does not release, so a new scan cannot
+be triggered, and there is no way to stop/cancel/restart one". All three were true, and none of
+them was a hang.
+
+**What the live instance was doing.** Scan 30 (`scheduled`, started 2026-09-07 14:51, thirty
+seconds after a recreate) read `7,533 of 7,533 checked` with the bar full — and was still
+running on the 13th, at **495 actions**, applying a transcode every 5–15 minutes and sharing
+the single transcode slot with the continuous shrink worker (its next job sat `queued` behind a
+shrink). The probes had finished on day one; everything since was the *repairing* pass, which
+runs on the scan thread, one job at a time, for as long as the pending list takes —
+`max_actions_per_scan` is 10,000 and the pending list was thousands long, so weeks. Nothing on
+the dashboard described that pass: `checked/total` was the only figure, `current` was the last
+file *probed*, and the `scan` task still said `probing 7530/7533`. The scan lock is held for the
+whole of it, so `Scan now` was refused and the 24-hour schedule was skipped every tick. Every
+scan since Aug 26 (23–30) had `finished NULL` and zeroed counters — each killed by a deploy
+restart before its repairs ended — so `last_scan_finished` read Aug 26, every restart found the
+schedule overdue, and started a new week-long scan thirty seconds in. Pausing (tried at 15:07)
+does not touch a running scan either.
+
+**The August note blaming `pool.map` was wrong.** Measured on CPython 3.14: breaking out of
+`for … in pool.map(…)` cancels the queued futures (6 of 50 ran, `with` exited in 0.6 s) — the
+map generator's `finally` does it when the iterator is dropped. The stop check has been in the
+probe loop since 1.0.0. What actually happened on Aug 27 was a stop *during repairing*: the
+loop checks `_stop` only between jobs, never reaches the job under way, and a job waiting for
+the transcode slot behind the shrink worker's encode blocks on the semaphore for the length of
+that encode before it can even look at a cancel event. So a stop appeared to do nothing, and a
+restart really was the only thing that ended it. Reproduce against the actual helper — the same
+lesson as the `q1` cursor theory.
+
+**Found while wiring the stop in, and worse than the complaint:** `_transcode`'s failure path
+falls through to `_redownload_row` when a *repair* fails and `corrupt_action` is `redownload`,
+and a cancelled run took that path too. A scan stopped mid-remux would have deleted and
+re-searched the file being repaired. `test_a_cancelled_repair_is_not_a_failed_repair` pins it;
+it fails on the old code with the file gone and a recycle row.
+
+**What changed** (`claude/scan-stop-and-phases`):
+
+- `ScanProgress` gained `phase` (`enumerating | checking | repairing | finishing`), `pending`,
+  `position`, `phase_started` and `stopping`. The dashboard draws the two passes as two
+  different things — *Repairing — 1,204 of 3,812 files with something to do · about 3 weeks
+  left at this rate* — with the job in flight beneath, and the `scan` task is cleared when the
+  checking pass ends.
+- `Scanner.request_stop` sets the in-flight job's cancel event (the scanner makes one per
+  repair and hands it to `Remediator.apply(…, cancel=)`), and the loop re-checks `_stop` after
+  the event is in place so a stop cannot land in the gap. `Remediator._slot` polls the
+  semaphore against the event instead of blocking on it. The probe pool is explicit
+  `submit` + `shutdown(cancel_futures=True)` rather than a contract inferred from garbage
+  collection. A stop in either pass records `stopped by user` and logs `scan_stopped` with
+  where it got to; the old repairing-pass stop logged `scan_finished`.
+- A cancelled transcode is `cancelled`, not `failed`: no attempt counted, no redownload.
+- **Stop scan** / **Restart** on the dashboard, and the header button reads *Stop scan* while
+  a scan runs and *Stopping…* while it stops. `POST /api/scan/restart` stops and starts the
+  moment the lock is free; a plain stop arriving in between withdraws the restart.
+- Scans with `finished NULL` are closed at startup as `interrupted by a restart`, before the
+  schedule is restored — so **the next scheduled scan after a restart that killed one is a
+  full interval later, not thirty seconds in**. `scan_at_startup` is the switch for that.
+
+**Verified on the running app** (a scratch library of ffmpeg-rendered AVIs, an `ffmpeg` shim
+that sleeps 25 s on transcode outputs only): the repairing panel and the job beneath it agree;
+Stop shows *Stopping* at once and lets go in ~4 s with the job `cancelled`, the source intact,
+no temp output and nothing recycled; Restart cancels and has a fresh scan repairing six seconds
+later; a restart of the server mid-repair closes the scan as interrupted; a scan left alone
+finishes with `aborted NULL`. First attempt tripped the abort brake — five of six demo files are
+"broken", which is exactly what an unmounted array looks like — and that is invariant 4 doing
+its job, not a bug in the demo.
+
+**Still structural, not done here:** the repairs are a *phase of the scan*, so a scan holds the
+library for as long as its backlog takes and the schedule means nothing while it does. The real
+shape is the shrink worker's — a persisted queue of decisions drained by a worker, with the scan
+reduced to the checking pass and the brakes evaluated when the queue is built. Until then, the
+figures are honest and the stop works; the lock is still held for the duration.
+
+**Deploy note:** the live scan 30 will be closed as `interrupted by a restart` by the recreate,
+`last_scan_finished` becomes the recreate time, and the next scheduled scan is 24 h later. Press
+*Scan now* to start the first one under the new code and watch the repairing figures — the
+pending count is the number nobody has seen yet.

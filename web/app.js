@@ -134,7 +134,7 @@ function handleEvent(event, data) {
       if (STATUS) { STATUS.state = data; renderLive(); }
       break;
     case 'scan':
-      if (STATUS) { STATUS.state.scan = data; renderLive(); }
+      if (STATUS) { STATUS.state.scan = data; updateScanButton(); renderLive(); }
       // The counts move as a scan progresses; keep them roughly current
       // without a request per file.
       scheduleRefresh(2500);
@@ -180,8 +180,7 @@ async function refreshStatus() {
     STATUS = await api('/status');
     $('#version').textContent = `v${STATUS.version}`;
     $('#pauseBtn').textContent = STATUS.state.paused ? 'Resume' : 'Pause';
-    $('#scanBtn').disabled = STATUS.state.scan.running;
-    $('#scanBtn').textContent = STATUS.state.scan.running ? 'Scanning…' : 'Scan now';
+    updateScanButton();
     updateTotals();
     updateBanner();
     if (ROUTE === '/' || ROUTE === '/files') render();
@@ -280,18 +279,7 @@ function buildLivePanel() {
   }
 
   const panel = el('div', { class: 'now', id: 'livePanel' });
-  if (scanning) {
-    const sc = s.scan;
-    const frac = sc.total ? sc.checked / sc.total : 0;
-    panel.append(
-      el('div', { class: 'kind' }, `Scanning — ${sc.trigger}`),
-      el('div', { class: 'what' }, sc.current ? basename(sc.current) : 'preparing…'),
-      el('div', { class: 'detail' },
-        `${sc.checked} of ${sc.total} checked · ${sc.ok} OK · ${sc.failed} with problems · ${sc.actions} action(s) taken`),
-      el('div', { class: `bar ${sc.total ? '' : 'indeterminate'}` },
-        el('i', { style: `width:${(frac * 100).toFixed(1)}%` })),
-    );
-  }
+  if (scanning) panel.append(...scanPanelRows(s.scan));
   for (const [key, t] of tasks) {
     if (key === 'scan' && scanning) continue;
     panel.append(
@@ -304,6 +292,70 @@ function buildLivePanel() {
     );
   }
   return panel;
+}
+
+// A scan is two passes, and the second is the long one: checking probes the
+// files (minutes to hours), repairing then applies what the probes decided,
+// one job at a time (days to weeks on a library with a backlog). They are
+// drawn as two different things because `checked/total` read as the whole
+// scan is exactly how one sat at "100%" for six days with no way to tell it
+// was busy, let alone to stop it.
+function scanPanelRows(sc) {
+  const trigger = sc.trigger ? ` — ${sc.trigger}` : '';
+  let kind, what, detail, frac = null;          // null bar = indeterminate
+  if (sc.phase === 'repairing') {
+    kind = `Repairing${trigger}`;
+    what = sc.current ? basename(sc.current) : 'preparing…';
+    const bits = [`${sc.position.toLocaleString()} of ${sc.pending.toLocaleString()} files with something to do`,
+      `${sc.actions} action(s) taken`];
+    const left = repairTimeLeft(sc);
+    if (left) bits.push(`about ${left} left at this rate`);
+    detail = bits.join(' · ');
+    frac = sc.pending ? sc.position / sc.pending : null;
+  } else if (sc.phase === 'finishing') {
+    kind = `Finishing${trigger}`;
+    what = 'sweeping the recycle bin';
+    detail = `${sc.checked.toLocaleString()} checked · ${sc.actions} action(s) taken`;
+  } else if (sc.phase === 'checking') {
+    kind = `Checking${trigger}`;
+    what = sc.current ? basename(sc.current) : 'preparing…';
+    detail = `${sc.checked.toLocaleString()} of ${sc.total.toLocaleString()} checked · ${sc.ok} OK · ${sc.failed} with problems`;
+    frac = sc.total ? sc.checked / sc.total : null;
+  } else {
+    kind = `Scanning${trigger}`;
+    what = 'enumerating the libraries…';
+    detail = 'asking Sonarr and Radarr what is in them';
+  }
+  if (sc.stopping) {
+    kind = `Stopping${trigger}`;
+    detail = 'ending the job in flight — the scan then records where it got to and lets go';
+  }
+  return [
+    el('div', { class: 'kind' }, kind),
+    el('div', { class: 'what' }, what),
+    el('div', { class: 'detail' }, detail),
+    el('div', { class: `bar ${frac === null ? 'indeterminate' : ''}` },
+      el('i', { style: `width:${((frac || 0) * 100).toFixed(1)}%` })),
+    el('div', { class: 'row', style: 'margin-top:10px' },
+      el('button', { class: 'btn btn-sm btn-danger', disabled: sc.stopping,
+        title: 'End the job in flight and let the scan go', onclick: stopScan }, 'Stop scan'),
+      el('button', { class: 'btn btn-sm btn-ghost', disabled: sc.stopping,
+        title: 'Stop this scan and start a fresh one as soon as it has let go', onclick: restartScan }, 'Restart')),
+  ];
+}
+
+// The repairs are anything from a two-second flag to a multi-hour shrink, so
+// this is a rate, not a promise — but "about three weeks" is the one thing
+// nobody could see before, and it is worth more than a bar at 100%.
+function repairTimeLeft(sc) {
+  if (!sc.phase_started || sc.position < 5 || sc.position >= sc.pending) return null;
+  const perItem = (Date.now() / 1000 - sc.phase_started) / sc.position;
+  const sec = perItem * (sc.pending - sc.position);
+  if (sec < 90) return 'a minute';
+  if (sec < 3600) return `${Math.round(sec / 60)} minutes`;
+  if (sec < 86400) return `${Math.round(sec / 3600)} hours`;
+  if (sec < 14 * 86400) return `${Math.round(sec / 86400)} days`;
+  return `${Math.round(sec / (7 * 86400))} weeks`;
 }
 
 /* ---------- dashboard ---------- */
@@ -1595,11 +1647,49 @@ async function startScan(library) {
   } catch (err) { toast(err.message, 'bad'); }
 }
 
+const STOP_WARNING = 'The job in flight is ended and its output removed; the file it was '
+  + 'working on is left exactly as it was. Whatever the scan still had to do '
+  + 'is found again by the next scan.';
+
+async function stopScan() {
+  if (!STATUS?.state.scan.running || STATUS.state.scan.stopping) return;
+  if (!confirm(`Stop the running scan?\n\n${STOP_WARNING}`)) return;
+  try {
+    const r = await api('/scan/stop', { method: 'POST' });
+    toast(r.stopping ? 'Stopping — ending the job in flight.' : 'No scan is running.', r.stopping ? 'ok' : '');
+    refreshStatus();
+  } catch (err) { toast(err.message, 'bad'); }
+}
+
+async function restartScan() {
+  if (STATUS?.state.scan.stopping) return;
+  if (STATUS?.state.scan.running
+      && !confirm(`Stop the running scan and start a fresh one?\n\n${STOP_WARNING}`)) return;
+  try {
+    const r = await api('/scan/restart', { method: 'POST' });
+    toast(r.restarting
+      ? 'Stopping — a new scan starts as soon as this one has let go.'
+      : 'Scan started.', 'ok');
+    refreshStatus();
+  } catch (err) { toast(err.message, 'bad'); }
+}
+
+// One button, three states: start a scan, stop the running one, or wait
+// while it stops. "Scanning…" greyed out for a week was the old third state.
+function updateScanButton() {
+  const sc = STATUS.state.scan;
+  const b = $('#scanBtn');
+  b.disabled = !!sc.stopping;
+  b.textContent = sc.stopping ? 'Stopping…' : sc.running ? 'Stop scan' : 'Scan now';
+  b.classList.toggle('btn-primary', !sc.running);
+  b.classList.toggle('btn-danger', !!sc.running);
+}
+
 /* ---------- boot ---------- */
 
 $('#scanBtn').addEventListener('click', () => {
-  if (STATUS?.state.scan.running) return;
-  startScan();
+  if (STATUS?.state.scan.running) stopScan();
+  else startScan();
 });
 $('#pauseBtn').addEventListener('click', async () => {
   const next = !STATUS.state.paused;

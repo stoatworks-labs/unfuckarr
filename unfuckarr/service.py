@@ -36,6 +36,7 @@ class Service:
         self.watcher = WatchManager(config.get, self._on_watch_ready)
         self._scan_lock = threading.Lock()
         self._scan_thread: threading.Thread | None = None
+        self._restart_after_stop = False
         self._sched_stop = threading.Event()
         self._sched_thread: threading.Thread | None = None
         self._watch_pool = threading.Semaphore(2)
@@ -49,8 +50,14 @@ class Service:
     def start(self) -> None:
         db.init()
         config.load()
-        self._restore_last_scan()
+        # Reconcile first: a scan the restart killed is closed as ended *now*,
+        # and the schedule then counts from that rather than from the last
+        # scan that ran to completion — which on the live instance was
+        # nineteen days and eight interrupted scans earlier, so every
+        # restart began a new scan thirty seconds in. `scan_at_startup` is
+        # the switch for that, not an accident of the history table.
         self._reconcile_interrupted_work()
+        self._restore_last_scan()
         self.watcher.start()
         self._sched_stop.clear()
         self._sched_thread = threading.Thread(target=self._scheduler, daemon=True,
@@ -99,6 +106,18 @@ class Service:
             db.log("jobs_reconciled", "warn",
                    detail={"interrupted": len(stale),
                            "paths": [j["path"] for j in stale if j["path"]][:10]})
+
+        # The same rule for scans: a row with no `finished` at startup is a
+        # scan the restart killed, and it only ever gets its counters written
+        # at the end. Left open, the history reads as eight scans that never
+        # happened, and "last scan finished" points at the one before them.
+        open_scans = db.q("SELECT id FROM scans WHERE finished IS NULL")
+        for scan in open_scans:
+            db.ex("UPDATE scans SET finished=?, aborted=? WHERE id=?",
+                  (time.time(), "interrupted by a restart", scan["id"]))
+        if open_scans:
+            db.log("scans_reconciled", "warn",
+                   detail={"interrupted": [r["id"] for r in open_scans]})
 
         def sweep() -> None:
             paths = [r["path"] for r in db.q("SELECT path FROM files")]
@@ -319,7 +338,12 @@ class Service:
         """Returns False when a scan is already running."""
         if not self._scan_lock.acquire(blocking=False):
             return False
+        self._launch(trigger, paths)
+        return True
 
+    def _launch(self, trigger: str, paths: list[str] | None) -> None:
+        """Run a scan on its own thread. The caller holds `_scan_lock`; the
+        scan thread releases it when it is done, whatever way it ends."""
         def run() -> None:
             try:
                 self.scanner.run(trigger=trigger, paths=paths)
@@ -333,10 +357,46 @@ class Service:
         self._scan_thread = threading.Thread(target=run, daemon=True,
                                              name="unfuckarr-scan")
         self._scan_thread.start()
+
+    def stop_scan(self) -> bool:
+        """Ask the running scan to stop. Returns False when none is running.
+
+        Stopping is not instant and does not pretend to be: the probe in
+        flight finishes (seconds), or the repair in flight is killed and its
+        output removed, and the scan then records where it got to and lets
+        go. `state.scan.stopping` is true for the duration.
+        """
+        self._restart_after_stop = False
+        if not self.scanning:
+            return False
+        self.scanner.request_stop()
         return True
 
-    def stop_scan(self) -> None:
+    def restart_scan(self, trigger: str = "manual") -> bool:
+        """Stop the running scan and start a fresh one the moment it lets go.
+
+        Returns False when nothing was running — then it is just a start.
+        The wait happens on a thread of its own because the stop takes as
+        long as ending the job in flight takes, and an HTTP request should
+        not sit on that.
+        """
+        if self.start_scan(trigger):
+            return False
+        self._restart_after_stop = True
         self.scanner.request_stop()
+
+        def wait_then_start() -> None:
+            self._scan_lock.acquire()
+            # A plain stop arriving while we waited withdraws the restart.
+            if not self._restart_after_stop:
+                self._scan_lock.release()
+                return
+            self._restart_after_stop = False
+            self._launch(trigger, None)
+
+        threading.Thread(target=wait_then_start, daemon=True,
+                         name="unfuckarr-scan-restart").start()
+        return True
 
     def _scheduler(self) -> None:
         self._recompute_next_scan()
