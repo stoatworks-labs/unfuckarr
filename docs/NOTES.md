@@ -1019,3 +1019,35 @@ figures are honest and the stop works; the lock is still held for the duration.
 `last_scan_finished` becomes the recreate time, and the next scheduled scan is 24 h later. Press
 *Scan now* to start the first one under the new code and watch the repairing figures — the
 pending count is the number nobody has seen yet.
+
+## 2026-09-14: deployed — scan phases and stop, and the image that was never recreated
+
+PR **#23 merged** (`de62cad`), `:edge` published; `unfk` rebuilt from it and recreated at 17:36.
+Backup at **`/mnt/user/appdata/.unfk-backups/pre-scanstop-2026-09-14/`** — on the cache pool this
+time, not `/root`, which is a RAM disk and has quietly held every previous backup. It is an
+online `sqlite3` `.backup()` taken from inside the container as uid 99 rather than a copy of the
+live db + wal + shm, so it is consistent by construction (`integrity_check ok`, 18,547 files).
+Rollback tag **`unfuckarr-makemkv:rollback-2026-09-14`** = the image that was actually running.
+
+**⚠️ The 2026-09-08 image was built and never deployed.** `unfk` had been running the image
+started 09-07 13:50Z (`be584e4c92f5`, since re-tagged `rollback-2026-09-08`) while
+`unfuckarr-makemkv:edge` pointed at the 09-08 build (`0a0dcca3f82b`, PR #22's read-position
+progress and the stall detector that can fire). Checked with
+`docker exec unfk python -c "import unfuckarr.transcode as t; print(hasattr(t, 'SourcePosition'))"`
+→ `False`. So the 09-08 notes above describe code that reached the box today, not on the 8th.
+`docker ps` shows an image *ID* rather than a tag when the tag has moved on; that is the tell.
+Check the running container's code, not the tag, before believing a deploy happened.
+
+**What the first start under the new code did:** `scans_reconciled` closed **19** open scan rows
+(1–7, 10, 11, 13, 14, 23–30 — it was never eight), `jobs_reconciled` failed 4 interrupted jobs,
+and the leftover sweep removed 190 `*.unfuckarr*` files totalling 1.47 GB — all Emby artwork
+and `.nfo` sidecars written against earlier temp outputs, not media. One survivor:
+`The Hunger Games (2012)/…BR-DISK.unfuckarr.convert/` is an **empty, root-owned** directory from
+the 08-24 hand-run conversion; harmless. `last_scan_finished` is now 17:36 on the 14th and the
+next scheduled scan is 17:36 on the 15th — the schedule change from #23, working as intended.
+The shrink worker resumed within the minute. Services green; recycle bin on `/media/.recycle`,
+writable.
+
+**Nothing has been scanned under the new code yet.** The first scan — manual, or the scheduled
+one tomorrow — is the one to watch: `max_actions_per_scan` is still 10,000, so the repairing
+pass will again run for weeks, but this time it will say so, and it can be stopped.
