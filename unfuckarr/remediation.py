@@ -16,9 +16,10 @@ import os
 import shutil
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from . import db, disc, governor, makemkv, quality, recycle, transcode
 from .checks import CheckResult
@@ -326,10 +327,50 @@ class Remediator:
         ev.set()
         return True
 
+    @contextmanager
+    def _slot(self, sema: threading.Semaphore,
+              cancel: threading.Event) -> Iterator[bool]:
+        """Hold a transcode slot for the body, or hand it ``False`` — without
+        ever taking one — if the job is cancelled while waiting its turn.
+
+        The slots are shared with the continuous shrink worker, and with
+        ``max_concurrent`` at 1 a scan's transcode routinely queues behind an
+        encode that has an hour to run. A plain ``with sema:`` would sit
+        through all of it before the job could even look at its cancel
+        event; a stop that takes an hour to take effect reads as a stop that
+        does not work.
+        """
+        while not sema.acquire(timeout=0.5):
+            if cancel.is_set():
+                yield False
+                return
+        if cancel.is_set():
+            sema.release()
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            sema.release()
+
+    def _cancelled(self, job_id: int, path: str, action: str) -> dict[str, Any]:
+        """A cancel says nothing about the file: no attempt is counted."""
+        self._cancel.pop(path, None)
+        self._set_job(job_id, "cancelled", 0, "cancelled")
+        return {"action": action, "ok": False, "message": "cancelled"}
+
     # -- entry point ------------------------------------------------------
 
     def apply(self, file_row: dict[str, Any], result: CheckResult,
-              info: MediaInfo | None, decision: Decision) -> dict[str, Any]:
+              info: MediaInfo | None, decision: Decision,
+              cancel: threading.Event | None = None) -> dict[str, Any]:
+        """Carry out ``decision`` on the file.
+
+        ``cancel`` lets the caller end the job from outside — the scanner
+        passes one per repair so a scan stop can reach the job in flight.
+        Without it the job makes its own, which the UI's per-file cancel
+        reaches through `cancel(path)` either way.
+        """
         path = file_row["path"]
         if transcode.is_temp_output(path):
             # Our own in-flight output, reached through a watch event, a scan,
@@ -342,17 +383,21 @@ class Remediator:
             "INSERT INTO jobs (kind, path, state, message, created) VALUES (?,?,?,?,?)",
             (decision.action, path, "queued", decision.reason, time.time()),
         )
+        cancel = cancel or threading.Event()
         try:
             if decision.action in ("none", "flag"):
                 self._set_job(job_id, "done", 1.0, decision.reason)
                 return {"action": decision.action, "ok": True,
                         "message": decision.reason}
             if decision.action in ("transcode", "repair"):
-                return self._transcode(job_id, file_row, result, info, decision)
+                return self._transcode(job_id, file_row, result, info, decision,
+                                       cancel)
             if decision.action == "shrink":
-                return self._shrink(job_id, file_row, result, info, decision)
+                return self._shrink(job_id, file_row, result, info, decision,
+                                    cancel)
             if decision.action == "convert":
-                return self._convert(job_id, file_row, result, info, decision)
+                return self._convert(job_id, file_row, result, info, decision,
+                                     cancel)
             if decision.action == "redownload":
                 return self._redownload(job_id, file_row, decision.reason)
             self._set_job(job_id, "failed", 0, f"unknown action {decision.action}")
@@ -385,7 +430,8 @@ class Remediator:
 
     def _transcode(self, job_id: int, file_row: dict[str, Any],
                    result: CheckResult, info: MediaInfo | None,
-                   decision: Decision) -> dict[str, Any]:
+                   decision: Decision,
+                   cancel: threading.Event | None = None) -> dict[str, Any]:
         s = self._settings()
         path = file_row["path"]
         if not s.transcode.enabled:
@@ -420,11 +466,13 @@ class Remediator:
 
         cmd = transcode.build_command(path, dst, info, plan, s.transcode,
                                       ffmpeg=s.ffmpeg_path)
-        cancel = threading.Event()
+        cancel = cancel or threading.Event()
         self._cancel[path] = cancel
 
         sema = self._semaphore(max(1, s.transcode.max_concurrent))
-        with sema:
+        with self._slot(sema, cancel) as got:
+            if not got:
+                return self._cancelled(job_id, path, "flag")
             self._set_job(job_id, "running", 0.0, plan.describe)
             set_task(f"remediate:{path}", kind="transcoding", path=path,
                      title=file_row.get("title") or Path(path).name,
@@ -446,14 +494,21 @@ class Remediator:
 
         if not ok:
             Path(dst).unlink(missing_ok=True)
+            if cancel.is_set():
+                # A cancel says nothing about the file: no attempt counted,
+                # and — this matters — no falling through to the redownload
+                # below. A stopped *repair* was a delete-and-re-search of the
+                # file being repaired until this line existed.
+                db.log("transcode_cancelled", "info", path,
+                       {"plan": plan.describe})
+                return self._cancelled(job_id, path, "flag")
             self._set_job(job_id, "failed", 0, message, error=message)
-            detail: dict[str, Any] = {"message": message}
-            if not cancel.is_set():
-                # A cancel says nothing about the file. Anything else counts
-                # against the cap — a failure that repeats deterministically
-                # would otherwise be retried on every scan, for ever.
-                detail["attempts"] = self._count_attempt(path, file_row)
-            db.log("transcode_failed", "error", path, detail)
+            # Anything but a cancel counts against the cap — a failure that
+            # repeats deterministically would otherwise be retried on every
+            # scan, for ever.
+            db.log("transcode_failed", "error", path,
+                   {"message": message,
+                    "attempts": self._count_attempt(path, file_row)})
             # A repair that failed means the damage is real. Fall through to a
             # redownload rather than leaving a broken file flagged as "tried".
             if repair and s.policy.corrupt_action == "redownload":
@@ -656,7 +711,8 @@ class Remediator:
 
     def _shrink(self, job_id: int, file_row: dict[str, Any],
                 result: CheckResult, info: MediaInfo | None,
-                decision: Decision) -> dict[str, Any]:
+                decision: Decision,
+                cancel: threading.Event | None = None) -> dict[str, Any]:
         """Re-encode an intact file to a measured quality target.
 
         The shape is the same as ``_transcode`` — plan, run, verify, recycle,
@@ -732,12 +788,14 @@ class Remediator:
             db.log("shrink_no_metric", "warn", path, msg)
             return {"action": "flag", "ok": True, "message": msg}
 
-        cancel = threading.Event()
+        cancel = cancel or threading.Event()
         self._cancel[path] = cancel
         sema = self._semaphore(max(1, s.transcode.max_concurrent))
         title = file_row.get("title") or Path(path).name
 
-        with sema:
+        with self._slot(sema, cancel) as got:
+            if not got:
+                return self._cancelled(job_id, path, "flag")
             self._set_job(job_id, "running", 0.0,
                           f"measuring how far {metric.name.upper()} allows")
             set_task(f"remediate:{path}", kind="analysing", path=path,
@@ -1013,7 +1071,8 @@ class Remediator:
 
     def _convert(self, job_id: int, file_row: dict[str, Any],
                  result: CheckResult, info: MediaInfo | None,
-                 decision: Decision) -> dict[str, Any]:
+                 decision: Decision,
+                 cancel: threading.Event | None = None) -> dict[str, Any]:
         """Turn a disc image into Matroska, with its bonus features beside it.
 
         The shape is the one every other action here has — gate, do the work,
@@ -1089,7 +1148,7 @@ class Remediator:
             db.log("convert_no_space", "warn", path, msg)
             return {"action": "flag", "ok": False, "message": msg}
 
-        cancel = threading.Event()
+        cancel = cancel or threading.Event()
         self._cancel[path] = cancel
         work = Path(path).with_name(f"{Path(path).stem}{transcode.TEMP_MARKER}convert")
         try:

@@ -244,6 +244,22 @@ All of it is on one settings page, with every option explaining what it actually
 
 ![Policy settings](docs/screenshots/settings-policy.png)
 
+### A scan is two passes, and you can stop either
+
+The first pass **checks** — probes every file that needs it, minutes to hours. The second
+**repairs** — applies what the probes decided, one job at a time, and takes as long as the
+jobs do: on a library with a backlog and a generous action cap, that is days to weeks. The
+dashboard says which pass is running and how far through it is (`1,204 of 3,812 files with
+something to do · about 3 weeks left at this rate`), with the job in flight underneath. A bar
+at 100% is never the whole scan.
+
+**Stop scan** ends the job in flight — its half-written output is removed, the file it was
+working on is left exactly as it was, and no attempt is counted against that file — and the
+scan then records where it got to and lets go. Whatever it still had to do is found again by
+the next scan, because known-bad files are always re-checked. **Restart** does the same and
+starts a fresh scan the moment the old one has let go. Both are on the dashboard while a scan
+runs, and the header button switches from *Scan now* to *Stop scan*.
+
 ## Pacing, not rationing
 
 Shrinking runs **continuously**, on its own worker, for as long as the service is up. It takes

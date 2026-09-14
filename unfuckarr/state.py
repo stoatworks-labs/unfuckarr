@@ -29,16 +29,31 @@ class CurrentTask:
 
 @dataclass
 class ScanProgress:
+    """A scan is two passes, and the second is the long one.
+
+    ``checking`` probes every file that needs it — minutes to hours — and
+    ``repairing`` then applies what the probes decided, one job at a time,
+    which on a library with a backlog is days to weeks. ``checked``/``total``
+    describe the first pass only; ``position``/``pending`` describe the
+    second. Reading the first pair as the whole scan is how a scan looked
+    "stuck at 100%" for six days while it was busy transcoding.
+    """
+
     running: bool = False
     scan_id: int | None = None
     trigger: str = ""
+    phase: str = ""             # enumerating | checking | repairing | finishing
     total: int = 0
     checked: int = 0
     ok: int = 0
     failed: int = 0
+    pending: int = 0            # files the checking pass decided to act on
+    position: int = 0           # how many of those the repairing pass has reached
     actions: int = 0
     started: float = 0.0
+    phase_started: float = 0.0
     current: str = ""
+    stopping: bool = False      # a stop was asked for; the current job is being ended
     aborted: str | None = None
 
 

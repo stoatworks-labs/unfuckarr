@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -247,17 +248,33 @@ class Scanner:
         self._settings = settings_getter
         self.remediator = remediator
         self._stop = False
+        # The cancel event of the repair being applied right now, so a stop
+        # can end it rather than wait for it. A transcode is minutes, a
+        # shrink is an hour or more, and a job queued behind the continuous
+        # worker's encode would otherwise sit on the semaphore for the length
+        # of *that* encode before it even noticed it had been cancelled.
+        self._applying: threading.Event | None = None
 
     def request_stop(self) -> None:
+        """Stop the scan at the first safe point: after the probe in flight,
+        or by ending the repair in flight. Safe to call when nothing runs."""
         self._stop = True
+        applying = self._applying
+        if applying is not None:
+            applying.set()
+        if state.scan.running and not state.scan.stopping:
+            state.scan.stopping = True
+            publish_scan()
 
     def run(self, trigger: str = "manual", paths: list[str] | None = None) -> dict[str, Any]:
         s = self._settings()
         self._stop = False
+        self._applying = None
         scan_id = db.ex("INSERT INTO scans (started, trigger) VALUES (?,?)",
                         (time.time(), trigger))
         state.scan = ScanProgress(running=True, scan_id=scan_id, trigger=trigger,
-                                  started=time.time())
+                                  phase="enumerating", started=time.time(),
+                                  phase_started=time.time())
         publish_scan()
         db.log("scan_started", "info", detail={"trigger": trigger})
 
@@ -265,6 +282,8 @@ class Scanner:
             return self._run_inner(s, scan_id, paths)
         finally:
             state.scan.running = False
+            state.scan.stopping = False
+            state.scan.phase = ""
             state.scan.current = ""
             state.last_scan_finished = time.time()
             publish_scan()
@@ -298,6 +317,8 @@ class Scanner:
 
         todo = [r for r in candidates if needs_check(r, s)]
         state.scan.total = len(todo)
+        state.scan.phase = "checking"
+        state.scan.phase_started = time.time()
         # The abort ratio is measured against everything this pass knows the
         # state of, not just the files it re-probed — see `_remediate`.
         population = len(candidates)
@@ -317,13 +338,23 @@ class Scanner:
         # Probing is I/O and subprocess bound, so threads are the right tool;
         # remediation is applied on this thread afterwards so the action cap
         # and abort ratio are evaluated against the whole pass.
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for row, result, info in pool.map(
-                lambda r: self._check_one(r, s, emby), todo
-            ):
+        #
+        # Every probe is submitted up front and the results are read back in
+        # library order, which is what `pool.map` did. What `pool.map` did
+        # not make explicit is what a stop costs: `cancel_futures` drops
+        # everything not yet started, so the shutdown waits only for the one
+        # probe per worker already in flight — seconds, not the rest of the
+        # library. (Breaking out of `map`'s iterator happens to cancel the
+        # queue too, but by way of the generator being garbage-collected,
+        # which is not a contract anyone should have to know about.)
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures = [pool.submit(self._check_one, r, s, emby) for r in todo]
+            for future in futures:
                 if self._stop:
-                    state.scan.aborted = "stopped by user"
+                    self._stopped()
                     break
+                row, result, info = future.result()
                 state.scan.checked += 1
                 if result.status == "ok":
                     state.scan.ok += 1
@@ -335,11 +366,29 @@ class Scanner:
                 decision = decide(result, s)
                 if decision.action not in ("none",):
                     pending.append((row, result, info, decision))
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+            # The last probe's "7530/7533" would otherwise outlive the pass
+            # and sit in /api/status for the whole of the repairing phase.
+            clear_task("scan")
 
         if state.scan.aborted:
             return {"aborted": state.scan.aborted}
 
         return self._remediate(s, pending, population)
+
+    def _stopped(self) -> None:
+        """Record a user stop, once, with where the scan had got to."""
+        if state.scan.aborted:
+            return
+        state.scan.aborted = "stopped by user"
+        db.log("scan_stopped", "warn", detail={
+            "phase": state.scan.phase,
+            "checked": state.scan.checked, "of": state.scan.total,
+            "repaired": state.scan.position, "pending": state.scan.pending,
+            "actions": state.scan.actions,
+        })
+        publish_scan()
 
     def _check_one(self, row: Any, s: Settings,
                    emby: EmbyClient | None) -> tuple[dict[str, Any], CheckResult, MediaInfo | None]:
@@ -442,9 +491,30 @@ class Scanner:
             return (2, -efficiency_checks.priority(item_info, s.efficiency))
 
         ordered = sorted(pending, key=order)
+        # The second pass, and the long one: the probes took minutes to
+        # hours, and this takes as long as the actions do — one job at a
+        # time, on this thread, days to weeks on a library with a backlog.
+        # It has its own progress figures because reading `checked/total`
+        # as the whole scan is exactly how one sat at "100%" for six days.
+        state.scan.phase = "repairing"
+        state.scan.pending = len(ordered)
+        state.scan.position = 0
+        state.scan.current = ""
+        state.scan.phase_started = time.time()
+        publish_scan()
+        last_published = time.time()
         for row, result, info, decision in ordered:
             if self._stop:
                 break
+            state.scan.position += 1
+            state.scan.current = row["path"]
+            # Flags fly by in milliseconds; an event for every one of a few
+            # thousand would swamp the browser for no information, so they
+            # publish once a second. An action is about to take minutes, so
+            # it publishes at once — the job's own task appears beside it.
+            if decision.action != "flag" or time.time() - last_published >= 1.0:
+                publish_scan()
+                last_published = time.time()
             if decision.action == "shrink":
                 if s.shrink.continuous:
                     # The background worker owns shrinking. Running them here
@@ -469,7 +539,21 @@ class Scanner:
                 db.log("action_cap_reached", "warn", row["path"],
                        {"cap": s.policy.max_actions_per_scan})
                 break
-            outcome = self.remediator.apply(row, result, info, decision)
+            # The job's cancel event is made here and handed in, so that a
+            # stop can reach the job in flight through `request_stop` — and
+            # the re-check closes the gap between "not stopped" above and the
+            # event being in place. A stop that lands after this line finds
+            # the event; one that landed before it is seen here.
+            cancel = threading.Event()
+            self._applying = cancel
+            if self._stop:
+                self._applying = None
+                break
+            try:
+                outcome = self.remediator.apply(row, result, info, decision,
+                                                cancel=cancel)
+            finally:
+                self._applying = None
             if decision.action == "shrink":
                 shrinks += 1
             elif decision.action == "convert":
@@ -479,14 +563,19 @@ class Scanner:
             if decision.action != "flag":
                 state.scan.actions = applied + shrinks + conversions
                 publish_scan()
+                last_published = time.time()
             bus.publish("remediated", {"path": row["path"], **outcome})
 
+        if self._stop:
+            self._stopped()
+        state.scan.phase = "finishing"
+        state.scan.current = ""
+        publish_scan()
         recycle.sweep(s.policy.recycle_bin_days, s.policy.recycle_bin_path)
-        db.log("scan_finished", "info", detail={
-            "checked": state.scan.checked, "failed": state.scan.failed,
-            "actions": applied, "shrinks": shrinks,
-            "conversions": conversions,
-        })
-        return {"checked": state.scan.checked, "failed": state.scan.failed,
-                "actions": applied, "shrinks": shrinks,
-                "conversions": conversions}
+        summary = {"checked": state.scan.checked, "failed": state.scan.failed,
+                   "actions": applied, "shrinks": shrinks,
+                   "conversions": conversions}
+        if state.scan.aborted:
+            return {"aborted": state.scan.aborted, **summary}
+        db.log("scan_finished", "info", detail=summary)
+        return summary

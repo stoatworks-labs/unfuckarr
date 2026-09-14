@@ -416,8 +416,18 @@ def scan_start(library: str | None = None) -> dict[str, Any]:
 
 @api.post("/scan/stop")
 def scan_stop() -> dict[str, Any]:
-    service.stop_scan()
-    return {"stopping": True}
+    """Stop the running scan. Not instant: the probe in flight finishes, or
+    the repair in flight is killed and cleaned up, and the scan then records
+    where it got to. Watch `state.scan.stopping` for the interval."""
+    return {"stopping": service.stop_scan()}
+
+
+@api.post("/scan/restart")
+def scan_restart() -> dict[str, Any]:
+    """Stop the running scan and start a new one as soon as it has let go —
+    or simply start one, when nothing was running."""
+    restarting = service.restart_scan("manual")
+    return {"restarting": restarting, "started": not restarting}
 
 
 @api.post("/pause")

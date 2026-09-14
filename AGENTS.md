@@ -497,6 +497,23 @@ Break any of these and the failure is quiet and expensive.
   loop captured in the FastAPI lifespan. A worker thread has no loop of its own.
 - **The scan is single-flight** via `Service._scan_lock`, and `__main__.py` pins uvicorn to one
   worker. Two workers would mean two scanners fighting over the same library.
+- **A scan is two passes, and the second is the long one.** `checking` probes the files
+  (minutes to hours); `repairing` then applies what they decided, one job at a time on the
+  scan thread, and takes as long as the jobs do. With `max_actions_per_scan` in the thousands
+  that is weeks, and the scan holds `_scan_lock` for all of it — the scheduled scan is silently
+  skipped every tick, and "Scan now" is refused. Live, 2026-09-13: scan 30 had read
+  `7,533 of 7,533 checked` for **six days** at 495 actions, and the only progress figure on
+  show was the first pass's. `ScanProgress.phase`, `position` and `pending` describe the second
+  pass; anything that reports a scan must read the phase, not just `checked/total`.
+- **A stop must reach the job in flight, and it must not count as a failure.** The repairing
+  loop always checked `_stop` between jobs; it never reached the job under way, and a transcode
+  queued behind the continuous worker's encode sat on the semaphore for the length of *that*
+  encode before it could even look at its cancel event. So `Scanner.request_stop` sets the
+  in-flight job's cancel event (the scanner makes one per repair and hands it to `apply`),
+  `Remediator._slot` polls the semaphore against the event instead of blocking on it, and a
+  cancelled transcode returns *before* the failed-repair fall-through — which was a
+  delete-and-re-search of the file being repaired. `docs/NOTES.md` previously blamed
+  `pool.map` for a stop not working; it was wrong, and the measured story is there.
 
 ### Disc conversion
 
@@ -631,6 +648,14 @@ which is the safe direction but does nothing useful.
   (`unfuckarr starting as unfuckarr:unfuckarr (1000:1000)`). Multi-arch amd64 + arm64 on tags.
   This is the only container proof available — there is no runtime on the dev machine.
 - That the scheduled-scan time survives a restart.
+- **Stopping a scan, in both passes**: a stop during checking discards the probe queue rather
+  than draining it; a stop during repairing reaches the job in flight through its cancel
+  event, including one that landed in the gap before the job registered it; a job waiting for
+  the transcode slot is cancelled without waiting for the slot's holder; a cancelled repair
+  leaves the file untouched, counts no attempt and never falls through to a redownload; the
+  repairing pass reports its own `position`/`pending`; scans a restart killed are closed at
+  startup; and stop/restart over the API, including a restart withdrawn by a later stop.
+  Every one of these was run against the pre-fix sources first and failed there.
 - **`intake`, 46 tests**: that `triage` has no route to `bad_release`; that the live by-ID
   message and the permissions/upgrade/parse family all read as `manual`; that an empty, packed,
   junk-only, sample-only, unopenable or far-too-small download reads as `bad_release` while a
