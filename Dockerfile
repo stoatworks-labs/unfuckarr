@@ -110,11 +110,22 @@ RUN set -eux; \
 # but leaves the largest files in a library unmeasured. DVD images are
 # unaffected — that path parses ISO9660 here and reads the VOB through
 # `subfile`, needing nothing from the ffmpeg build.
+#
+# hevc_vaapi is demanded on amd64 only. VAAPI is the Intel/AMD GPU path and the
+# linuxserver arm64 build of ffmpeg 8 does not carry the encoder at all; arm64 is
+# built only on a tagged release, so the first tag after the 8.0.1 pin was where
+# that showed up (v1.2.0, 2026-09-17).
 RUN set -eux; \
     ! ldd /usr/local/bin/ffmpeg | grep -q 'not found'; \
     ! ldd /usr/local/bin/ffprobe | grep -q 'not found'; \
     ffmpeg -hide_banner -filters | grep -q ' libvmaf '; \
-    ffmpeg -hide_banner -encoders | grep -q hevc_vaapi; \
+    if [ "$TARGETARCH" = amd64 ]; then \
+        ffmpeg -hide_banner -encoders | grep -q hevc_vaapi; \
+    elif ffmpeg -hide_banner -encoders | grep -q hevc_vaapi; then \
+        echo "hevc_vaapi: present"; \
+    else \
+        echo "hevc_vaapi: ABSENT on $TARGETARCH - VAAPI encodes need an amd64 host"; \
+    fi; \
     ffmpeg -hide_banner -protocols | grep -qw subfile; \
     if ffmpeg -hide_banner -protocols | grep -qw bluray; then \
         echo "bluray protocol: present"; \
