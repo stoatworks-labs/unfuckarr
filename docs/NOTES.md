@@ -704,11 +704,11 @@ several sections, so a first-match regex reports another section's values — th
 notes nearly recorded "no providers configured" when four were, and `use_sonarr: false` when it
 was true. `GET /api/system/settings` is authoritative.
 
-**What was actually broken:** `radarr.ip` was `https://radarr.tail745ddc.ts.net` — the Address
+**What was actually broken:** `radarr.ip` was `https://radarr.<tailnet>.ts.net` — the Address
 field takes a **hostname**, and Bazarr builds `{scheme}://{ip}:{port}`, so it dialled
 `https://https://radarr...:7878`. Both services were also pointed at tailnet hostnames with the
 app's own port, and those names are fronted by `tailscale serve` on **443** —
-`https://sonarr.tail745ddc.ts.net:8989` answers nothing. Bazarr is on the same Docker host, so it
+`https://sonarr.<tailnet>.ts.net:8989` answers nothing. Bazarr is on the same Docker host, so it
 now uses `sonarr:8989` / `radarr:7878`, ssl off. (Unraid's default bridge *does* resolve container
 names — worth knowing, it is not true of a stock Docker bridge.)
 
