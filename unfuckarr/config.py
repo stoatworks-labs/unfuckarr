@@ -335,8 +335,44 @@ class Policy(BaseModel):
     # scan that runs for two days. Unlike a shrink there is no continuous
     # worker to hand them to, so this is the only pacing there is.
     max_conversions_per_scan: int = 2
+    # A file whose findings have no fix behind them is a permanent resident of
+    # every scan: `needs_check` re-probes anything that is not `ok`, `decide`
+    # has nothing to offer it, and it is counted as a problem again the next
+    # night, for ever. Measured on the live library 2026-09-22: 2,432 of the
+    # 6,179 flagged files were in exactly this state — 1,490 of them for
+    # `very_low_bitrate` alone, 235 for `image_subtitles_only`.
+    #
+    # `research` asks Sonarr/Radarr to look for a better release, and nothing
+    # else. It never deletes and it never rewrites: the *arr downloads the
+    # replacement, imports it, and removes the old file itself — and only on a
+    # successful import, so a grab that fails or stalls leaves what is on disk
+    # untouched. That is the one thing a transcode cannot do for these files,
+    # because no rewrite puts back detail that was never encoded in the first
+    # place.
+    #
+    # Default stays `flag`: a re-search spends someone's bandwidth and indexer
+    # goodwill, and turning that on is a choice the operator makes.
+    unfixable_action: Literal["none", "flag", "research"] = "flag"
+    # Re-searches get their own cap, for a different reason than shrinks and
+    # conversions. Those are capped for server load; this one is capped for
+    # indexer etiquette. Each re-search is a query fanned out to every indexer
+    # the *arr has, and firing one per stuck file in a single pass — 1,476 of
+    # them on the library this was written against — is how an account gets
+    # rate-limited, or banned.
+    max_researches_per_scan: int = 5
+    # Do not ask about the same file again for this long. Without a cooldown
+    # the cap just re-asks about the same handful every night; the cooldown is
+    # what makes the cap walk through the backlog instead of standing still.
+    # It is also the brake on a file nobody has a better copy of: asking the
+    # same indexers for the same episode every 24 hours is the behaviour that
+    # gets noticed, and a month is long enough for a new release to exist.
+    research_after_days: int = 30
     # If more than this fraction of a library fails, stop and flag instead of
     # deleting — that is a mount problem, not a media problem.
+    # `research` is deliberately not counted towards this, for the same reason
+    # `shrink` and `convert` are not: the brake exists to catch a library that
+    # has just broken, and it cannot be tripped by an action that does not
+    # touch a single file on disk.
     abort_if_failure_ratio_over: float = 0.5
 
 

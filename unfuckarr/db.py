@@ -211,6 +211,8 @@ MIGRATIONS = [
     ("files", "converted_from", "TEXT"),
     ("files", "convert_skipped", "TEXT"),
     ("files", "convert_attempts", "INTEGER DEFAULT 0"),
+    ("files", "last_research", "REAL"),
+    ("files", "research_attempts", "INTEGER DEFAULT 0"),
 ]
 
 

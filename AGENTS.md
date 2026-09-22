@@ -218,6 +218,12 @@ Break any of these and the failure is quiet and expensive.
     and it read from the outside exactly like a tool that logs problems and fixes nothing.
     Adding a check is cheap; adding one whose finding no action can clear is not.
 
+    The `plan_has_work` guard is asked regardless of `hygiene_action`, not only when it is
+    `transcode`. Whether a rewrite would help is a fact about the findings, not about the action
+    configured for them, and on the shipped default (`flag`) the old transcode-only shape meant
+    these files were reported as untidy for ever with no way to say "this one needs a better
+    source". `policy.unfixable_action` is that way — see invariant 25.
+
 23. **In `intake`, only the files can condemn a release — never the status message.** The queue
     has two failures that look identical from the outside: a release that is unusable (unpacked
     to nothing, still in a rar, only a sample, video that will not open), where another copy is
@@ -252,6 +258,28 @@ Break any of these and the failure is quiet and expensive.
     other**: the loser's `DELETE` hits a queue id that no longer exists, or — much worse —
     blocklists the replacement the winner's re-search has just grabbed. If this ever grows to
     cover them, the queue cleaner beside it has to be switched off in the same change.
+
+25. **`research` asks and nothing else — no delete, no recycle, no blocklist.** That is the
+    entire difference between it and `redownload`, and it is not an optimisation to tidy away.
+    Sonarr and Radarr already replace a file the safe way round: the grab goes to the download
+    client, is imported, and only *then* does the old file go — so a download that fails, stalls
+    or is rejected leaves what is on disk exactly where it was. Deleting first, the way a
+    redownload must because the file it is replacing is broken, would turn "this file could be
+    better" into "this file is gone and something might replace it" — on a file that plays
+    perfectly well. `test_research_asks_the_arr_and_keeps_the_file` asserts both halves.
+
+    Two things gate it, and both exist because the *arr will not tell you it refused.
+    `ArrClient.upgrade_blocked` reads the quality profile first: a profile with `upgradeAllowed`
+    off, or with its cutoff pinned to the *lowest* quality it allows (Sonarr upgrades only until
+    it reaches the cutoff, so a cutoff at the floor is met by every file that exists), can never
+    produce a grab — but the command is still accepted, fanned out to every indexer, and every
+    release silently rejected. Measured on the live install 2026-09-22: all six Radarr profiles
+    had upgrades off and five of six Sonarr profiles had the cutoff at the floor. And
+    `max_researches_per_scan` is indexer etiquette, not server load — the backlog it drains was
+    1,476 files, and asking for all of them in one pass is how an account gets banned. The
+    cooldown is checked in `Scanner._remediate` as well as in `apply` so a waiting file does not
+    spend one of the pass's slots; without that the first five files absorb the cap every night
+    for a month and nothing behind them is ever asked about.
 
 ## Traps found the hard way
 

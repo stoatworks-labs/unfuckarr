@@ -741,6 +741,13 @@ async function openDrawer(path) {
       },
     }, 'Convert disc to MKV'),
     el('button', {
+      class: 'btn',
+      title: 'Ask Sonarr/Radarr for a better release. Nothing is deleted — the '
+        + '*arr imports the replacement and removes this file itself, and only '
+        + 'if the download actually completes.',
+      onclick: () => fileAction(path, 'research'),
+    }, 'Re-search (keep file)'),
+    el('button', {
       class: 'btn btn-danger',
       onclick: () => {
         if (!confirm(`Delete ${basename(path)} and ask the *arr for a replacement?\n\nThe file goes to the recycle bin first.`)) return;
@@ -1106,6 +1113,9 @@ const FIELD_HELP = {
   'policy.recycle_bin_path': 'Where deleted and replaced files are kept. Point it at a path INSIDE your media mount and on the same share \u2014 e.g. /media/.recycle. Then recycling is a rename and costs nothing; anywhere else it is a full copy of every file, and on Unraid the default (/config/recycle) is appdata on the cache, which a handful of 40 GB remuxes will fill. Usually set by UNFUCKARR_RECYCLE_BIN_PATH alongside the volume mappings.',
   'policy.oversize_action': 'What to do with a file that has not been measured for a saving yet. This can never delete: the worst it can do is re-encode, and only when a measured quality check says the result is indistinguishable from the original.',
   'policy.max_actions_per_scan': 'Hard cap on how many files one scan may transcode or delete. Shrinks are counted separately, below.',
+  'policy.unfixable_action': 'What to do with a file whose problems no rewrite can fix — a heavily re-encoded source, image-only subtitles, an Emby refusal with no reason given. `research` asks Sonarr/Radarr for a better release and never deletes: the *arr imports the replacement and removes the old file itself, only on a successful download. `flag` just keeps reporting it.',
+  'policy.max_researches_per_scan': 'How many re-searches one scan may ask for. This is indexer etiquette, not server load — each one is a query fanned out to every indexer your *arr has, so keep it low.',
+  'policy.research_after_days': 'Leave a file alone for this long after asking about it. Also what makes the cap walk through the backlog instead of re-asking about the same few files every night.',
   'policy.max_shrinks_per_scan': 'Only applies when continuous shrinking is off. Then it is really \u201chow many hours of encoding per scan\u201d: shrinks run one after another at roughly 15\u201325 minutes each, so 5 is about two hours. With continuous shrinking on, the GPU share below is what paces the work instead, and this is ignored.',
   'efficiency.target_mbps': 'Not a threshold \u2014 nothing is excluded for being under it. It only sets the ORDER the backlog is worked through: files furthest above the reference for their height are measured first, because the per-scan cap means the order decides which savings land this month and which land next year.',
   'efficiency.min_size_mb': 'Do not spend a quality search on a file smaller than this. A question about worthwhileness, not quality.',
@@ -1307,7 +1317,9 @@ async function viewSettings() {
       settingField('policy.hygiene_action', s.policy.hygiene_action,
         { options: ['none', 'flag', 'transcode'] }),
       settingField('policy.oversize_action', s.policy.oversize_action,
-        { options: ['none', 'flag', 'shrink'] })),
+        { options: ['none', 'flag', 'shrink'] }),
+      settingField('policy.unfixable_action', s.policy.unfixable_action,
+        { options: ['none', 'flag', 'research'] })),
     settingField('policy.try_repair_before_redownload', s.policy.try_repair_before_redownload,
       { label: 'Try a remux before re-downloading a corrupt file' }),
     settingField('policy.blocklist_on_redownload', s.policy.blocklist_on_redownload,
@@ -1319,6 +1331,8 @@ async function viewSettings() {
         { label: 'Recycle bin path', placeholder: '/media/.recycle' }),
       settingField('policy.max_actions_per_scan', s.policy.max_actions_per_scan),
       settingField('policy.max_shrinks_per_scan', s.policy.max_shrinks_per_scan),
+      settingField('policy.max_researches_per_scan', s.policy.max_researches_per_scan),
+      settingField('policy.research_after_days', s.policy.research_after_days),
       settingField('policy.abort_if_failure_ratio_over', s.policy.abort_if_failure_ratio_over))));
 
   // Transcoding

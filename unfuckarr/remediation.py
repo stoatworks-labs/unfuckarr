@@ -32,7 +32,7 @@ from .state import bus, clear_task, set_task
 
 log = logging.getLogger(__name__)
 
-Action = str  # none | flag | transcode | repair | shrink | convert | redownload
+Action = str  # none | flag | transcode | repair | shrink | convert | redownload | research
 
 # A transcode that does not clear the finding would otherwise be repeated on
 # every scan for ever. Two goes, then the file is flagged and left alone.
@@ -147,7 +147,14 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
             # plan around, so the plan would be a stream copy that cannot clear
             # the verdict, run twice, for every file in this state. Invariant
             # 22: an action is only offered when there is a fix behind it.
-            return Decision("flag",
+            if policy.unfixable_action == "research":
+                return Decision("research",
+                                "Emby will not direct play this and did not "
+                                "say why, and nothing in the file looks wrong "
+                                "— no rewrite can help, so ask for a better "
+                                "release instead",
+                                codes)
+            return Decision(policy.unfixable_action,
                             "Emby will not direct play this and did not say "
                             "why, and nothing in the file looks wrong — there "
                             "is no change to make",
@@ -167,7 +174,7 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
                             [f.code for f in unmeasured])
         log.debug("not shrinking %s: %s", result.path, blocked)
 
-    if warnings:
+    if warnings and policy.hygiene_action != "none":
         action = policy.hygiene_action
         if action == "transcode" and _is_disc(result):
             # Hygiene findings on a disc image are real — a Blu-ray playlist
@@ -184,7 +191,7 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
                             "the work — converting it to Matroska would fix "
                             "both",
                             [f.code for f in warnings])
-        if action == "transcode" and not transcode.plan_has_work(result.findings):
+        if not transcode.plan_has_work(result.findings):
             # Nothing here has a fix behind it. Sending the file to the
             # transcoder anyway builds a plan with no metadata work in it,
             # which collapses to a stream-copy remux: every byte rewritten,
@@ -192,13 +199,29 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
             # side. `_confirm_fixed` then counts it as a failed attempt
             # (invariant 9) and it happens a second time before the file is
             # given up on for good. Say so once instead.
-            return Decision("flag",
+            #
+            # Asked regardless of `hygiene_action`, which the transcode-only
+            # guard here used to make it: whether a rewrite would help is a
+            # fact about the findings, not about the action configured for
+            # them, and on the default (`flag`) the old shape meant the file
+            # was reported as untidy for ever with no way to say "this one
+            # needs a better source". `unfixable_action` is that way.
+            if policy.unfixable_action == "research":
+                # The same reasoning that rules a rewrite out is what makes a
+                # re-search the only move left: these findings describe the
+                # encode, and the only way to change an encode is to fetch a
+                # different one.
+                return Decision("research",
+                                "nothing a rewrite can change — these describe "
+                                "how the file was made, so ask for a better "
+                                "release instead",
+                                [f.code for f in warnings])
+            return Decision(policy.unfixable_action,
                             "nothing a rewrite can change — these describe "
                             "how the file was made, not how it was muxed",
                             [f.code for f in warnings])
-        if action != "none":
-            return Decision(action, "stream metadata needs tidying",
-                            [f.code for f in warnings])
+        return Decision(action, "stream metadata needs tidying",
+                        [f.code for f in warnings])
 
     if unmeasured and policy.oversize_action != "none":
         return Decision("flag", "not measured for a saving",
@@ -400,6 +423,8 @@ class Remediator:
                                      cancel)
             if decision.action == "redownload":
                 return self._redownload(job_id, file_row, decision.reason)
+            if decision.action == "research":
+                return self._research(job_id, file_row, decision.reason)
             self._set_job(job_id, "failed", 0, f"unknown action {decision.action}")
             return {"action": decision.action, "ok": False,
                     "message": "unknown action"}
@@ -1409,6 +1434,89 @@ class Remediator:
         file_row["convert_attempts"] = attempts
         db.ex("UPDATE files SET convert_attempts=? WHERE path=?", (attempts, path))
         return attempts
+
+    # -- re-search --------------------------------------------------------
+
+    def research_blocked(self, file_row: dict[str, Any]) -> str | None:
+        """Why this file should not be re-searched right now, or None.
+
+        Split out from `_research` because the scan has to answer the same
+        question *before* spending one of its capped slots: a file in its
+        cooldown that consumed a slot would mean the cap walks nowhere, and
+        the backlog this exists to drain would never move.
+        """
+        s = self._settings()
+        if not file_row.get("arr_parent_id"):
+            return "no Sonarr or Radarr entry owns this file"
+        last = file_row.get("last_research")
+        if last:
+            days = (time.time() - float(last)) / 86400
+            if days < s.policy.research_after_days:
+                return (f"asked {days:.0f} days ago; waiting "
+                        f"{s.policy.research_after_days} between attempts")
+        return None
+
+    def _research(self, job_id: int, file_row: dict[str, Any],
+                  reason: str) -> dict[str, Any]:
+        """Ask the *arr for a better release. Touch nothing on disk.
+
+        There is deliberately no delete, no recycle and no blocklist here, and
+        that is the whole difference between this and `_redownload`. The *arr
+        downloads the replacement, imports it, and removes the old file itself
+        — on a successful import and not before — so a grab that never
+        completes leaves what is already on disk exactly where it is. Doing
+        the delete ourselves first, the way a redownload does, would turn
+        "this file could be better" into "this file is gone and something
+        might replace it", which is not a trade anyone asked for on a file
+        that plays perfectly well.
+        """
+        path = file_row["path"]
+        blocked = self.research_blocked(file_row)
+        if blocked is not None:
+            self._set_job(job_id, "done", 1.0, blocked)
+            return {"action": "research", "ok": True, "message": blocked}
+
+        client = self._arr_for(file_row)
+        if client is None:
+            message = "no *arr configured for this file"
+            self._set_job(job_id, "done", 1.0, message)
+            return {"action": "research", "ok": True, "message": message}
+
+        parent = int(file_row["arr_parent_id"])
+        episode_ids = [int(e) for e in (file_row.get("arr_episode_ids") or [])]
+
+        # Ask the profile first. A search the profile forbids is a query to
+        # every indexer that cannot possibly end in a grab, and the *arr says
+        # nothing about having refused — so this is the only place the reason
+        # can be recorded where anyone will see it.
+        refusal = client.upgrade_blocked(parent)
+        if refusal is not None:
+            db.ex("UPDATE files SET last_research=? WHERE path=?",
+                  (time.time(), path))
+            db.log("research_blocked", "info", path, {"reason": refusal})
+            self._set_job(job_id, "done", 1.0, refusal)
+            return {"action": "research", "ok": True, "message": refusal}
+
+        try:
+            client.search(parent, episode_ids)
+        except ArrError as exc:
+            db.log("arr_search_failed", "error", path, str(exc))
+            self._set_job(job_id, "failed", 0, str(exc), error=str(exc))
+            return {"action": "research", "ok": False,
+                    "message": f"search failed: {exc}"}
+
+        # The cooldown starts when we asked, not when something arrives — the
+        # point of it is to rate-limit *us*, and a search that finds nothing
+        # is the case it most needs to cover.
+        now = time.time()
+        db.ex("UPDATE files SET last_research=?, "
+              "research_attempts=COALESCE(research_attempts,0)+1 WHERE path=?",
+              (now, path))
+        db.bump("researches")
+        message = f"asked {client.flavour} to look for a better release"
+        db.log("research", "info", path, {"reason": reason})
+        self._set_job(job_id, "done", 1.0, message)
+        return {"action": "research", "ok": True, "message": message}
 
     # -- redownload -------------------------------------------------------
 

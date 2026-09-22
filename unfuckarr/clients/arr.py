@@ -34,6 +34,9 @@ class ArrClient:
         self.cfg = cfg
         self.flavour = flavour
         self.timeout = timeout
+        # Quality profiles change about never and `upgrade_blocked` is asked
+        # once per re-searched file, so they are fetched once per client.
+        self._profiles: dict[int, dict[str, Any]] | None = None
 
     # -- plumbing ---------------------------------------------------------
 
@@ -182,6 +185,77 @@ class ArrClient:
         # This endpoint blocklists the release and queues a replacement search.
         self._request("POST", f"history/failed/{newest['id']}")
         return True
+
+    def upgrade_blocked(self, entity_id: int) -> str | None:
+        """Why a re-search for this entity cannot produce a replacement.
+
+        Returns None when a grab is at least possible, or a sentence naming
+        the setting that forbids it. This exists because a search that cannot
+        result in a grab is indistinguishable, from the outside, from one that
+        simply found nothing — the *arr accepts the command, fans it out to
+        every indexer, rejects every release it gets back, and logs nothing
+        the caller can see. Spending that on a file whose profile forbids the
+        upgrade outright is pure waste, and worse, it is waste that looks like
+        work.
+
+        Both branches were measured on the live install (2026-09-22): all six
+        Radarr profiles had ``upgradeAllowed`` off, and five of the six Sonarr
+        profiles had their cutoff pinned to the *lowest* quality they allow,
+        which is the same refusal wearing a different hat — Sonarr upgrades
+        only until it reaches the cutoff, so a cutoff at the bottom of the
+        list is met by every file that exists.
+        """
+        entity = "movie" if self.flavour == "radarr" else "series"
+        try:
+            record = self._request("GET", f"{entity}/{entity_id}") or {}
+            profile_id = record.get("qualityProfileId")
+            if not profile_id:
+                return None
+            profile = self._quality_profile(int(profile_id))
+        except ArrError:
+            # Not knowing is not a reason to refuse: let the search happen and
+            # let the *arr be the one that says no.
+            return None
+        if profile is None:
+            return None
+        name = profile.get("name") or profile_id
+
+        if not profile.get("upgradeAllowed"):
+            return (f"quality profile {name!r} has upgrades turned off, so "
+                    f"{self.flavour} will not replace a file it already has")
+
+        allowed = self._allowed_qualities(profile)
+        cutoff = profile.get("cutoff")
+        if allowed and cutoff is not None and allowed[0][0] == cutoff:
+            return (f"quality profile {name!r} has its cutoff at {allowed[0][1]!r}, "
+                    "the lowest quality it allows — every file already meets it, "
+                    "so no release counts as an upgrade")
+        return None
+
+    def _quality_profile(self, profile_id: int) -> dict[str, Any] | None:
+        if self._profiles is None:
+            rows = self._request("GET", "qualityprofile") or []
+            self._profiles = {int(p["id"]): p for p in rows if p.get("id")}
+        return self._profiles.get(profile_id)
+
+    @staticmethod
+    def _allowed_qualities(profile: dict[str, Any]) -> list[tuple[int, str]]:
+        """The profile's allowed qualities, worst first, as (id, name).
+
+        A group (Sonarr's "WEB 1080p" holding WEBDL and WEBRip) carries the id
+        the cutoff refers to, so it is flattened to one entry rather than to
+        its members — comparing the cutoff against a member id would never
+        match and the check would silently pass everything.
+        """
+        out: list[tuple[int, str]] = []
+        for item in profile.get("items") or []:
+            quality = item.get("quality")
+            if quality is None:
+                if item.get("id") and any(m.get("allowed") for m in item.get("items") or []):
+                    out.append((int(item["id"]), item.get("name") or ""))
+            elif item.get("allowed"):
+                out.append((int(quality["id"]), quality.get("name") or ""))
+        return out
 
     def search(self, entity_id: int, episode_ids: list[int] | None = None) -> None:
         if self.flavour == "radarr":

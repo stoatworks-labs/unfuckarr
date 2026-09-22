@@ -465,8 +465,10 @@ class Scanner:
         applied = 0
         shrinks = 0
         conversions = 0
+        researches = 0
         capped_shrinks = False
         capped_conversions = False
+        capped_researches = False
         # Repairs first, shrinks last. A broken file is urgent and a remux
         # takes seconds; an unmeasured file is neither urgent nor cheap, and
         # one multi-hour shrink must never consume the pass that a corrupt
@@ -482,13 +484,25 @@ class Scanner:
         # what *makes* the disc measurable — so it should not queue behind the
         # shrinks it will eventually feed. Biggest first within them, on the
         # same reasoning as fattest-first for shrinks.
+        # Re-searches sit at the front with the repairs rather than behind the
+        # shrinks, because they cost a single API call and the thing they are
+        # queued behind is measured in hours. A stopped scan that got through
+        # its repairs and none of its re-searches would drain the backlog at
+        # zero files a night.
+        #
+        # Within them, longest-unasked first — never-asked before asked-once —
+        # so the cap walks the backlog instead of circling the same few files.
+        # With the shipped cap of 5 a night this ordering is the only thing
+        # that decides whether a given file is ever asked about at all.
         def order(item: tuple) -> tuple[int, float]:
-            _, _, item_info, item_decision = item
+            item_row, _, item_info, item_decision = item
+            if item_decision.action == "research":
+                return (1, item_row.get("last_research") or 0.0)
             if item_decision.action == "convert":
-                return (1, -(item_info.size if item_info else 0))
+                return (2, -(item_info.size if item_info else 0))
             if item_decision.action != "shrink":
                 return (0, 0.0)
-            return (2, -efficiency_checks.priority(item_info, s.efficiency))
+            return (3, -efficiency_checks.priority(item_info, s.efficiency))
 
         ordered = sorted(pending, key=order)
         # The second pass, and the long one: the probes took minutes to
@@ -528,6 +542,21 @@ class Scanner:
                                {"cap": s.policy.max_shrinks_per_scan})
                         capped_shrinks = True
                     continue
+            elif decision.action == "research":
+                # The cooldown is checked here, not only inside `apply`,
+                # because a file that is merely waiting must not spend one of
+                # the pass's slots — otherwise the first five files in the
+                # backlog absorb the cap every night for a month and nothing
+                # behind them is ever asked about.
+                waiting = self.remediator.research_blocked(row)
+                if waiting is not None:
+                    continue
+                if researches >= s.policy.max_researches_per_scan:
+                    if not capped_researches:
+                        db.log("research_cap_reached", "info", row["path"],
+                               {"cap": s.policy.max_researches_per_scan})
+                        capped_researches = True
+                    continue
             elif decision.action == "convert":
                 if conversions >= s.policy.max_conversions_per_scan:
                     if not capped_conversions:
@@ -558,10 +587,12 @@ class Scanner:
                 shrinks += 1
             elif decision.action == "convert":
                 conversions += 1
+            elif decision.action == "research":
+                researches += 1
             elif decision.action != "flag":
                 applied += 1
             if decision.action != "flag":
-                state.scan.actions = applied + shrinks + conversions
+                state.scan.actions = applied + shrinks + conversions + researches
                 publish_scan()
                 last_published = time.time()
             bus.publish("remediated", {"path": row["path"], **outcome})
@@ -574,7 +605,7 @@ class Scanner:
         recycle.sweep(s.policy.recycle_bin_days, s.policy.recycle_bin_path)
         summary = {"checked": state.scan.checked, "failed": state.scan.failed,
                    "actions": applied, "shrinks": shrinks,
-                   "conversions": conversions}
+                   "conversions": conversions, "researches": researches}
         if state.scan.aborted:
             return {"aborted": state.scan.aborted, **summary}
         db.log("scan_finished", "info", detail=summary)
