@@ -9,7 +9,8 @@
 > [Binding to an interface](#binding-to-an-interface) — set an API key, and keep it off the
 > open internet. No reverse proxy, no port forward, no "it's fine, it has a password".
 
-> **AI-assisted project.** This codebase was created with [Claude Code](https://claude.com/claude-code).
+> **AI-assisted project.** This codebase was created with [Claude](https://claude.com/claude-code)
+> (Anthropic), directed and reviewed by a human author.
 > The check engine, the transcode planner, the policy brakes and the recycle bin are covered by a
 > test suite that runs against real files rendered by ffmpeg on every push — and since 1.0.0 it
 > has been used live: a real Sonarr, Radarr and Emby setup has been connected, and real repairs
