@@ -27,7 +27,7 @@ from .state import bus, state
 log = logging.getLogger(__name__)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 
 @asynccontextmanager
