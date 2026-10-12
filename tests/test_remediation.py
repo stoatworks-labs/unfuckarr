@@ -234,6 +234,28 @@ def test_an_added_track_shifts_the_language_tags(settings):
                          "-metadata:s:a:2": "language=eng"}
 
 
+def test_a_file_with_nothing_playable_keeps_its_originals(settings):
+    """1,560 of the files the full disk wrote off were H.264 with DTS and
+    nothing else. Re-encoding every track to the configured AAC at 192k threw
+    the DTS away; the converted default goes in front of it instead."""
+    info = _tracks(("dts", 6, True), ("dts", 2, False, "eng", "Commentary"))
+    result = CheckResult(path=info.path)
+    result.add(Finding("compat", "bad_audio_codec", "error", ""))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    assert p.audio_action == "copy"
+    assert p.add_audio == transcode.AddedAudio(source=0, codec="ac3",
+                                               channels=6, bitrate="640k")
+
+
+def test_mp4_cannot_carry_the_originals_so_everything_is_re_encoded(settings):
+    settings.transcode.container = "mp4"
+    info = _tracks(("dts", 6, True), ("ac3", 2, False))
+    p = transcode.plan(info, _unplayable_default(info), settings.transcode,
+                       settings.emby_compat)
+    assert p.add_audio is None
+    assert p.audio_action == "encode"
+
+
 def test_a_plan_with_no_change_in_it_is_recognised(settings):
     """The shape of every remux in the September–October loop."""
     info = _tracks(("ac3", 6, True), ("dts", 6, False))

@@ -297,7 +297,10 @@ Break any of these and the failure is quiet and expensive.
     the planner. An unplayable default beside a playable track is `default_audio_unplayable`
     (error); `_fix_default_audio` promotes a stand-in (same language, not a commentary or
     description, channels ≥ min(default, 6)) or else adds a converted copy of the default as
-    output audio 0 and keeps the original. Verified against live Emby 2026-10-12: Battlestar
+    output audio 0 and keeps the original. A file with *no* playable track (`bad_audio_codec`)
+    takes the same add path rather than having every track re-encoded and the DTS discarded;
+    only a non-Matroska target, which cannot carry DTS or TrueHD, still re-encodes everything.
+    Verified against live Emby 2026-10-12: Battlestar
     Galactica S01E01, DTS default + AC3 2.0, refused as it stands and direct play with
     `AudioStreamIndex` on the AC3. `mixed_audio_support` is now information only and **not** in
     `COMPAT_ACTIONABLE`: it was, `plan` never acted on it, and `changes_nothing` exists because of

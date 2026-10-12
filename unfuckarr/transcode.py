@@ -251,13 +251,6 @@ def plan(info: MediaInfo, result: CheckResult, tcfg: TranscodeConfig,
     elif v is not None and tcfg.copy_compatible_streams:
         p.video_action = "copy"
 
-    if "bad_audio_codec" in codes and tcfg.audio_codec != "copy":
-        # Only when nothing playable is present. A playable track that is not
-        # the default is `default_audio_unplayable`, handled below without
-        # touching the tracks that are already there.
-        if not any(a.codec_name in profile.audio for a in info.audio):
-            p.audio_action = "encode"
-
     if codes & {"bad_container", "container_not_in_profile", "no_faststart"}:
         p.is_remux = True
     p.faststart = container == "mp4"
@@ -268,8 +261,13 @@ def plan(info: MediaInfo, result: CheckResult, tcfg: TranscodeConfig,
     # After the hygiene fixes, because `no_default_audio` and
     # `multiple_default_audio` choose by channel count — and the track with
     # the most channels is very often the DTS this is here to step around.
-    if "default_audio_unplayable" in codes and info.audio \
-            and p.audio_action == "copy":
+    # `bad_audio_codec` counts only when nothing is playable: Emby's reasons
+    # can add it to a file that has a playable track, and there the default
+    # track is the question, which the compat check asks on its own.
+    if info.audio and (
+            "default_audio_unplayable" in codes
+            or ("bad_audio_codec" in codes
+                and not any(a.codec_name in profile.audio for a in info.audio))):
         _fix_default_audio(p, info, profile, tcfg)
 
     if p.video_action == "copy" and p.audio_action == "copy":
@@ -291,7 +289,14 @@ def _fix_default_audio(p: TranscodePlan, info: MediaInfo, profile: Any,
     Without one, a converted copy of the default goes in front and becomes
     the default, and the original stays as it was for anything that can
     pass it through. Promoting the stereo track instead would quietly turn
-    a 5.1 film into a stereo one for every viewer.
+    a 5.1 film into a stereo one for every viewer. That includes a file with
+    no playable track at all: it used to have every track re-encoded to the
+    configured codec — AAC at 192k across six channels, with the DTS thrown
+    away — and Allan chose to keep the originals there too (2026-10-12).
+
+    Only Matroska carries the originals reliably; DTS and TrueHD into MP4
+    fail the mux. For any other container every track is re-encoded to the
+    configured codec, which was the only behaviour before this existed.
     """
     lead = default_audio(info.audio)
     want = min(lead.channels or 2, 6)
@@ -305,7 +310,8 @@ def _fix_default_audio(p: TranscodePlan, info: MediaInfo, profile: Any,
     if tcfg.audio_codec == "copy":
         return
     codec = next((c for c in ADDED_AUDIO_BITRATE if c in profile.audio), None)
-    if codec is None:
+    if codec is None or p.container != "mkv":
+        p.audio_action = "encode"
         return
     surround, stereo = ADDED_AUDIO_BITRATE[codec]
     p.add_audio = AddedAudio(source=info.audio.index(lead), codec=codec,

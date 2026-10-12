@@ -54,7 +54,8 @@ a file the local table runs as well and supplies the reason. And it judges a fil
 audio track: a DTS default with a perfectly good AC3 track beside it still transcodes on every
 play. For those, unfuckarr makes the playable track the default if it's the same language with as
 many channels, and otherwise adds an AC3 5.1 copy of the default in front of it, leaving the
-original where it was for anything that can pass it through.
+original where it was for anything that can pass it through. A file with no playable audio at all
+gets the same treatment rather than losing its DTS.
 
 **Stream hygiene: will it behave?**
 Missing audio language tags, no default track among several, image-only subtitles (which force a

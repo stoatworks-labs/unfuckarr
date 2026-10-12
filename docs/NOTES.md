@@ -1104,6 +1104,11 @@ conversion cap.
   stand-in (same language, not commentary/description, channels ≥ min(default, 6)) or adds an AC3
   5.1 copy of the default at 640k as output audio 0 and keeps the original — Allan chose this
   hybrid over always-promote (Battlestar would go stereo) and always-add. Invariant 27.
+- **A file with no playable audio takes the same path.** About 1,900 of the files the reset
+  releases are DTS-only, and `bad_audio_codec` used to re-encode every track to the configured
+  AAC at **192k** — six channels at a stereo bitrate, with the DTS discarded. Asked before the
+  reset, Allan chose the hybrid here too: an AC3 5.1 640k default in front, originals kept. Only
+  an MP4 target (which cannot carry DTS/TrueHD) still re-encodes everything.
 - `transcode.changes_nothing`: `_transcode` refuses a non-repair plan that would write the file
   back unchanged and logs `transcode_no_op` as a **warning**. Seeing one means `decide` and `plan`
   disagree again.
