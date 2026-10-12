@@ -15,9 +15,11 @@
 > test suite that runs against real files rendered by ffmpeg on every push. Since 1.0.0 it's
 > been used live too: I've connected it to a real Sonarr, Radarr and Emby setup and run real
 > repairs (remuxes, recycling, delete-and-re-search) against a live 17,000-file library.
-> Hardware-accelerated encoding and the Unraid template install still haven't been exercised. On
-> *your* library, start with the actions set to `flag` anyway, look at what it found, and only
-> then let it act.
+> The only hardware encoder that's been run is `vaapi`, on an AMD Radeon 880M (see
+> [Hardware transcoding](#hardware-transcoding)). `qsv`, `nvenc` and `videotoolbox` haven't run
+> on real hardware, and the Unraid template install still hasn't been exercised. On *your*
+> library, start with the actions set to `flag` anyway, look at what it found, and only then let
+> it act.
 
 Scans a Sonarr/Radarr library, works out which video files are broken or which ones Emby can't
 direct play, and fixes them, either by transcoding, by remuxing, or by deleting the file and
