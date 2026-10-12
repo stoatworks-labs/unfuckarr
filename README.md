@@ -68,16 +68,18 @@ input"*, which you can't tell apart from a properly broken file, so a library fu
 gets queued for delete-and-re-search. unfuckarr opens them instead, without mounting anything and
 without any privilege the container doesn't already have:
 
-- **Blu-ray** via ffmpeg's `bluray:` protocol. libbluray bundles libudfread and reads the UDF
-  filesystem straight out of the image, then presents the longest playlist. Seeking works, which
-  is what makes the quality search usable on a disc.
+- **Blu-ray** by reading the UDF filesystem in Python, taking the largest `.m2ts` under
+  `BDMV/STREAM` as the feature, and handing ffmpeg its byte range through the `subfile` protocol.
+  The ffmpeg in the image has no libbluray. An ffmpeg that does (on a source install, say) gets
+  the disc through its `bluray:` protocol instead, which follows the disc's own playlists.
 - **DVD** by parsing the ISO9660 directory in Python to find the title VOBs, then handing ffmpeg
-  each one as a byte range of the image through the `subfile` protocol. (Debian's ffmpeg is built
-  without libdvdread, so there's no `dvd:` protocol to use.)
+  each one as a byte range of the image through the `subfile` protocol, which is built into every
+  ffmpeg.
 
-From there a disc behaves like any other file. It's checked for integrity, measured for
-efficiency, and (because an 80 Mbps disc is the best shrink candidate in any library)
-re-encoded to a normal `.mkv` that every client can direct play.
+From there a disc is checked for integrity like any other file. Shrinking one is off by default
+(`shrink_disc_images`): an encode straight out of the raw stream came out short on a live
+library, and although the verification caught and discarded every one, each cost a full encode.
+So a disc gets an *info* finding and is left alone; converting it with MakeMKV is below.
 
 **Converting a disc image, with MakeMKV.** Reading an image is enough to judge it but not enough
 to convert it: the feature on a Blu-ray is a *playlist* naming a sequence of segments, and taking
@@ -192,11 +194,12 @@ gives you a grey, washed-out file that still plays, which is the worst kind of f
 nothing reports it.
 
 > **VMAF needs an ffmpeg that has it, and no distribution ships one.** Not Debian bookworm, not
-> Debian trixie, not jellyfin-ffmpeg. So the container includes a second, static ffmpeg
-> (`ffmpeg-vmaf`) used *only* for scoring. Debian's ffmpeg still does all the encoding, so the
-> hardware path is untouched. Running from source without one, unfuckarr falls back to ffmpeg's
-> built-in SSIM filter and says so in the UI. It does catch gross quality loss, but it matches
-> what a person sees less closely, so the thresholds are approximate rather than a measurement.
+> Debian trixie, not jellyfin-ffmpeg. So the image is built on linuxserver.io's ffmpeg 8, one
+> binary that does the encoding (VAAPI included) and the scoring. Running from source, unfuckarr
+> looks for an `ffmpeg-vmaf` on the `PATH` before your `ffmpeg`, so you can add a libvmaf build
+> without replacing your own. Without one, it falls back to ffmpeg's built-in SSIM filter and
+> says so in the UI. It does catch gross quality loss, but it matches what a person sees less
+> closely, so the thresholds are approximate rather than a measurement.
 
 > **Shrinking fills the recycle bin.** The original of every shrunk file is kept for
 > `recycle_bin_days` (default 14). At five shrinks a scan on a library of 40 GB remuxes, that's
@@ -384,13 +387,13 @@ Image tags:
 
 | Tag | Means | Architectures |
 |---|---|---|
-| `latest`, `1.0.0`, `1.0` | the newest release | amd64 + arm64 |
+| `latest`, `1.3.0`, `1.3` | the newest release | amd64 + arm64 |
 | `edge` | current `main` | amd64 only |
 | `sha-abc1234` | one specific commit | amd64 (arm64 too, on releases) |
 
-arm64 is emulated at build time and ships no VAAPI drivers, so there's no hardware transcoding
-there. `edge` is amd64-only because building arm64 under QEMU on every push isn't worth the
-minutes, which is also why `latest` never points at a `main` build.
+arm64 is emulated at build time and its ffmpeg has no VAAPI encoder, so there's no hardware
+transcoding there. `edge` is amd64-only because building arm64 under QEMU on every push isn't
+worth the minutes, which is also why `latest` never points at a `main` build.
 
 ### From source
 
@@ -455,14 +458,16 @@ Pass `/dev/dri` into the container and set the accelerator in Settings → Trans
 | `nvenc` | NVIDIA container runtime |
 | `videotoolbox` | macOS host, source install only |
 
-The amd64 image ships the Intel and Mesa VAAPI drivers. **The arm64 image ships neither**, so
-there's no hardware transcoding on ARM.
+The amd64 image's ffmpeg brings its own VA drivers (radeonsi for AMD, iHD and i965 for Intel).
+**The arm64 build has no `hevc_vaapi` encoder at all**, so there's no hardware transcoding on ARM.
 
 **`vaapi` is tested on real hardware**, an AMD Radeon 880M (gfx1150), where a 1080p MPEG-2
-source re-encodes to HEVC at about 12× realtime through unfuckarr's own transcode path. Mesa
-comes from bookworm-backports for this reason: Debian's stable Mesa knows no AMD GPU newer
+source re-encodes to HEVC at about 12× realtime through unfuckarr's own transcode path. That
+run needed Mesa from bookworm-backports, because Debian's stable Mesa knows no AMD GPU newer
 than RDNA2 and fails with `amdgpu: unknown (family_id, chip_external_rev)` on anything newer,
-with the card sitting right there in `/dev/dri`.
+with the card sitting right there in `/dev/dri`. Since v1.2.0 the image takes its ffmpeg and VA
+drivers from linuxserver.io's ffmpeg 8 build instead, and that has run on the same card too:
+correct 1080p output, scoring VMAF 91.65 on a QP 26 encode.
 
 `qsv`, `nvenc` and `videotoolbox` are still command-line construction only. No Intel, NVIDIA or
 macOS hardware has run them. `none` (libx264) is still the default.

@@ -390,10 +390,10 @@ Break any of these and the failure is quiet and expensive.
   damaged, which is the failure the module exists to undo.
 - **No distribution ffmpeg has libvmaf.** Not Debian bookworm (5.1.9), not Debian trixie (7.1.5),
   not jellyfin-ffmpeg — check `debian/rules` in any of them and `--enable-libvmaf` is simply not
-  there. The image therefore installs a second, static BtbN build as `ffmpeg-vmaf`, used *only*
-  for scoring, and the Dockerfile greps its filter list so a download that changes shape fails
-  the build instead of silently downgrading every shrink to SSIM. Encoding stays on Debian's
-  ffmpeg because that is the binary the VAAPI work was verified against.
+  there. The image therefore takes its one ffmpeg from linuxserver.io's 8.x build, which has it
+  (the 1088 trap below is why that build rather than a second scorer beside Debian's), and the
+  Dockerfile greps its filter list so a build that changes shape fails instead of silently
+  downgrading every shrink to SSIM. `ffmpeg-vmaf` is still looked for first, for a source install.
 - **`verify` has to cut both sides out too, not just the search.** Seeking two different files to
   the same timestamp does not reliably reach the same frame, and while that was survivable when
   both were ordinary Matroska with the same timebase, a disc image is read as a raw MPEG-TS byte
@@ -459,28 +459,28 @@ Break any of these and the failure is quiet and expensive.
 
   | ffmpeg | VAAPI geometry | libvmaf |
   |---|---|---|
-  | Debian bookworm 5.1.9 (what the image ships) | **1088, padded** | no |
+  | Debian bookworm 5.1.9 (what the image shipped up to v1.1.0) | **1088, padded** | no |
   | Debian trixie 7.1.5 | **1088, padded** | no |
   | BtbN static (master) | aborts — bundled libva cannot reach the host driver | yes |
   | **linuxserver.io 8.0.1** | **1080, correct** | **yes** |
 
   So ffmpeg 8.x fixes it, and the linuxserver.io build has libvmaf as well — one binary instead
   of Debian's plus a separate scorer. That is exactly what Shrinkray does (it is built *from*
-  `lscr.io/linuxserver/ffmpeg`), which is why it can do VAAPI encodes when this cannot.
+  `lscr.io/linuxserver/ffmpeg`), which is why it could do VAAPI encodes when this could not.
 
   **The image is now built the same way** — Ubuntu 24.04 plus a multi-stage copy of that
   ffmpeg's `/usr/local`, verified by building it and running it on the target hardware: correct
   1080p geometry, VMAF 91.65 on a QP 26 encode against a calibration that predicted 91.96, and
   the PUID/PGID drop still working.
 
-  **What that build does not have is libbluray**, so Blu-ray images cannot be opened and are
-  reported as `disc_not_inspectable`. DVD images are unaffected, because that path parses ISO9660
+  **What that build does not have is libbluray**, so there's no `bluray:` protocol for Blu-ray
+  images. DVD images are unaffected, because that path parses ISO9660
   here and reads the VOB through `subfile`, which is a builtin. BtbN's static build *does* carry
   all three flags, but it needs a libva newer than Ubuntu ships (it aborts on `vaMapBuffer2`
   against 2.20), and once given linuxserver's libva 2.23 its VAAPI and libvmaf worked while
-  reading a disc still did not. The durable fix is to stop depending on the ffmpeg build for this
-  at all: parse UDF here, the way the DVD path already parses ISO9660, and hand ffmpeg a
-  `subfile` range.
+  reading a disc still did not. So the durable fix went in: disc reading no longer depends on the
+  ffmpeg build, because UDF is parsed here (`disc.bluray_main_title`), the way the DVD path
+  parses ISO9660, and ffmpeg is handed a `subfile` range.
 
   Grafting that binary onto a Debian Python base does **not** work as-is: its `/usr/local/lib`
   carries its own libva (2.23), which shadows the distro's and then cannot load Mesa's
@@ -622,7 +622,8 @@ Break any of these and the failure is quiet and expensive.
 HEVC at ~12x realtime through `plan` → `build_command` → `run`, output probed as hevc/yuv420p
 with the audio and duration intact. Two things had to be fixed to get there, and both are the
 kind of thing only hardware finds: Debian stable's Mesa cannot initialise any AMD GPU newer than
-RDNA2 (hence bookworm-backports in the Dockerfile), and the command asked the GPU to filter
+RDNA2 (hence bookworm-backports in the Dockerfile, until v1.2.0 moved to linuxserver.io's
+ffmpeg 8 and the VA drivers that come with it), and the command asked the GPU to filter
 frames it had never decoded (see the trap below).
 
 **Verified in live use (since 1.0.0), and the limits of it:** a real Sonarr, Radarr and Emby
