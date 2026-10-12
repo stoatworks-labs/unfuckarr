@@ -192,7 +192,8 @@ def test_modern_profile_accepts_hevc(video_factory, settings):
 
 @needs_ffmpeg
 def test_one_playable_audio_track_is_enough(video_factory, settings, tmp_path):
-    """A DTS track alongside an AAC track is fine — Emby picks the AAC one."""
+    """A DTS track beside a default AAC track is fine — Emby opens a file on
+    its default track, and that one plays."""
     base = video_factory("base.mkv", seconds=6)
     import subprocess
     out = tmp_path / "dual.mkv"
@@ -204,6 +205,59 @@ def test_one_playable_audio_track_is_enough(video_factory, settings, tmp_path):
     result = CheckResult(path=str(out))
     compat.check(info, settings.emby_compat, result)
     assert "bad_audio_codec" not in {f.code for f in result.errors}
+
+
+def _audio_info(*tracks: tuple[str, int, bool]):
+    """A file with these (codec, channels, default) audio tracks, built
+    without ffmpeg: the question is what the check makes of the tracks."""
+    from unfuckarr.probe import MediaInfo, Stream
+    streams = [Stream(index=0, codec_type="video", codec_name="h264",
+                      width=1920, height=1080, fps=25.0)]
+    for i, (codec, channels, default) in enumerate(tracks, start=1):
+        streams.append(Stream(index=i, codec_type="audio", codec_name=codec,
+                              channels=channels, language="eng",
+                              is_default=default))
+    return MediaInfo(path="/media/x.mkv", input_url="/media/x.mkv",
+                     container="mkv", duration=3600.0, size=6_000_000_000,
+                     streams=streams)
+
+
+def test_an_unplayable_default_track_is_an_error_beside_a_playable_one(settings):
+    """Emby judges the default track. Battlestar Galactica S01E01 on the live
+    library, DTS default and AC3 second: refused as it stands, direct play
+    with the AC3 track selected. "One playable track is enough" was the
+    assumption that made every file like this a pointless remux."""
+    result = CheckResult(path="/media/x.mkv")
+    compat.check(_audio_info(("dts", 6, True), ("ac3", 2, False)),
+                 settings.emby_compat, result)
+    codes = {f.code: f for f in result.findings}
+    assert codes["default_audio_unplayable"].severity == "error"
+    assert codes["default_audio_unplayable"].data["default"] == 0
+    assert "mixed_audio_support" not in codes
+
+
+def test_pcm_as_the_default_is_caught_too(settings):
+    """Con Air on the live library: PCM default, five AC3 tracks behind it.
+    PCM is not in PROBLEM_AUDIO, so the old check said nothing at all."""
+    result = CheckResult(path="/media/x.mkv")
+    compat.check(_audio_info(("pcm_s16le", 6, True), ("ac3", 6, False)),
+                 settings.emby_compat, result)
+    assert "default_audio_unplayable" in {f.code for f in result.errors}
+
+
+def test_with_no_default_flag_the_first_track_is_the_default(settings):
+    result = CheckResult(path="/media/x.mkv")
+    compat.check(_audio_info(("truehd", 8, False), ("ac3", 6, False)),
+                 settings.emby_compat, result)
+    assert "default_audio_unplayable" in {f.code for f in result.errors}
+
+
+def test_an_unplayable_track_that_is_not_the_default_is_information(settings):
+    result = CheckResult(path="/media/x.mkv")
+    compat.check(_audio_info(("ac3", 6, True), ("dts", 6, False)),
+                 settings.emby_compat, result)
+    assert not result.errors
+    assert [f.code for f in result.findings] == ["mixed_audio_support"]
 
 
 @needs_ffmpeg

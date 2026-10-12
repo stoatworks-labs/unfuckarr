@@ -481,6 +481,16 @@ class Remediator:
 
         repair = decision.action == "repair"
         plan = transcode.plan(info, result, s.transcode, s.emby_compat, repair=repair)
+        if not repair and transcode.changes_nothing(plan, info):
+            # `decide` thought there was work here and the planner found none.
+            # Nothing ran, so nothing is counted — but it is logged as a
+            # warning, because it means the two have drifted apart again.
+            msg = ("the plan for this file copies it unchanged — there is "
+                   "nothing a transcode would change")
+            self._set_job(job_id, "done", 1.0, msg)
+            db.log("transcode_no_op", "warn", path,
+                   {"reason": decision.reason, "findings": decision.findings})
+            return {"action": "flag", "ok": True, "message": msg}
         dst = transcode.output_path(path, plan.container)
 
         if not transcode.free_space_ok(dst, info.size or file_row.get("size") or 0):
@@ -528,9 +538,11 @@ class Remediator:
                        {"plan": plan.describe})
                 return self._cancelled(job_id, path, "flag")
             self._set_job(job_id, "failed", 0, message, error=message)
-            # Anything but a cancel counts against the cap — a failure that
-            # repeats deterministically would otherwise be retried on every
-            # scan, for ever.
+            if transcode.out_of_space(message):
+                return self._out_of_space(path, "transcode", message)
+            # Anything but a cancel or a full disk counts against the cap — a
+            # failure that repeats deterministically would otherwise be
+            # retried on every scan, for ever.
             db.log("transcode_failed", "error", path,
                    {"message": message,
                     "attempts": self._count_attempt(path, file_row)})
@@ -564,6 +576,8 @@ class Remediator:
                 Path(dst).unlink(missing_ok=True)
                 msg = f"could not recycle the original: {exc}"
                 self._set_job(job_id, "failed", 0, msg, error=msg)
+                if transcode.out_of_space(msg):
+                    return self._out_of_space(path, "recycle", msg)
                 return {"action": "flag", "ok": False, "message": msg}
             try:
                 final = transcode.replace(path, dst)
@@ -624,6 +638,19 @@ class Remediator:
         if out.size < 64 * 1024:
             return f"output is only {out.size} bytes"
         return None
+
+    def _out_of_space(self, path: str, stage: str, message: str) -> dict[str, Any]:
+        """A job that failed because the disk is full.
+
+        Not counted against the file: the file is fine and so is the job, and
+        the next one will fail identically until somebody frees space. The
+        outcome carries `halt` so `Scanner._remediate` stops the pass rather
+        than spending the rest of the backlog's attempts on the same disk —
+        which is how 3,815 untouched files were written off on 2026-09-21.
+        """
+        db.log("no_space", "error", path, {"stage": stage, "message": message})
+        return {"action": "flag", "ok": False, "message": message,
+                "halt": f"the disk is full ({stage}): {message}"}
 
     def _count_attempt(self, path: str, file_row: dict[str, Any]) -> int:
         """One more transcode that did not leave a verified fix behind.
@@ -929,6 +956,10 @@ class Remediator:
         if not ok:
             Path(dst).unlink(missing_ok=True)
             self._set_job(job_id, "failed", 0, message, error=message)
+            if transcode.out_of_space(message) and not cancel.is_set():
+                # A shrink gets one attempt, ever: counting this one would
+                # write the file off for good over a disk that was full today.
+                return self._out_of_space(path, "shrink", message)
             detail: dict[str, Any] = {"message": message}
             if not cancel.is_set():
                 detail["attempts"] = self._count_shrink_attempt(path, file_row)
@@ -1252,6 +1283,10 @@ class Remediator:
                 return {"action": "convert", "ok": False, "message": "cancelled"}
             reason = f"MakeMKV could not copy the feature: {exc}"
             self._set_job(job_id, "failed", 0, reason, error=reason)
+            if transcode.out_of_space(reason):
+                # About the disk, not the disc — invariant 20's reasoning.
+                return {**self._out_of_space(path, "convert", reason),
+                        "action": "convert"}
             db.log("convert_failed", "error", path, {
                 "reason": reason,
                 "attempts": self._count_convert_attempt(path, file_row)})

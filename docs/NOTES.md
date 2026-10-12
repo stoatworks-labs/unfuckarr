@@ -1051,3 +1051,62 @@ writable.
 **Nothing has been scanned under the new code yet.** The first scan — manual, or the scheduled
 one tomorrow — is the one to watch: `max_actions_per_scan` is still 10,000, so the repairing
 pass will again run for weeks, but this time it will say so, and it can be stopped.
+
+## 2026-10-12: "Emby did not say why" on 3,348 files, and three reasons none of them moved
+
+Reported as files sitting at *Emby would transcode this: Emby did not say why* and never being
+resolved. The tag itself is innocent — Emby 4.9.5 gives no `TranscodeReasons` on any refusal
+(2026-08-27), so it is on **every** incompatible file, 3,348 of 3,348. What kept them there was
+three separate things, all measured on the live box (read-only: the API, the DB opened
+`mode=ro` as the app user, and the two September backups through a throwaway container).
+
+**1. A full disk wrote off 3,815 files in a day.** 3,254 of the incompatible files sat at
+`fix_attempts` 2, and their mtimes were months or years old — nothing had ever replaced them. The
+22 September backup's activity log holds 2,403 `transcode_failed` events between 09-21 18:07 and
+09-22 18:23, every one `Error opening output …: No space left on device`. Scan 32 started 4,059
+repairs and finished in **20 minutes**; scan 33 did the same in **8**. Each instant failure
+counted, so two scans took everything from 0 to 2. Comparing against the 09-14 backup: **3,032
+incompatible and 783 hygiene files had 0 attempts on 09-14, are byte-identical today, and are at
+2.** Every scan since refused them — the ~4,040 nightly "actions" were all flags.
+`free_space_ok` could not have caught it: `disk_usage` on `/media` (shfs) reports 32 TB free across
+the array, but the `media` share is `shareUseCache="yes"` and new files land on the 7.3 TB NVMe
+pool first. Re-running a capped file's exact ffmpeg command on 10-12 worked (DTS → 6-channel AAC,
+video copied), so nothing about the files was wrong.
+
+**2. Emby opens a file on its default audio track.** 480 more files carried only
+`mixed_audio_support` — a DTS or PCM default with a playable AC3 track beside it — and the local
+check's comment said "one playable track is enough: Emby picks it". It does not. Battlestar
+Galactica S01E01 (DTS 5.1 default, AC3 2.0): `PlaybackInfo` refuses; the same call with
+`AudioStreamIndex` on the AC3 says `SupportsDirectPlay: True`. Con Air (PCM default, five AC3)
+the same. `plan` only re-encoded audio when *nothing* was playable, so the plan for every one of
+these was a stream copy.
+
+**3. That stream copy looped through the watch folder.** `_confirm_fixed` re-checks without
+Emby, so the unchanged copy read as a fix (no counter, `files_fixed` bumped). The swap looks like
+an arrival; the arrival check asks Emby, gets the same *no*, and goes again. Since 10-07 (as far
+back as the 5,000-row activity log reaches): **~15 TB rewritten across 20 films** — Blade II
+162 times, a 53 GB Starship Troopers 84, a 58 GB Fast & Furious 68 — each pass recycling the
+original, all of it written to the cache SSD. Whether this is what filled the pool on 09-21 is
+not proven; it is the obvious suspect.
+
+A tail of 8 Dark Angel episodes is refused for a default+forced DVDSUB subtitle (direct play with
+subtitles off) — not handled here. 84 uncapped files are disc images waiting for the 2-a-night
+conversion cap.
+
+### What changed (`claude/default-audio`)
+
+- `transcode.out_of_space` + `Remediator._out_of_space`: ENOSPC/EDQUOT is logged `no_space`,
+  counted against nothing (transcode, shrink or convert), and returns `halt`;
+  `Scanner._remediate` stops the pass (`repairs_halted`) and the shrink worker backs off 30 min.
+  Invariant 26.
+- `compat.default_audio_unplayable` (error) replaces the bad half of `mixed_audio_support`, which
+  is now information only and out of `COMPAT_ACTIONABLE`. `_fix_default_audio` promotes a
+  stand-in (same language, not commentary/description, channels ≥ min(default, 6)) or adds an AC3
+  5.1 copy of the default at 640k as output audio 0 and keeps the original — Allan chose this
+  hybrid over always-promote (Battlestar would go stereo) and always-add. Invariant 27.
+- `transcode.changes_nothing`: `_transcode` refuses a non-repair plan that would write the file
+  back unchanged and logs `transcode_no_op` as a **warning**. Seeing one means `decide` and `plan`
+  disagree again.
+- 17 new tests, each confirmed to fail on the old source first. One existing test pinned the bug
+  (`mixed_audio_support` earning a transcode) and now uses `unusual_pixel_format` for the same
+  point — a warning-severity code that `plan` really does act on.

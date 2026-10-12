@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..config import EmbyCompatConfig
-from ..probe import MediaInfo
+from ..probe import MediaInfo, Stream
 from . import CheckResult, Finding
 
 
@@ -96,6 +96,15 @@ def resolve(cfg: EmbyCompatConfig) -> Profile:
     return PRESETS[cfg.target_profile]
 
 
+def default_audio(audio: list[Stream]) -> Stream:
+    """The track a player opens with: the one flagged default, else the first.
+
+    Shared with the planner, which has to aim at the same track this check
+    complained about.
+    """
+    return next((a for a in audio if a.is_default), audio[0])
+
+
 def check(info: MediaInfo, cfg: EmbyCompatConfig, result: CheckResult) -> None:
     """Append compatibility findings to ``result``."""
     if not cfg.enabled or info is None:
@@ -164,16 +173,36 @@ def check(info: MediaInfo, cfg: EmbyCompatConfig, result: CheckResult) -> None:
 
     audio = info.audio
     if audio:
-        # One playable track is enough: Emby picks it. Only complain when every
-        # track needs transcoding.
         playable = [a for a in audio if a.codec_name in profile.audio]
+        lead = default_audio(audio)
         if not playable:
             worst = audio[0].codec_name
             detail = PROBLEM_AUDIO.get(
                 worst, f"no audio track in the target profile (found {worst})")
             result.add(Finding("compat", "bad_audio_codec", "error", detail,
                                {"codecs": [a.codec_name for a in audio]}))
+        elif lead.codec_name not in profile.audio:
+            # A playable track beside the default is not enough: Emby judges
+            # the file by the track it would open with, which is the default.
+            # Measured on the live library 2026-10-12: Battlestar Galactica
+            # S01E01 (DTS default, AC3 second) is refused, and the same
+            # PlaybackInfo call with AudioStreamIndex on the AC3 track says
+            # direct play. This used to be `mixed_audio_support` at info
+            # severity, on the theory that "Emby picks" the playable track —
+            # it does not, and the planner had nothing to do with that
+            # finding, so every one of these files was remuxed unchanged.
+            result.add(Finding(
+                "compat", "default_audio_unplayable", "error",
+                f"the default audio track is {lead.codec_name}, outside the "
+                f"target profile — Emby opens a file on its default track, so "
+                f"it transcodes every play although {len(playable)} playable "
+                f"track(s) exist",
+                {"default": audio.index(lead), "codec": lead.codec_name,
+                 "playable": [a.codec_name for a in playable]},
+            ))
         else:
+            # The default plays, so the other tracks only matter to a viewer
+            # who picks one. Information, not a fault, and nothing to plan.
             problem = [a.codec_name for a in audio if a.codec_name in PROBLEM_AUDIO]
             if problem and len(playable) < len(audio):
                 result.add(Finding(

@@ -25,9 +25,9 @@ from typing import Any, Callable
 
 from . import governor as governor_mod
 from .checks import CheckResult
-from .checks.compat import resolve as resolve_profile
+from .checks.compat import default_audio, resolve as resolve_profile
 from .config import EmbyCompatConfig, TranscodeConfig
-from .probe import MediaInfo
+from .probe import MediaInfo, Stream
 
 log = logging.getLogger(__name__)
 
@@ -129,6 +129,36 @@ CONTAINER_SUBTITLES = {
 
 
 @dataclass
+class AddedAudio:
+    """A playable copy of one source audio track, written as the new default."""
+    source: int        # index into `MediaInfo.audio`
+    codec: str
+    channels: int
+    bitrate: str
+
+    @property
+    def layout(self) -> str:
+        return {1: "mono", 2: "stereo", 6: "5.1"}.get(self.channels,
+                                                      f"{self.channels}ch")
+
+    @property
+    def describe(self) -> str:
+        return f"add {self.codec} {self.layout} as the default audio"
+
+
+# Bitrates for an added default track, as (surround, stereo). Not
+# `TranscodeConfig.audio_bitrate`: that is sized for re-encoding a whole file's
+# audio to AAC stereo, and 192k across six channels is what a soundtrack
+# sounds like over a bad phone line. 640k is AC-3's ceiling and what a
+# Blu-ray's own AC-3 core uses.
+ADDED_AUDIO_BITRATE = {
+    "ac3": ("640k", "224k"),
+    "eac3": ("640k", "224k"),
+    "aac": ("384k", "192k"),
+}
+
+
+@dataclass
 class TranscodePlan:
     reason: str
     video_action: str = "copy"      # copy | encode
@@ -137,6 +167,10 @@ class TranscodePlan:
     drop_subtitles: list[int] = field(default_factory=list)
     fix_language_tags: bool = False
     set_default_audio: int | None = None
+    # Mapped ahead of every source track, so it is output audio 0, and it
+    # takes the default flag from all of them. `set_default_audio` is ignored
+    # when this is set.
+    add_audio: AddedAudio | None = None
     clear_forced_subtitles: bool = False
     faststart: bool = False
     is_remux: bool = False
@@ -157,13 +191,15 @@ class TranscodePlan:
             bits.append("re-encode video")
         if self.audio_action == "encode":
             bits.append("re-encode audio")
+        if self.add_audio is not None:
+            bits.append(self.add_audio.describe)
         if self.is_remux and not bits:
             bits.append("remux")
         if self.drop_subtitles:
             bits.append(f"drop {len(self.drop_subtitles)} subtitle track(s)")
         if self.fix_language_tags:
             bits.append("tag languages")
-        if self.set_default_audio is not None:
+        if self.set_default_audio is not None and self.add_audio is None:
             bits.append("set default audio")
         if self.clear_forced_subtitles:
             bits.append("clear forced subtitles")
@@ -215,10 +251,10 @@ def plan(info: MediaInfo, result: CheckResult, tcfg: TranscodeConfig,
     elif v is not None and tcfg.copy_compatible_streams:
         p.video_action = "copy"
 
-    needs_audio = bool(codes & {"bad_audio_codec", "mixed_audio_support"})
-    if needs_audio and tcfg.audio_codec != "copy":
-        # Only re-encode when nothing already playable is present; otherwise
-        # the existing good track is enough for Emby to pick.
+    if "bad_audio_codec" in codes and tcfg.audio_codec != "copy":
+        # Only when nothing playable is present. A playable track that is not
+        # the default is `default_audio_unplayable`, handled below without
+        # touching the tracks that are already there.
         if not any(a.codec_name in profile.audio for a in info.audio):
             p.audio_action = "encode"
 
@@ -229,9 +265,87 @@ def plan(info: MediaInfo, result: CheckResult, tcfg: TranscodeConfig,
 
     apply_hygiene_fixes(p, info, codes)
 
+    # After the hygiene fixes, because `no_default_audio` and
+    # `multiple_default_audio` choose by channel count — and the track with
+    # the most channels is very often the DTS this is here to step around.
+    if "default_audio_unplayable" in codes and info.audio \
+            and p.audio_action == "copy":
+        _fix_default_audio(p, info, profile, tcfg)
+
     if p.video_action == "copy" and p.audio_action == "copy":
         p.is_remux = True
     return p
+
+
+def _fix_default_audio(p: TranscodePlan, info: MediaInfo, profile: Any,
+                       tcfg: TranscodeConfig) -> None:
+    """Give the file a default audio track the target profile can play.
+
+    A playable track that can stand in for the current default is promoted,
+    which is a remux measured in seconds and changes no audio. "Stand in"
+    means the same language, not a commentary or a description, and at
+    least as many channels as the default — capped at 5.1, because that is
+    all a converted track could offer either, so a Blu-ray's AC-3 5.1 core
+    is as good a default as anything made from its TrueHD 7.1.
+
+    Without one, a converted copy of the default goes in front and becomes
+    the default, and the original stays as it was for anything that can
+    pass it through. Promoting the stereo track instead would quietly turn
+    a 5.1 film into a stereo one for every viewer.
+    """
+    lead = default_audio(info.audio)
+    want = min(lead.channels or 2, 6)
+    stand_ins = [a for a in info.audio
+                 if a.codec_name in profile.audio and a.channels >= want
+                 and _language(a) == _language(lead) and not _is_secondary(a)]
+    if stand_ins:
+        best = max(stand_ins, key=lambda a: (a.channels, -a.index))
+        p.set_default_audio = info.audio.index(best)
+        return
+    if tcfg.audio_codec == "copy":
+        return
+    codec = next((c for c in ADDED_AUDIO_BITRATE if c in profile.audio), None)
+    if codec is None:
+        return
+    surround, stereo = ADDED_AUDIO_BITRATE[codec]
+    p.add_audio = AddedAudio(source=info.audio.index(lead), codec=codec,
+                             channels=want,
+                             bitrate=surround if want > 2 else stereo)
+    p.set_default_audio = None
+
+
+def _language(stream: Stream) -> str:
+    lang = (stream.language or "").lower()
+    return "" if lang in ("und", "unknown") else lang
+
+
+def _is_secondary(stream: Stream) -> bool:
+    """A commentary or an audio description — never anybody's default."""
+    title = (stream.title or "").lower()
+    disposition = stream.raw.get("disposition") or {}
+    return ("comment" in title or "descri" in title
+            or bool(disposition.get("comment"))
+            or bool(disposition.get("visual_impaired")))
+
+
+def changes_nothing(p: TranscodePlan, info: MediaInfo) -> bool:
+    """Whether running this plan would write the source back out unchanged.
+
+    Every stream copied, into the container it is already in, with no track
+    dropped, added or re-flagged. `decide` is meant never to send such a file
+    here (invariant 22), and `_transcode` refuses one anyway, because the two
+    have drifted apart before: `plan_has_work` called `mixed_audio_support`
+    work that `plan` never did, and live that rewrote ~15 TB in five days —
+    Blade II 162 times — each copy reported as a fix, because the re-check
+    after a transcode does not ask Emby, and each one picked up again by the
+    watch folder a minute later because the swap looks like an arrival.
+    """
+    return (p.video_action == "copy" and p.audio_action == "copy"
+            and p.add_audio is None and not p.drop_subtitles
+            and not p.fix_language_tags and p.set_default_audio is None
+            and not p.clear_forced_subtitles and not p.faststart
+            and not p.is_shrink
+            and (info.container or "").lower() == p.container)
 
 
 # The hygiene findings a transcode can actually clear. Everything else the
@@ -256,10 +370,16 @@ HYGIENE_FIXABLE = frozenset({
 # `decide` has to answer the same question about both — is there any work here
 # — and it cannot answer it by building a plan, being a pure function of the
 # result and the policy with no `MediaInfo` to hand.
+#
+# `mixed_audio_support` is deliberately absent. It was listed here, and `plan`
+# only ever re-encoded audio when *no* track was playable — which that finding
+# rules out by definition — so every file carrying it was sent for a stream
+# copy that changed nothing. `default_audio_unplayable` is the half of it that
+# is a real fault, and `_fix_default_audio` is its fix.
 COMPAT_ACTIONABLE = frozenset({
     "bad_video_codec", "video_codec_not_in_profile", "high_bit_depth",
     "resolution_too_high", "unusual_pixel_format",
-    "bad_audio_codec", "mixed_audio_support",
+    "bad_audio_codec", "default_audio_unplayable",
     "bad_container", "container_not_in_profile", "no_faststart",
 })
 
@@ -269,9 +389,8 @@ def plan_has_work(findings: Iterable[Any]) -> bool:
 
     `plan` reads `{f.code for f in result.findings}` — *every* finding, not
     just the errors — so this has to as well. Getting that wrong flags a file
-    the transcoder could genuinely have fixed: measured live 2026-08-27 on an
-    X-Files remux where Emby refused without reasons and the only actionable
-    code was `mixed_audio_support`, which is a warning.
+    the transcoder could genuinely have fixed, such as one whose only
+    actionable code is the *warning* `unusual_pixel_format`.
     """
     for f in findings:
         code = getattr(f, "code", None)
@@ -399,7 +518,14 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
     cmd += ["-fflags", "+genpts+igndts", "-i",
             info.source if info.is_disc else src]
 
-    cmd += ["-map", "0:v:0?", "-map", "0:a?"]
+    cmd += ["-map", "0:v:0?"]
+    # An added track is mapped first, so it is output audio 0 and every
+    # source track sits one place later than it did.
+    added = p.add_audio
+    shift = 1 if added is not None else 0
+    if added is not None:
+        cmd += ["-map", f"0:a:{added.source}"]
+    cmd += ["-map", "0:a?"]
     if tcfg.keep_subtitles:
         for i, _ in enumerate(info.subtitles):
             if i not in p.drop_subtitles:
@@ -425,15 +551,23 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
             cmd += ["-ac", "6"]
     else:
         cmd += ["-c:a", "copy"]
+        if added is not None:
+            # Stream-specific, and after the blanket copy, so it wins for
+            # output audio 0 and leaves the originals copied.
+            cmd += ["-c:a:0", added.codec, "-b:a:0", added.bitrate,
+                    "-ac:a:0", str(added.channels)]
+            lang = _language(info.audio[added.source]) or default_language
+            cmd += ["-metadata:s:a:0", f"language={lang}",
+                    "-metadata:s:a:0",
+                    f"title={added.codec.upper()} {added.layout}"]
 
     if tcfg.keep_subtitles and info.subtitles:
         cmd += ["-c:s", "copy" if p.container == "mkv" else "mov_text"]
 
     if p.fix_language_tags:
-        kept_audio = list(enumerate(info.audio))
-        for out_i, a in kept_audio:
+        for i, a in enumerate(info.audio):
             if not a.language or a.language in ("und", "unknown"):
-                cmd += [f"-metadata:s:a:{out_i}", f"language={default_language}"]
+                cmd += [f"-metadata:s:a:{i + shift}", f"language={default_language}"]
         out_i = 0
         for i, s in enumerate(info.subtitles):
             if i in p.drop_subtitles:
@@ -442,7 +576,11 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
                 cmd += [f"-metadata:s:s:{out_i}", f"language={default_language}"]
             out_i += 1
 
-    if p.set_default_audio is not None:
+    if added is not None:
+        cmd += ["-disposition:a:0", "default"]
+        for i in range(len(info.audio)):
+            cmd += [f"-disposition:a:{i + 1}", "0"]
+    elif p.set_default_audio is not None:
         for i in range(len(info.audio)):
             flag = "default" if i == p.set_default_audio else "0"
             cmd += [f"-disposition:a:{i}", flag]
@@ -757,6 +895,24 @@ def replace(src: str, new: str) -> str:
     except OSError:
         shutil.move(new, final)
     return final
+
+
+# What ffmpeg, MakeMKV and Python's strerror print for ENOSPC and EDQUOT.
+NO_SPACE_MARKERS = ("No space left on device", "Disk quota exceeded")
+
+
+def out_of_space(message: str) -> bool:
+    """Whether a failure was the disk filling up, not anything about the file.
+
+    `free_space_ok` cannot see this coming on Unraid. `shutil.disk_usage` on a
+    user share reports the whole array, and a share that writes to the cache
+    pool first fails as soon as the *pool* fills. On 2026-09-21 the pool
+    filled with terabytes free on the array; that scan started 4,059 repairs
+    and finished in 20 minutes, the next evening's did the same in 8, and
+    each failure was counted against its file — 3,815 files written off in
+    a day, every one of them byte-for-byte untouched.
+    """
+    return any(m in (message or "") for m in NO_SPACE_MARKERS)
 
 
 def free_space_ok(path: str, needed: int, margin: float = 1.2) -> bool:

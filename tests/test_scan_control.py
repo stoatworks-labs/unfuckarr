@@ -129,6 +129,30 @@ def test_repairing_reports_its_own_progress(settings, monkeypatch):
     assert state.scan.actions == 4
 
 
+def test_a_full_disk_stops_the_repairing_pass(settings, monkeypatch):
+    """Every job behind the first full-disk failure fails the same way in
+    seconds. The pass stops and says why, and the backlog waits."""
+    rem = Remediator(lambda: settings)
+    calls = []
+
+    def full(row, *a, **k):
+        calls.append(row["path"])
+        return {"action": "flag", "ok": False, "message": "no space",
+                "halt": "the disk is full (transcode): No space left on device"}
+    monkeypatch.setattr(rem, "apply", full)
+    scanner = Scanner(lambda: settings, rem)
+    settings.policy.abort_if_failure_ratio_over = 1.0
+
+    state.scan = ScanProgress(running=True, checked=10, total=10)
+    pending = [({"path": f"/media/{i}.mkv"}, _corrupt(), None,
+                Decision("transcode", "bad")) for i in range(5)]
+    out = scanner._remediate(settings, pending, population=100)
+
+    assert calls == ["/media/0.mkv"]
+    assert "disk is full" in out["aborted"]
+    assert db.q1("SELECT COUNT(*) n FROM activity WHERE event='repairs_halted'")["n"] == 1
+
+
 def test_a_stop_during_repairing_ends_the_job_in_flight(settings, monkeypatch):
     """The loop always checked the flag between jobs; it never reached the
     job under way. A transcode is minutes and a shrink an hour or more, so a

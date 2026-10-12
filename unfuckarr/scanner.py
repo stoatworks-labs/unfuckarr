@@ -596,6 +596,18 @@ class Scanner:
                 publish_scan()
                 last_published = time.time()
             bus.publish("remediated", {"path": row["path"], **outcome})
+            if outcome.get("halt"):
+                # A full disk fails every job behind this one in seconds, and
+                # each would be a failure to explain later. Stop the pass; the
+                # next scan picks the backlog up where this one left it.
+                state.scan.aborted = (
+                    f"stopped repairing after {state.scan.position} of "
+                    f"{state.scan.pending}: {outcome['halt']}")
+                db.log("repairs_halted", "error", row["path"],
+                       {"reason": outcome["halt"],
+                        "position": state.scan.position,
+                        "pending": state.scan.pending})
+                break
 
         if self._stop:
             self._stopped()

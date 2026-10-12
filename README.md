@@ -49,6 +49,13 @@ Emby's own `TranscodeReasons` back. That takes account of your server's version,
 and its remux rules in a way a local codec table never can. Without Emby, it uses a local profile
 model instead: `modern`, `conservative` (Chromecast-class), `permissive`, or a custom list.
 
+Two things Emby won't tell you. Version 4.9 says *no* without ever saying why, so when it refuses
+a file the local table runs as well and supplies the reason. And it judges a file by its *default*
+audio track: a DTS default with a perfectly good AC3 track beside it still transcodes on every
+play. For those, unfuckarr makes the playable track the default if it's the same language with as
+many channels, and otherwise adds an AC3 5.1 copy of the default in front of it, leaving the
+original where it was for anything that can pass it through.
+
 **Stream hygiene: will it behave?**
 Missing audio language tags, no default track among several, image-only subtitles (which force a
 video transcode whenever they're switched on), every subtitle flagged forced, odd frame rates.

@@ -189,12 +189,13 @@ class Service:
                     self._sched_stop.wait(300)
                     continue
 
-                self._shrink_one(row, Decision(
+                outcome = self._shrink_one(row, Decision(
                     "shrink",
                     "measuring how small this can be at full perceptual quality"))
                 # Straight on to the next one: the governor is what paces
-                # this, not a delay here.
-                wait = 0.0
+                # this, not a delay here — unless the disk is full, when the
+                # same file would come straight back and fail the same way.
+                wait = 1800.0 if outcome and outcome.get("halt") else 0.0
             except Exception as exc:  # noqa: BLE001 - the worker must not die
                 log.exception("shrink worker failed")
                 db.log("shrink_worker_error", "error", detail=str(exc))
@@ -248,11 +249,11 @@ class Service:
             " ORDER BY shrink_priority DESC, size DESC LIMIT 1")
         return {k: row[k] for k in row.keys()} if row else None
 
-    def _shrink_one(self, record: dict[str, Any], decision) -> None:
+    def _shrink_one(self, record: dict[str, Any], decision) -> dict[str, Any] | None:
         path = record["path"]
         if not Path(path).exists():
             db.ex("UPDATE files SET status='missing' WHERE path=?", (path,))
-            return
+            return None
         s = config.get()
         result, info = check_file(
             path, s, expected_runtime=record.get("expected_runtime"),
@@ -265,9 +266,10 @@ class Service:
         # The file may have changed since the scan flagged it — repaired,
         # replaced by the *arr, or no longer a candidate at all.
         if not result.unmeasured:
-            return
+            return None
         outcome = self.remediator.apply(record, result, info, decision)
         bus.publish("remediated", {"path": path, **outcome})
+        return outcome
 
     # -- the download queue -----------------------------------------------
 

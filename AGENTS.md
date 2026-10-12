@@ -281,6 +281,32 @@ Break any of these and the failure is quiet and expensive.
     spend one of the pass's slots; without that the first five files absorb the cap every night
     for a month and nothing behind them is ever asked about.
 
+26. **A full disk is never recorded against a file.** `transcode.out_of_space` recognises
+    ENOSPC/EDQUOT in a failure, and `Remediator._out_of_space` logs `no_space`, counts nothing —
+    not `fix_attempts`, not the single permanent shrink or convert attempt — and returns `halt`,
+    which ends `Scanner._remediate`'s pass and backs the shrink worker off for half an hour.
+    `free_space_ok` cannot be trusted to see it coming on Unraid: `shutil.disk_usage` on a user
+    share reports the whole array, and a share that writes to the cache pool first fails as soon
+    as the *pool* fills. Live, 2026-09-21/22: the pool filled with terabytes free on the array,
+    two scans started 4,059 repairs each and finished in 20 and 8 minutes, and 3,815 files that
+    nothing had ever touched were written off at `fix_attempts` 2 — refused by every scan after
+    it, a month of nightly "actions" that were all flags.
+
+27. **Emby opens a file on its default audio track, and the plan has to aim at that track.**
+    `compat.default_audio` (the track flagged default, else the first) is shared by the check and
+    the planner. An unplayable default beside a playable track is `default_audio_unplayable`
+    (error); `_fix_default_audio` promotes a stand-in (same language, not a commentary or
+    description, channels ≥ min(default, 6)) or else adds a converted copy of the default as
+    output audio 0 and keeps the original. Verified against live Emby 2026-10-12: Battlestar
+    Galactica S01E01, DTS default + AC3 2.0, refused as it stands and direct play with
+    `AudioStreamIndex` on the AC3. `mixed_audio_support` is now information only and **not** in
+    `COMPAT_ACTIONABLE`: it was, `plan` never acted on it, and `changes_nothing` exists because of
+    what followed. The post-transcode re-check does not ask Emby, so the unchanged copy was
+    recorded as a fix; the swap looks like an arrival to the watch folder, which asked Emby, got
+    the same *no*, and did it again. ~15 TB rewritten in five days, Blade II 162 times. `_transcode`
+    now refuses any non-repair plan that `changes_nothing` and logs `transcode_no_op` as a warning
+    — if that event ever appears, `decide` and `plan` have drifted apart again.
+
 ## Traps found the hard way
 
 - **The recycle bin's size is what is on disk, not `SUM(size)` from the table.** The two disagree,

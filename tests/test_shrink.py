@@ -349,6 +349,27 @@ def test_a_file_is_never_shrunk_twice(video_factory, settings, monkeypatch):
 
 
 @needs_ffmpeg
+def test_a_full_disk_does_not_use_up_the_only_attempt(video_factory, settings,
+                                                      monkeypatch):
+    """A shrink gets one attempt, ever. Spending it on a disk that happened to
+    be full today would write the file off for good."""
+    path = video_factory("full.mkv", seconds=4)
+    row = insert(path)
+    arm(monkeypatch, settings)
+    monkeypatch.setattr(transcode, "run", lambda *a, **k: (
+        False, "Error opening output files: No space left on device"))
+    result, info = check_file(str(path), settings)
+
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("shrink", "unmeasured"))
+    assert out["halt"]
+    after = db.q1("SELECT shrink_attempts, shrink_skipped FROM files WHERE path=?",
+                  (str(path),))
+    assert (after["shrink_attempts"] or 0) == 0
+    assert after["shrink_skipped"] is None
+
+
+@needs_ffmpeg
 def test_a_file_already_assessed_is_not_reassessed(video_factory, settings,
                                                    monkeypatch):
     """The reasons are properties of the content and will be just as true next

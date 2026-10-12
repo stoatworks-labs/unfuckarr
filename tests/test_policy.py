@@ -114,13 +114,30 @@ def test_emby_no_with_stated_reasons_transcodes(settings):
 
 
 def test_a_compat_warning_the_planner_uses_still_earns_the_transcode(settings):
-    """`mixed_audio_support` is severity *warning*, and `plan` reads every
-    finding regardless of severity — so a guard that looked only at the errors
-    flagged a file the transcoder could genuinely fix. Measured live
-    2026-08-27 on an X-Files remux Emby refused without reasons."""
+    """`plan` reads every finding regardless of severity, so a guard that
+    looked only at the errors would flag a file the transcoder could fix."""
     r = CheckResult(path="/media/x.mkv")
     r.add(Finding("emby", "no_direct_play", "error", "", {"reasons": []}))
-    r.add(Finding("compat", "mixed_audio_support", "warning", ""))
+    r.add(Finding("compat", "unusual_pixel_format", "warning", ""))
+    assert decide(r, settings).action == "transcode"
+
+
+def test_mixed_audio_support_is_not_work(settings):
+    """It used to be, and `plan` never did anything with it: the default
+    track either plays (nothing to fix) or it does not, and that case is
+    `default_audio_unplayable`. Treated as work, it sent the file for a
+    stream copy that the post-transcode check called a fix and the watch
+    folder picked straight back up — Blade II, 162 times in five days."""
+    r = CheckResult(path="/media/x.mkv")
+    r.add(Finding("emby", "no_direct_play", "error", "", {"reasons": []}))
+    r.add(Finding("compat", "mixed_audio_support", "info", ""))
+    assert decide(r, settings).action == "flag"
+
+
+def test_an_unplayable_default_track_earns_the_transcode(settings):
+    r = CheckResult(path="/media/x.mkv")
+    r.add(Finding("emby", "no_direct_play", "error", "", {"reasons": []}))
+    r.add(Finding("compat", "default_audio_unplayable", "error", ""))
     assert decide(r, settings).action == "transcode"
 
 

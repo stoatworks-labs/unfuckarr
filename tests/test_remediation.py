@@ -131,6 +131,161 @@ def test_every_fixable_code_is_one_the_planner_acts_on(settings):
                 or p.clear_forced_subtitles), code
 
 
+def _tracks(*tracks: tuple) -> MediaInfo:
+    """Audio as (codec, channels, default[, language[, title]]) tuples."""
+    streams = [Stream(index=0, codec_type="video", codec_name="h264",
+                      width=1920, height=1080, fps=25.0)]
+    for i, t in enumerate(tracks, start=1):
+        codec, channels, default = t[:3]
+        streams.append(Stream(index=i, codec_type="audio", codec_name=codec,
+                              channels=channels, is_default=default,
+                              language=t[3] if len(t) > 3 else "eng",
+                              title=t[4] if len(t) > 4 else ""))
+    return MediaInfo(path="/media/x.mkv", input_url="/media/x.mkv",
+                     container="mkv", duration=3600.0, size=6_000_000_000,
+                     streams=streams)
+
+
+def _unplayable_default(info: MediaInfo) -> CheckResult:
+    result = CheckResult(path=info.path)
+    result.add(Finding("emby", "no_direct_play", "error", "", {"reasons": []}))
+    result.add(Finding("compat", "default_audio_unplayable", "error", ""))
+    return result
+
+
+def test_a_stand_in_track_is_promoted_to_default(settings):
+    """Con Air: PCM 5.1 default, AC3 5.1 beside it. Flagging the AC3 track
+    default is a remux in seconds and changes no audio at all."""
+    info = _tracks(("pcm_s16le", 6, True), ("ac3", 6, False), ("ac3", 2, False))
+    p = transcode.plan(info, _unplayable_default(info), settings.transcode,
+                       settings.emby_compat)
+    assert p.set_default_audio == 1
+    assert p.add_audio is None
+    assert p.audio_action == "copy"
+    assert not transcode.changes_nothing(p, info)
+
+
+def test_a_stereo_track_does_not_stand_in_for_surround(settings):
+    """Battlestar Galactica: DTS 5.1 default, AC3 2.0 beside it. Promoting the
+    stereo track would make a 5.1 episode stereo for everyone, so a converted
+    5.1 copy goes in front instead and the DTS stays for passthrough."""
+    info = _tracks(("dts", 6, True), ("ac3", 2, False))
+    p = transcode.plan(info, _unplayable_default(info), settings.transcode,
+                       settings.emby_compat)
+    assert p.set_default_audio is None
+    assert p.add_audio == transcode.AddedAudio(source=0, codec="ac3",
+                                               channels=6, bitrate="640k")
+    cmd = transcode.build_command(info.path, "/tmp/out.mkv", info, p,
+                                  settings.transcode)
+    maps = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-map"]
+    assert maps[:3] == ["0:v:0?", "0:a:0", "0:a?"]
+    assert cmd[cmd.index("-c:a") + 1] == "copy"
+    assert cmd[cmd.index("-c:a:0") + 1] == "ac3"
+    assert cmd[cmd.index("-ac:a:0") + 1] == "6"
+    pairs = {cmd[i]: cmd[i + 1] for i, a in enumerate(cmd)
+             if a.startswith("-disposition:a:")}
+    assert pairs == {"-disposition:a:0": "default", "-disposition:a:1": "0",
+                     "-disposition:a:2": "0"}
+
+
+def test_truehd_7_1_is_stood_in_for_by_its_ac3_5_1_core(settings):
+    """A converted track could only be 5.1 either, so the disc's own AC-3
+    core is as good a default as anything made from the TrueHD."""
+    info = _tracks(("truehd", 8, True), ("ac3", 6, False))
+    p = transcode.plan(info, _unplayable_default(info), settings.transcode,
+                       settings.emby_compat)
+    assert p.set_default_audio == 1 and p.add_audio is None
+
+
+def test_a_commentary_or_another_language_never_stands_in(settings):
+    info = _tracks(("dts", 6, True, "eng"),
+                   ("ac3", 6, False, "eng", "Director's Commentary"),
+                   ("ac3", 6, False, "fre"))
+    p = transcode.plan(info, _unplayable_default(info), settings.transcode,
+                       settings.emby_compat)
+    assert p.set_default_audio is None
+    assert p.add_audio is not None and p.add_audio.source == 0
+
+
+def test_the_hygiene_default_choice_does_not_undo_the_compat_one(settings):
+    """`no_default_audio` picks the track with the most channels, which is
+    the DTS this is trying to step around."""
+    # No default flag: the first track is the default, and it is DTS 7.1.
+    info = _tracks(("dts", 8, False), ("ac3", 6, False), ("ac3", 2, False))
+    result = _unplayable_default(info)
+    result.add(Finding("hygiene", "no_default_audio", "warning", ""))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    assert p.set_default_audio == 1
+
+
+def test_an_added_track_shifts_the_language_tags(settings):
+    info = _tracks(("dts", 6, True, ""), ("ac3", 2, False, ""))
+    result = _unplayable_default(info)
+    result.add(Finding("hygiene", "audio_missing_language", "warning", ""))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    cmd = transcode.build_command(info.path, "/tmp/out.mkv", info, p,
+                                  settings.transcode)
+    languages = {cmd[i]: cmd[i + 1] for i, a in enumerate(cmd)
+                 if a.startswith("-metadata:s:a:")
+                 and cmd[i + 1].startswith("language=")}
+    # The added track, then both originals one place later than in the source.
+    assert languages == {"-metadata:s:a:0": "language=eng",
+                         "-metadata:s:a:1": "language=eng",
+                         "-metadata:s:a:2": "language=eng"}
+
+
+def test_a_plan_with_no_change_in_it_is_recognised(settings):
+    """The shape of every remux in the September–October loop."""
+    info = _tracks(("ac3", 6, True), ("dts", 6, False))
+    result = CheckResult(path=info.path)
+    result.add(Finding("emby", "no_direct_play", "error", "", {"reasons": []}))
+    result.add(Finding("compat", "mixed_audio_support", "info", ""))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    assert transcode.changes_nothing(p, info)
+
+
+@needs_ffmpeg
+def test_an_added_default_track_really_plays(tmp_path, settings):
+    """End to end through ffmpeg: the per-stream codec has to win over the
+    blanket copy, and the result has to pass the same check that condemned
+    the source. PCM stands in for DTS, whose encoder is experimental."""
+    import subprocess
+    from unfuckarr.checks import compat
+
+    src = tmp_path / "surround.mkv"
+    subprocess.run([
+        settings.ffmpeg_path, "-v", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc=size=320x180:rate=25:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=880:duration=6",
+        "-map", "0:v", "-map", "1:a", "-map", "2:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a:0", "pcm_s16le", "-ac:a:0", "6", "-c:a:1", "ac3", "-ac:a:1", "2",
+        "-metadata:s:a:0", "language=eng", "-metadata:s:a:1", "language=eng",
+        "-disposition:a:0", "default", "-disposition:a:1", "0", str(src),
+    ], check=True, capture_output=True)
+
+    info = probe(str(src), settings.ffprobe_path)
+    before = CheckResult(path=str(src))
+    compat.check(info, settings.emby_compat, before)
+    assert "default_audio_unplayable" in {f.code for f in before.errors}
+
+    p = transcode.plan(info, before, settings.transcode, settings.emby_compat)
+    out = tmp_path / "out.mkv"
+    cmd = transcode.build_command(str(src), str(out), info, p, settings.transcode,
+                                  ffmpeg=settings.ffmpeg_path)
+    subprocess.run(cmd, check=True, capture_output=True)
+
+    after_info = probe(str(out), settings.ffprobe_path)
+    got = [(a.codec_name, a.channels, a.is_default, a.language)
+           for a in after_info.audio]
+    assert got == [("ac3", 6, True, "eng"), ("pcm_s16le", 6, False, "eng"),
+                   ("ac3", 2, False, "eng")]
+    after = CheckResult(path=str(out))
+    compat.check(after_info, settings.emby_compat, after)
+    assert not after.errors, [f.code for f in after.errors]
+
+
 def test_local_table_runs_when_emby_refuses_without_reasons(settings, monkeypatch):
     """The fallback that makes the verdict actionable. Without it a refusal
     with no reasons produces `video_action == "copy"` and a stream copy."""
@@ -400,6 +555,64 @@ def test_output_missing_at_verify_counts_attempts_and_stops(
     out = rem.apply(row(), result, info, Decision("transcode", "incompatible"))
     assert out["action"] == "flag"
     assert "not trying again" in out["message"]
+
+
+NO_SPACE = ("[out#0/matroska @ 0x55] Error opening output /media/x.unfuckarr.mkv: "
+            "No space left on device; Error opening output files: No space "
+            "left on device")
+
+
+@needs_ffmpeg
+def test_a_full_disk_is_not_counted_against_the_file(video_factory, settings,
+                                                      monkeypatch):
+    """2026-09-21: the cache pool filled with terabytes free on the array, and
+    two scans failed every transcode they started in minutes. Each failure was
+    counted, so two scans wrote off 3,815 files nothing had ever touched."""
+    path = video_factory("full.mkv", seconds=6)
+    db.ex("INSERT INTO files (path, title) VALUES (?,?)", (str(path), "Full"))
+    monkeypatch.setattr(transcode, "run", lambda *a, **k: (False, NO_SPACE))
+    result, info = check_file(str(path), settings)
+    result.add(Finding("compat", "bad_container", "error", ""))
+    row = {"path": str(path), "source": "folder", "title": "Full",
+           "arr_id": None, "arr_parent_id": None, "fix_attempts": 0}
+
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("transcode", "incompatible"))
+
+    assert not out["ok"]
+    assert "disk is full" in out["halt"]
+    assert path.exists()
+    assert db.q1("SELECT fix_attempts FROM files WHERE path=?",
+                 (str(path),))["fix_attempts"] == 0
+    assert db.q1("SELECT COUNT(*) n FROM activity WHERE event='no_space'")["n"] == 1
+    assert db.q1("SELECT COUNT(*) n FROM activity "
+                 "WHERE event='transcode_failed'")["n"] == 0
+
+
+def test_a_plan_that_changes_nothing_is_refused_and_not_counted(settings,
+                                                                monkeypatch):
+    """The backstop for `decide` and `plan` drifting apart again. Nothing
+    runs, nothing is recycled, and the drift is logged as a warning."""
+    ran = []
+    monkeypatch.setattr(transcode, "run", lambda *a, **k: ran.append(a) or (True, ""))
+    info = _tracks(("ac3", 6, True), ("dts", 6, False))
+    db.ex("INSERT INTO files (path, title) VALUES (?,?)", (info.path, "X"))
+    result = CheckResult(path=info.path)
+    result.add(Finding("emby", "no_direct_play", "error", "", {"reasons": []}))
+    result.add(Finding("compat", "mixed_audio_support", "info", ""))
+    row = {"path": info.path, "source": "folder", "title": "X",
+           "arr_id": None, "arr_parent_id": None, "fix_attempts": 0}
+
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("transcode", "Emby cannot direct play this",
+                                    ["no_direct_play"]))
+
+    assert out["action"] == "flag" and out["ok"]
+    assert not ran
+    assert db.q1("SELECT fix_attempts FROM files WHERE path=?",
+                 (info.path,))["fix_attempts"] == 0
+    assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 0
+    assert db.q1("SELECT level FROM activity WHERE event='transcode_no_op'")["level"] == "warn"
 
 
 @needs_ffmpeg
