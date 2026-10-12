@@ -1115,3 +1115,55 @@ conversion cap.
 - 17 new tests, each confirmed to fail on the old source first. One existing test pinned the bug
   (`mixed_audio_support` earning a transcode) and now uses `unusual_pixel_format` for the same
   point — a warning-severity code that `plan` really does act on.
+
+### Deployed 2026-10-13, and the counters put back
+
+`unfk` runs **`5a935be`** (v1.3.0) since 00:46. Backup at
+`/mnt/user/appdata/.unfk-backups/pre-default-audio-2026-10-12/` (online `.backup()` as uid 99,
+`integrity_check ok`, 18,789 files, + config + inspect). Rollback tag
+**`unfuckarr-makemkv:rollback-2026-10-12`** = the image that was running (`7a88cdfdad7c`).
+
+**⚠️ The rebuild recipe is broken: the MakeMKV PPA has moved to 2.0.0.** `docker build -f
+docker/makemkv/Dockerfile` fails with `Version '1.18.4-1~noble' for 'makemkv-bin' was not found`
+— `~heyarje/makemkv-beta` carries only `2.0.0-1~noble` now and keeps no old versions. A major
+version under disc conversion is not something to slip in with an unrelated fix, so the deployed
+`unfuckarr-makemkv:edge` (`1a04e237107b`) is an **overlay**: `FROM rollback-2026-10-12`,
+`COPY unfuckarr/ /app/unfuckarr/`, plus the `import unfuckarr.api` check. That is exact for this
+change — between `61b00de` and `5a935be` only the Python package changed (no `web/`,
+requirements, entrypoint or base-image change) — and it keeps MakeMKV 1.18.4. Labelled
+`com.stoatworks.overlay-of=rollback-2026-10-12`. **The next real rebuild has to bump
+`MAKEMKV_VERSION` and verify a conversion first.**
+
+**Counters.** With the container stopped, as uid 99 from a throwaway container:
+
+- **3,816** reset (3,032 incompatible, 783 hygiene, 1 ok): 0 attempts in the 09-14 backup and
+  byte-identical (size + mtime) since. List in `/config/reset-2026-10-12.json`.
+- **210** more (`/config/reset-2026-10-13.json`), found when Battlestar S01E01 was still refused
+  at the cap: 0 on 09-14, 2 on 09-22, unchanged since — they *had* changed in between (shrunk, or
+  no-op-remuxed in scan 31), which the first rule excluded. 206 of them are DTS/TrueHD defaults
+  beside AC3, the very files the old planner could only copy, and that copy never counted an
+  attempt — so the two attempts can only be the full-disk scans.
+- Left capped on purpose: 12 incompatible (10 `.ts` capped since August, 2 changed since 09-22),
+  64 hygiene (most capped since August), 102 ok.
+
+Both resets logged as `fix_attempts_reset` in the activity log.
+
+**Startup** removed **230 abandoned outputs, 94.8 GB** — the loop's half-written copies — and
+failed 13 interrupted jobs.
+
+**Verified on real media, through the app.** Before the swap, from a throwaway container on the
+new image with `/media` read-only, 30 s of each real plan into `/tmp`: Battlestar S01E01 → AC3 5.1
+added as default, DTS-HD MA and the director's commentary kept (the AC3 2.0 *was* the
+commentary); Con Air → English AC3 5.1 promoted, PCM kept; X-Files S09E01 (DTS only) → AC3 5.1
+added, DTS kept; Blade II → English AC3 5.1 promoted. No compat errors left on any output. After
+the swap, `POST /api/files/recheck?act=true` on Battlestar S01E01: `add ac3 5.1 as the default
+audio`, confirmed fixed, `fix_attempts` 0 — and after an item refresh **Emby's `PlaybackInfo`
+says `SupportsDirectPlay: True`** with the unfuckarr profile, on the file it refused an hour
+earlier.
+
+Not yet seen: the watcher's arrival check on that swapped file. It was queued behind a Scott
+Pilgrim shrink search holding the arrival pool (`_watch_pool` is a semaphore of 2 shared with
+whatever the arrivals go on to do), which is old behaviour. Expect `arrival_checked … "action":
+"none"`; a `transcode_no_op` warning anywhere means `decide` and `plan` disagree again. The
+first scheduled scan under all of this is **18:01 on 10-13**, with ~4,000 released files — about
+1,900 of them audio-only adds, 667 of them AVI → HEVC VAAPI encodes. It will run for days.
