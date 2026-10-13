@@ -184,7 +184,7 @@ class Service:
                     self._sched_stop.wait(300)
                     continue
 
-                row = self._next_shrink_candidate()
+                row = self._next_shrink_candidate(self.remediator.busy_paths())
                 if row is None:
                     self._sched_stop.wait(300)
                     continue
@@ -194,8 +194,13 @@ class Service:
                     "measuring how small this can be at full perceptual quality"))
                 # Straight on to the next one: the governor is what paces
                 # this, not a delay here — unless the disk is full, when the
-                # same file would come straight back and fail the same way.
-                wait = 1800.0 if outcome and outcome.get("halt") else 0.0
+                # same file would come straight back and fail the same way;
+                # or the file changed under the job, which counts nothing, so
+                # a file still being written would otherwise be re-probed and
+                # refused in a tight loop until it settles.
+                outcome = outcome or {}
+                wait = (1800.0 if outcome.get("halt")
+                        else 60.0 if outcome.get("superseded") else 0.0)
             except Exception as exc:  # noqa: BLE001 - the worker must not die
                 log.exception("shrink worker failed")
                 db.log("shrink_worker_error", "error", detail=str(exc))
@@ -219,7 +224,8 @@ class Service:
         return _window_wait(s.shrink.only_between_hours)
 
     @staticmethod
-    def _next_shrink_candidate() -> dict[str, Any] | None:
+    def _next_shrink_candidate(busy: list[str] | None = None
+                               ) -> dict[str, Any] | None:
         """The fattest file still waiting to be measured.
 
         Fattest first because the order decides which savings land this month
@@ -227,7 +233,16 @@ class Service:
         reference bitrate for its resolution the file sits; NULLs sort last
         under DESC in SQLite, so a row that has never been checked falls to
         the back rather than to the front.
+
+        ``busy`` is the files another job already has — a watch-folder
+        arrival, usually. `apply` would turn the worker away from one, but
+        the row would still be the fattest next time it looked, and the time
+        after: the worker would spin on the refusal for as long as the other
+        job ran.
         """
+        busy = busy or []
+        not_busy = (f" AND path NOT IN ({','.join('?' * len(busy))})"
+                    if busy else "")
         # `hygiene` as well as `unmeasured`, because `decide` deliberately
         # prefers a shrink over a hygiene flag — the re-encode rewrites every
         # byte and carries the tag fixes with it. Selecting on status alone
@@ -246,7 +261,8 @@ class Service:
             "   AND COALESCE(shrink_attempts, 0) = 0 "
             "   AND EXISTS (SELECT 1 FROM findings d WHERE d.path = files.path "
             "               AND d.code = 'not_measured' AND d.resolved IS NULL) "
-            " ORDER BY shrink_priority DESC, size DESC LIMIT 1")
+            + not_busy +
+            " ORDER BY shrink_priority DESC, size DESC LIMIT 1", tuple(busy))
         return {k: row[k] for k in row.keys()} if row else None
 
     def _shrink_one(self, record: dict[str, Any], decision) -> dict[str, Any] | None:

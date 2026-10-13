@@ -9,9 +9,11 @@ been shrunk once already. A shrink that goes ahead is the easy case.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
 import subprocess
 from pathlib import Path
@@ -975,3 +977,184 @@ def test_a_failed_search_cannot_loop_on_the_same_file(video_factory, settings,
           "VALUES (?,?,?,?,?)", (str(path), "efficiency", "not_measured", "info", 1.0))
     assert Service._next_shrink_candidate() is None, \
         "the worker would pick it straight back up and fail identically"
+
+
+# -- one job per file -----------------------------------------------------
+#
+# Live, 2026-08-26 to 10-12: at least 48 files that arrived through a watch
+# folder covering the library were shrunk twice within minutes. The arrival check
+# and the continuous worker each took the file, both queued on the one
+# transcode slot holding the row and the probe they had read beforehand, and
+# neither looked again once it got there. Red Dwarf S03E01: the second
+# search started 46 seconds before the first job swapped its output in (its
+# CRF ladder is identical to the first's to four decimals — it sampled the
+# original), and its encode two minutes later read the *first job's output*.
+# A second generation of loss, verified as VMAF 93.5 against that output
+# rather than against the original, and a saving counted against the
+# original's size a second time: 1.16 + 1.26 GB "saved" from a 1.75 GB file.
+
+def candidate(path: Path, **extra) -> dict:
+    """A row the continuous worker would pick up."""
+    row = insert(path, status="unmeasured", **extra)
+    db.ex("INSERT INTO findings (path, category, code, severity, created) "
+          "VALUES (?,?,?,?,?)",
+          (str(path), "efficiency", "not_measured", "info", 1.0))
+    return row
+
+
+def shrink_state(path: Path) -> dict:
+    row = db.q1("SELECT shrunk, shrink_skipped, shrink_attempts FROM files "
+                "WHERE path=?", (str(path),))
+    return {k: row[k] for k in row.keys()}
+
+
+@needs_ffmpeg
+def test_a_file_being_shrunk_is_not_taken_by_a_second_job(video_factory,
+                                                          settings,
+                                                          monkeypatch):
+    """The live shape: one job encoding, a second arriving for the same file.
+    The second must be turned away at once — not queued on the slot to start
+    from a probe of a file that is about to be replaced under it — and the
+    worker's next look must not offer the file either, or it would spin on
+    the refusal."""
+    from unfuckarr.service import Service
+
+    path = video_factory("busy.mkv", seconds=4)
+    row = candidate(path)
+    ran = arm(monkeypatch, settings)
+    armed_run = transcode.run
+    encoding, finish = threading.Event(), threading.Event()
+
+    def slow_run(cmd, *a, **k):
+        encoding.set()
+        finish.wait(10)
+        return armed_run(cmd, *a, **k)
+    monkeypatch.setattr(transcode, "run", slow_run)
+    settings.transcode.max_concurrent = 1
+    result, info = check_file(str(path), settings)
+    rem = Remediator(lambda: settings)
+    outcomes: dict[str, dict] = {}
+
+    def job(name: str) -> threading.Thread:
+        t = threading.Thread(target=lambda: outcomes.__setitem__(
+            name, rem.apply(dict(row), result, info, Decision("shrink", name))))
+        t.start()
+        return t
+
+    worker = job("worker")
+    try:
+        assert encoding.wait(10)
+        arrival = job("arrival")
+        arrival.join(5)
+        assert not arrival.is_alive(), \
+            "the second job queued behind the first instead of standing down"
+        assert outcomes["arrival"]["action"] == "none"
+        assert outcomes["arrival"].get("busy")
+        assert Service._next_shrink_candidate(rem.busy_paths()) is None, \
+            "the worker would pick the file being shrunk straight back up"
+    finally:
+        finish.set()
+        worker.join(10)
+
+    assert outcomes["worker"]["action"] == "shrink"
+    assert len(ran) == 1, "the same file was encoded twice"
+    assert db.totals()["files_shrunk"] == 1
+    assert db.totals()["bytes_saved"] == outcomes["worker"]["saved"]
+    assert rem.busy_paths() == [], "the claim outlived the job"
+
+
+@needs_ffmpeg
+def test_a_job_that_waited_does_not_shrink_what_another_just_shrank(
+        video_factory, settings, monkeypatch):
+    """The claim only covers jobs that overlap. A caller can still read the
+    row and probe the file, lose the race to a job that runs start to finish,
+    and only then reach `apply` holding a row that says "never shrunk" and a
+    size that is no longer the file's. Nothing before the encode may be
+    trusted from before the slot."""
+    path = video_factory("stale.mkv", seconds=4)
+    row = insert(path)
+    ran = arm(monkeypatch, settings)
+    result, info = check_file(str(path), settings)
+    rem = Remediator(lambda: settings)
+
+    first = rem.apply(dict(row), result, info, Decision("shrink", "worker"))
+    assert first["action"] == "shrink"
+    second = rem.apply(dict(row), result, info, Decision("shrink", "arrival"))
+
+    assert second["action"] != "shrink"
+    assert len(ran) == 1, "an encode was re-encoded — a second generation of loss"
+    assert db.totals()["files_shrunk"] == 1
+    assert db.totals()["bytes_saved"] == first["saved"], \
+        "the saving was counted again against the original's stale size"
+    assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 1
+    state = shrink_state(path)
+    assert state["shrunk"] is not None
+    assert not state["shrink_attempts"], "standing down is not a failed attempt"
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("change", ["replaced", "rewritten in place"])
+def test_a_file_that_changed_during_the_search_is_not_encoded(
+        video_factory, settings, monkeypatch, change):
+    """What the live race looked like from inside the second job: its search
+    sampled the original, and by the time the search finished the file had
+    been replaced. The CRF it found belongs to a file that is gone. Checked
+    on size and on mtime, because an in-place rewrite need not change the
+    size."""
+    path = video_factory("moved.mkv", seconds=4)
+    row = insert(path)
+    ran = arm(monkeypatch, settings)
+    result, info = check_file(str(path), settings)
+
+    def search_then_change(*a, **k):
+        if change == "replaced":
+            path.write_bytes(path.read_bytes()[: path.stat().st_size // 3])
+        else:
+            later = path.stat().st_mtime + 60
+            os.utime(path, (later, later))
+        return good_plan()
+    monkeypatch.setattr(quality, "search", search_then_change)
+
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("shrink", "unmeasured"))
+
+    assert not ran, "encoded a file other than the one that was measured"
+    assert out["ok"] and out["action"] != "shrink"
+    assert out.get("superseded")
+    assert shrink_state(path) == {"shrunk": None, "shrink_skipped": None,
+                                  "shrink_attempts": 0}, \
+        "nothing was decided about the file on disk, so nothing is recorded"
+    assert "bytes_saved" not in db.totals()
+
+
+@needs_ffmpeg
+def test_a_file_that_changed_during_the_encode_is_not_replaced(
+        video_factory, settings, monkeypatch):
+    """An *arr importing an upgrade over a file mid-encode: the encode read
+    the old file, and swapping it in would recycle the upgrade and put a
+    re-encode of what it replaced in its place."""
+    path = video_factory("upgraded.mkv", seconds=4)
+    row = insert(path)
+    ran = arm(monkeypatch, settings)
+    armed_run = transcode.run
+    upgrade = b"an upgrade the arr just imported" * 4096
+
+    def encode_then_upgrade(cmd, *a, **k):
+        done = armed_run(cmd, *a, **k)
+        path.write_bytes(upgrade)
+        return done
+    monkeypatch.setattr(transcode, "run", encode_then_upgrade)
+    result, info = check_file(str(path), settings)
+
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("shrink", "unmeasured"))
+
+    assert len(ran) == 1
+    assert out["action"] != "shrink"
+    assert path.read_bytes() == upgrade, "the upgrade was replaced"
+    assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 0
+    assert not Path(transcode.output_path(str(path), "mkv")).exists(), \
+        "the discarded output was left behind"
+    assert shrink_state(path) == {"shrunk": None, "shrink_skipped": None,
+                                  "shrink_attempts": 0}
+    assert "bytes_saved" not in db.totals()

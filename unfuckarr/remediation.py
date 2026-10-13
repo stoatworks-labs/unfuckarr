@@ -334,7 +334,17 @@ class Remediator:
         self._transcode_sema: threading.Semaphore | None = None
         self._sema_size = 0
         self._cancel: dict[str, threading.Event] = {}
+        # Paths with a job under way, from `apply` to its return. Not
+        # `_cancel`: that is registered only once a job reaches the slot and
+        # dropped the moment the encode ends — before verification and the
+        # swap, which is exactly the window a second job got through live.
+        self._busy: set[str] = set()
         self._lock = threading.Lock()
+
+    def busy_paths(self) -> list[str]:
+        """Files a job is working on now — never a candidate for another."""
+        with self._lock:
+            return list(self._busy)
 
     def _semaphore(self, size: int) -> threading.Semaphore:
         with self._lock:
@@ -393,6 +403,15 @@ class Remediator:
         passes one per repair so a scan stop can reach the job in flight.
         Without it the job makes its own, which the UI's per-file cancel
         reaches through `cancel(path)` either way.
+
+        One job per file. The scan, the watch folder, the continuous shrink
+        worker and the UI all arrive here, each holding a row and a probe it
+        read beforehand; a second job for a file that already has one stands
+        down at once rather than queueing on the slot to act on a file the
+        first is about to replace. Live, the arrival check and the worker
+        both shrank at least 48 files that way between 2026-08-26 and 10-12 —
+        the second encoding the first one's output (invariant 11) and
+        counting the saving again.
         """
         path = file_row["path"]
         if transcode.is_temp_output(path):
@@ -402,6 +421,26 @@ class Remediator:
             db.log("own_temp_skipped", "info", path, decision.reason)
             return {"action": "none", "ok": True,
                     "message": "unfuckarr's own temporary output — not touched"}
+        if decision.action in ("none", "flag"):
+            return self._apply(file_row, result, info, decision, cancel)
+        with self._lock:
+            busy = path in self._busy
+            self._busy.add(path)
+        if busy:
+            db.log("already_in_flight", "info", path,
+                   {"action": decision.action, "reason": decision.reason})
+            return {"action": "none", "ok": True, "busy": True,
+                    "message": "another job is already working on this file"}
+        try:
+            return self._apply(file_row, result, info, decision, cancel)
+        finally:
+            with self._lock:
+                self._busy.discard(path)
+
+    def _apply(self, file_row: dict[str, Any], result: CheckResult,
+               info: MediaInfo | None, decision: Decision,
+               cancel: threading.Event | None) -> dict[str, Any]:
+        path = file_row["path"]
         job_id = db.ex(
             "INSERT INTO jobs (kind, path, state, message, created) VALUES (?,?,?,?,?)",
             (decision.action, path, "queued", decision.reason, time.time()),
@@ -848,6 +887,11 @@ class Remediator:
         with self._slot(sema, cancel) as got:
             if not got:
                 return self._cancelled(job_id, path, "flag")
+            # The row and the probe were read before the wait for the slot,
+            # which can be the length of another file's encode.
+            gone = self._superseded(job_id, path, info, decision)
+            if gone is not None:
+                return gone
             self._set_job(job_id, "running", 0.0,
                           f"measuring how far {metric.name.upper()} allows")
             set_task(f"remediate:{path}", kind="analysing", path=path,
@@ -930,6 +974,15 @@ class Remediator:
                 db.log("shrink_skipped", "warn", path, msg)
                 return {"action": "flag", "ok": False, "message": msg}
 
+            # And again after the search, which takes minutes: the CRF it
+            # found belongs to the file it sampled. This is the check the live
+            # race needed — the second job's search sampled the original, the
+            # first swapped its output in meanwhile, and the encode that
+            # followed read that output.
+            gone = self._superseded(job_id, path, info, decision)
+            if gone is not None:
+                return gone
+
             cmd = transcode.build_command(path, dst, info, plan, s.transcode,
                                           ffmpeg=s.ffmpeg_path)
             self._set_job(job_id, "running", 0.0, plan.describe)
@@ -952,6 +1005,15 @@ class Remediator:
                 governor=gov,
             )
             self._cancel.pop(path, None)
+
+        # Whatever the encode made of it, if the file it read is not the file
+        # on disk now — an *arr imported over it, hours into the encode — the
+        # result says nothing about either, and every verdict below would be
+        # recorded against the wrong file.
+        if not cancel.is_set():
+            gone = self._superseded(job_id, path, info, decision, dst)
+            if gone is not None:
+                return gone
 
         if not ok:
             Path(dst).unlink(missing_ok=True)
@@ -1026,7 +1088,11 @@ class Remediator:
                     "worst": round(worst, 2), "reason": reason})
             return self._skip_shrink(job_id, path, reason)
 
-        # Only now is the original allowed to go.
+        # Only now is the original allowed to go — if it is still the
+        # original. The last look before the one step that cannot be undone.
+        gone = self._superseded(job_id, path, info, decision, dst)
+        if gone is not None:
+            return gone
         try:
             recycled = recycle.store(
                 path, f"replaced by shrink ({plan.describe}, "
@@ -1084,6 +1150,49 @@ class Remediator:
         db.ex("UPDATE files SET shrink_skipped=? WHERE path=?", (reason, path))
         self._set_job(job_id, "done", 1.0, reason)
         return {"action": "flag", "ok": True, "message": reason}
+
+    def _superseded(self, job_id: int, path: str, info: MediaInfo,
+                    decision: Decision,
+                    dst: str | None = None) -> dict[str, Any] | None:
+        """Stand down when the file is no longer the one this job measured.
+
+        A shrink reads its row and its probe before it waits for the slot,
+        and takes its CRF from a search minutes long. Anything that touches
+        the file meanwhile — another job's swap, an *arr upgrade — leaves it
+        holding numbers about a file that is gone. Nothing is recorded,
+        because nothing has been learned about the file that is there: no
+        attempt, no verdict, and the next look starts from a fresh probe.
+        Returns None when the file is still the one measured.
+        """
+        row = db.q1("SELECT shrunk, shrink_skipped FROM files WHERE path=?",
+                    (path,))
+        reason = None
+        if row is not None and row["shrunk"]:
+            reason = "another job has shrunk it since"
+        elif row is not None and row["shrink_skipped"] and not decision.force:
+            reason = f"another job has assessed it since: {row['shrink_skipped']}"
+        else:
+            try:
+                st = os.stat(path)
+            except OSError as exc:
+                reason = f"it is no longer there: {exc.strerror or exc}"
+            else:
+                if info.size and st.st_size != info.size:
+                    reason = (f"it is {st.st_size:,} bytes now, against the "
+                              f"{info.size:,} that were measured")
+                elif info.mtime and st.st_mtime != info.mtime:
+                    reason = "it has been rewritten since it was measured"
+        if reason is None:
+            return None
+        if dst:
+            Path(dst).unlink(missing_ok=True)
+        self._cancel.pop(path, None)
+        msg = f"the file changed after it was measured — {reason}; left alone"
+        self._set_job(job_id, "done", 1.0, msg)
+        db.log("shrink_superseded", "info", path,
+               {"reason": reason, "measured_size": info.size})
+        return {"action": "flag", "ok": True, "superseded": True,
+                "message": msg}
 
     def _count_shrink_attempt(self, path: str, file_row: dict[str, Any]) -> int:
         attempts = (file_row.get("shrink_attempts") or 0) + 1

@@ -1246,4 +1246,107 @@ through the watch folder were **shrunk twice within minutes**: the arrival path 
 worker both searched the same original, the first swapped its output in, and the second then
 encoded *that* output (generation loss — invariant 11) and counted a saving against the
 original's stale size. Red Dwarf S03E01: 1.75 GB file, `saved` 1.16 GB then 1.26 GB. Not fixed
-here, and the conversion correction alone does not make `bytes_saved` right.
+here, and the conversion correction alone does not make `bytes_saved` right. (Fixed and measured
+in the next entry: it is 48 files back to 08-26, not 25.)
+
+## 2026-10-13: two jobs shrank the same file, and the counter counted both
+
+**What happened** (read-only: live DB as uid 99 `mode=ro`, the three backups `immutable=1` from a
+throwaway container, `config.json`). Live runs `shrink.continuous` on, `max_concurrent` 1, and
+watch folders on `/media/tv` and `/media/movies`, so the scanner skips shrinks entirely and only
+two callers ever start one: the arrival check (`_check_arrival` → `apply`) and the continuous
+worker (`_shrink_one` → `apply`). Both read the row and probe the file *before* `_shrink` waits
+for the one slot, and nothing looked again afterwards. Nothing claimed a path either: `_cancel`
+is keyed by path but registered only at the slot and popped as soon as the encode ends, before
+verification and the swap, which is exactly the window the second job came through.
+
+Red Dwarf S03E01, BST: `arrival_checked → shrink` 23:38; first search 23:48:11; first encode
+23:50:59. The encode ends and frees the slot; the second job takes it at **23:53:02** and searches
+with `size` 1,748,079,760, the original's; the first job verifies and swaps at **23:53:48**. The
+second search's CRF ladder is identical to the first's to four decimals (92.0746 / 91.5604 /
+89.9326 / 87.5444), so it cut its windows out of the original. Its encode at 23:55:42 read the
+path, which by then held the first output. VMAF **93.5** is gen 2 against gen 1, not against the
+original. `saved` was then reckoned from the stale size, and `shrunk_from` got the original's
+size from both jobs.
+
+**Scale: 48 files, not 25.** Merging the activity from all four databases: 48 paths with two
+`shrink_done` 4–38 minutes apart. The first was **2026-08-26** (Jeeves and Wooster S01E01); 25
+are since 10-07 and 23 sit in the 09-14 and 09-22 backups. Every one has exactly one
+`arrival_checked` and two `shrink_search_started` at the same (original) size. None before
+08-24, which is when the counters arrived (seeded honestly from `shrunk_from − size`).
+
+- Red Dwarf 10 (S01E04, S02E01, S02E02, S03E01–03, S04E03, S04E05, S05E02, S05E03)
+- Have I Got a Bit More News for You 10 (S57E02/03/05/07, S60E10, S65E01/02/07/08/09)
+- Jeeves and Wooster 9 (S01E01, S01E02, S02E02, S02E03, S03E03, S03E04, S03E06, S04E04, S04E05)
+- It's Always Sunny S18E04, S18E05; Taskmaster S22E02, S22E06
+- 1 each: Fantastic Beasts: The Crimes of Grindelwald, Argo, Bad Boys (1995), Bad Boys: Ride or
+  Die, Silo S03E09, Paul Merton in India S01E03, Stuart Fails to Save the Universe S01E07,
+  Dispatches S2026E07, Cornwall: This Fishing Life S02E03, Deadliest Catch S21E06, Teachers
+  S01E01, Scrubs (2026) S02E03, Have I Got News for You S72E02, Mad Men S07E04, Last Week
+  Tonight S13E26
+
+46 of these files are still the gen-2 encode on disk. Jeeves S03E03 and Scrubs S02E03 have been
+replaced since. **The originals are gone**: the bin holds one file from today. Each file passed
+VMAF 92 against the original *once*. The second generation was never measured against it, so
+these files are probably under the target. Re-grabbing them through the *arr is the only way back.
+
+**Fixed:**
+
+- `Remediator.apply` allows **one job per file** (`_busy`, `busy_paths()`). A second caller for a
+  path that already has a job logs `already_in_flight` and returns `busy` at once, rather than
+  queueing on the slot. This applies to every acting decision, not just shrink: two transcodes or
+  a transcode and a conversion on one file race the same way.
+- `Service._next_shrink_candidate(busy)` skips claimed paths. Without that, the worker would pick
+  the arrival's file every time it looked and spin on the refusal.
+- `MediaInfo.mtime` is recorded by `probe` (stat'd *before* ffprobe runs). `_shrink` calls
+  `_superseded` at four points: when it gets the slot, after the search (the check the live race
+  needed), after the encode (before any verdict is recorded), and before the recycle/swap. It
+  re-reads `shrunk`/`shrink_skipped` and compares the file's size and mtime with the probe. If
+  anything moved, it deletes any output, logs `shrink_superseded`, and returns `superseded`: no
+  attempt, no verdict, no counter. The worker waits 60 s after a superseded outcome so that a
+  file still being written is not re-probed in a tight loop.
+- **Verified the size half cannot misfire:** `probe().size == os.stat().st_size` on 15 live files
+  across mkv, mp4, avi, ts and mpg (read-only, the container's own `probe`). Disc images already
+  take `os.path.getsize`.
+- 5 new tests in `test_shrink.py`, "one job per file", all run against the old source first.
+  They failed there with the live shapes: the second job queued behind the first; a job that
+  waited re-shrank the file (`'shrink' != 'shrink'`, two encodes); an encode ran after the file
+  changed during the search, both for a replacement and for an mtime-only rewrite; and an *arr
+  upgrade was recycled and replaced after the file changed during the encode. Full suite: 423 pass.
+
+**The over-count is the *first* `saved` of each pair, not the second.** The second job measured
+against the original's stale size, so its `saved` alone is already the whole original → gen 2
+reduction. It equals `shrunk_from − size` on the row **exactly** for 46 of 48 (the other two
+files have been replaced since). The counter got `s1 + s2`, the disk changed by `s2`, so `s1` is
+spurious. Subtracting `s2` instead would leave the counter `s2 − s1` short on every file (gen 2 is
+smaller than gen 1).
+
+| window | pairs | over-count (Σ first `saved`) |
+|---|---|---|
+| 10-07 → 10-12 (live log) | 25 | 32,245,577,801 |
+| 08-26 → 09-22 (backups) | 23 | 95,977,704,858 |
+| **logged total** | **48** | **128,223,282,659 (128.2 GB)** |
+
+(Σ second `saved` would be 139,090,486,980.) `files_shrunk` is over by the same 48.
+
+**Unlogged gaps.** The activity log keeps ~5,000 rows. 09-14 17:34 → 09-21 19:07 and 09-22 20:24 →
+10-07 20:10 exist in no database, the bin has been emptied, and `jobs` is pruned. Estimated by
+reconciling the counters against the rows shrunk in each window. Validated on 10-07 → 10-12,
+where it gives 26 files / 32.65 GB against the known 25 / 32.25 GB, and on 09-21/22 (1 against 1):
+
+- **Gap 1: ~4 files, ~5.4 GB.** No conversions in that window, so this is reasonably firm.
+- **Gap 2: ~51–68 files, bytes not measurable.** 68 is the `files_shrunk` excess, an upper bound
+  inflated by rows later replaced. 51–54 comes from the recorded VMAF: a double's score is gen 2
+  against gen 1 and reads high, 73% ≥ 93.5 against 10% of singles. The bytes residual mixes in
+  15 conversions, and two of the six counted by 09-14 ran between the counters landing
+  (08-24 01:53) and the log starting (06:19), so their figures are unknown. The
+  double count comes out somewhere around **100–240 GB** depending on those two. Pinning it
+  needs the per-disc conversion figures from the audit above.
+
+**Not deployed, and nothing written to the live DB.** Corrections waiting on Allan, best applied
+together with the conversion one in the entry above:
+
+- `bytes_saved` **+680,813,383,056** (conversions) **− 128,223,282,659** (logged doubles) =
+  **+552,590,100,397**; `files_shrunk` **− 48**.
+- Optionally the gap estimates: about −5.4 GB / −4 for gap 1, and an unknown −100 to −240 GB /
+  −51 to −68 for gap 2.

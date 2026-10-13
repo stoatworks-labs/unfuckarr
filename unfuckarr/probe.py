@@ -86,6 +86,11 @@ class MediaInfo:
     format_name: str = ""
     duration: float = 0.0
     size: int = 0
+    # When the file had this mtime, it had these streams. 0 when unknown. A
+    # job that waits — on the transcode slot, or behind minutes of quality
+    # search — compares it, and `size`, against the file before it acts, so
+    # that it never acts on a file that changed under it.
+    mtime: float = 0.0
     bitrate: int = 0
     streams: list[Stream] = field(default_factory=list)
     faststart: bool | None = None  # None when the question does not apply
@@ -228,6 +233,12 @@ def probe(path: str | Path, ffprobe: str = "ffprobe", timeout: int = 120,
           ffmpeg: str = "ffmpeg") -> MediaInfo:
     """Read container and stream metadata. Raises ProbeError if unreadable."""
     path = str(path)
+    # Before ffprobe runs, not after: a file that changes while it is being
+    # read then carries an mtime older than the file, and reads as changed.
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        mtime = 0.0
     url, disc_kind = path, ""
     found_disc = None
     if disc_mod.is_disc_image(path):
@@ -285,6 +296,7 @@ def probe(path: str | Path, ffprobe: str = "ffprobe", timeout: int = 120,
         container=disc_kind or _container_from(path, format_name),
         duration=_to_float(fmt.get("duration")),
         size=size,
+        mtime=mtime,
         bitrate=_to_int(fmt.get("bit_rate")),
         streams=streams,
         raw=data,

@@ -104,6 +104,16 @@ Break any of these and the failure is quiet and expensive.
     settings may have changed; it never reopens a *shrunk* one, because generation loss does not
     become untrue.
 
+    The markers are only as good as the row the job reads, and every caller reads it *before*
+    waiting for the slot. So `Remediator.apply` allows **one job per file** (`busy_paths`; a
+    second caller stands down at once, and the continuous worker's candidate query skips a busy
+    file rather than spin on the refusal), and `_shrink` re-reads the row and re-stats the file
+    against the probe's `size`/`mtime` (`_superseded`) when it gets the slot, after the search,
+    after the encode and before the swap — standing down, counting nothing, if either moved.
+    Without both, the watch-folder arrival and the worker shrank the same file within minutes at
+    least 48 times (2026-08-26 to 10-12): the second job's search sampled the original, the first
+    swapped its output in, and the second encoded *that* and counted the saving a second time.
+
 12. **The measurement is the gate — nothing decides in advance which files are "too big".**
     An earlier version of `checks/efficiency.py` selected candidates by video bitrate against a
     target for their resolution. That is a guess about how an encoder will behave on content it
@@ -747,7 +757,11 @@ which is the safe direction but does nothing useful.
   measures below target being discarded, one bad sample failing a passing mean, an unverifiable
   output being discarded, HDR left alone, a missing metric not writing the file off, the shrink
   window wrapping past midnight, shrinks staying out of the abort ratio, their own cap, repairs
-  ordered ahead of them, and the six new columns migrating onto a 1.0.0-shaped database.
+  ordered ahead of them, and the six new columns migrating onto a 1.0.0-shaped database. And
+  one job per file: a second job for a file being shrunk standing down (and the worker not
+  offered it), a job that waited not re-shrinking what another just shrank, and a file that
+  changed during the search or the encode being neither encoded nor replaced, with nothing
+  counted — each run against the old source first and failing there.
 - That VMAF actually discriminates: a near-lossless re-encode scores above 90 and CRF 51 below
   80, measured against media ffmpeg rendered.
 - **Disc images**, against ISO9660 volumes the tests assemble byte by byte (so no fixture and no
