@@ -12,7 +12,8 @@
 # `makemkvcon` sees exactly the paths unfuckarr sees, because it is the same
 # container.
 #
-#   docker build -f docker/makemkv/Dockerfile -t unfuckarr-makemkv:edge .
+#   docker build -f docker/makemkv/Dockerfile \
+#       --build-arg MAKEMKV_EULA=accepted -t unfuckarr-makemkv:edge .
 #
 # Then, in the settings page:
 #
@@ -23,63 +24,101 @@
 # See docker/makemkv/README.md for the rebuild and the beta key.
 
 ARG BASE_IMAGE=ghcr.io/stoatworks-labs/unfuckarr:edge
-FROM ${BASE_IMAGE}
+# Must be the distribution BASE_IMAGE is built on: what is compiled here is
+# linked against its libavcodec, OpenSSL and expat, and runs there.
+ARG BUILD_IMAGE=ubuntu:24.04
 
-# MakeMKV comes from the long-running Launchpad PPA rather than being built
-# from makemkv.com's tarballs. Not a preference — building from source is the
-# obvious thing and was the first attempt — but www.makemkv.com answered
-# Cloudflare 525 for everyone in August 2026, so the tarballs could not be
-# fetched from anywhere.
+# MakeMKV is built from makemkv.com's own tarballs, pinned by version and
+# sha256. It used to come from the ~heyarje/makemkv-beta PPA, because
+# www.makemkv.com answered Cloudflare 525 to everyone in August 2026. That PPA
+# keeps one version per series: on 2026-09-27 it replaced 1.18.4 with 2.0.0,
+# and Launchpad purged the 1.18.4 files. MakeMKV 2.0.0 segfaults — a NULL read
+# inside makemkvcon, straight after "AACS directory not present" — on any
+# Blu-ray without an AACS folder, which is every decrypted image and so every
+# disc in a library like this one: 93 of the live box's 95 images, the other
+# two not UDF at all. Same on Windows, no fix and no reply from upstream
+# (forum.makemkv.com, "Version 2.0.0 won't open the disk structure";
+# github.com/flathub/com.makemkv.MakeMKV/issues/123). An image built on 2.0.0
+# converts nothing.
 #
-# ⚠️ As of 2026-10-13 this does not build, and must not be "fixed" by bumping
-# the pin. The PPA keeps one version per series and now carries only
-# 2.0.0-1~noble; Launchpad has already purged the 1.18.4 noble files. And
-# MakeMKV 2.0.0 segfaults on every Blu-ray image tried — a NULL read inside
-# makemkvcon, straight after "AACS directory not present" — on the live
-# library, in this image and in a bare ubuntu:24.04, while 1.18.4 reads the
-# same images (upstream: github.com/flathub/com.makemkv.MakeMKV/issues/123).
-# An image built on 2.0.0 converts nothing. Until a 2.0.x is verified with
-# `makemkvcon -r info iso:<a real Blu-ray image>` reaching TCOUNT, rebuild with
-# docker/makemkv/Dockerfile.overlay, which keeps the MakeMKV of a known-good
-# local image and replaces only the application.
-#
-# It is added as a signed apt source, with the PPA's own key, rather than
-# fetching .deb files over HTTPS and hoping: apt then verifies what it
-# installs, resolves the dependencies against Ubuntu's own archive, and the
-# version stays pinnable. The fingerprint below is the one Launchpad publishes
-# for ~heyarje/makemkv-beta.
-#
-# Note what this changes about the licence position: the PPA is a third party
-# redistributing MakeMKV's proprietary half. Using it is a decision for whoever
-# builds this image. It does not make the result any more shareable — see the
-# bottom of this file.
-ARG MAKEMKV_VERSION=1.18.4-1~noble
-ARG MAKEMKV_PPA_FINGERPRINT=94B56C64CA7278ECFC34E8808540356019F7E55B
-ARG UBUNTU_SERIES=noble
+# makemkv.com keeps every superseded release under /download/old/ and
+# publishes a PGP-signed list of checksums per release
+# (makemkv-sha-<version>.txt, signed by 2ECF 2330 5F1F C0B3 2001 6733 94E3
+# 083A 1804 2697, "MakeMKV (signature)"). The hashes below are from 1.18.4's,
+# its signature checked on 2026-10-14. Moving to another version: check that
+# file's signature, take its two hashes, and before deploying make sure the new
+# makemkvcon reaches TCOUNT on `info iso:<a real Blu-ray image>`.
+FROM ${BUILD_IMAGE} AS makemkv
+ARG MAKEMKV_VERSION=1.18.4
+ARG MAKEMKV_OSS_SHA256=8590063648d42ec2a958b74573d7022f0f4c334e4e4fe7dd53b70c6e748ba453
+ARG MAKEMKV_BIN_SHA256=cee56de0baa5531abed16bd862742d308d772b4ab4dae16ee865bf74f04a1608
+# makemkv-bin's installer stops until someone types "yes" to GuinpinSoft's
+# EULA (src/eula_en_linux.txt in the bin tarball). A build has no one to type
+# it, so whoever builds the image says so here — the build does not say it for
+# them.
+ARG MAKEMKV_EULA=
+
+RUN set -eux; \
+    if [ "${MAKEMKV_EULA}" != "accepted" ]; then \
+      echo "makemkv-bin is licensed under GuinpinSoft's EULA (src/eula_en_linux.txt in makemkv-bin-${MAKEMKV_VERSION}.tar.gz)." >&2; \
+      echo "Read it, and build with --build-arg MAKEMKV_EULA=accepted if you accept it." >&2; \
+      exit 1; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl build-essential pkg-config \
+        libssl-dev libexpat1-dev zlib1g-dev libavcodec-dev libavutil-dev; \
+    cd /tmp; \
+    # The current release lives in /download/, superseded ones in /old/; the
+    # checksum, not the folder, says it is the right file.
+    for part in oss bin; do \
+      f="makemkv-${part}-${MAKEMKV_VERSION}.tar.gz"; \
+      curl -fsSLO "https://www.makemkv.com/download/old/${f}" \
+        || curl -fsSLO "https://www.makemkv.com/download/${f}"; \
+    done; \
+    printf '%s  %s\n' \
+      "${MAKEMKV_OSS_SHA256}" "makemkv-oss-${MAKEMKV_VERSION}.tar.gz" \
+      "${MAKEMKV_BIN_SHA256}" "makemkv-bin-${MAKEMKV_VERSION}.tar.gz" \
+      | sha256sum -c -; \
+    tar xzf "makemkv-oss-${MAKEMKV_VERSION}.tar.gz"; \
+    tar xzf "makemkv-bin-${MAKEMKV_VERSION}.tar.gz"; \
+    cd "makemkv-oss-${MAKEMKV_VERSION}"; \
+    ./configure --prefix=/usr --disable-gui; \
+    make -j"$(nproc)"; \
+    make install DESTDIR=/out; \
+    cd "../makemkv-bin-${MAKEMKV_VERSION}"; \
+    mkdir -p tmp; \
+    echo accepted > tmp/eula_accepted; \
+    make install DESTDIR=/out PREFIX=/usr
+
+FROM ${BASE_IMAGE}
+ARG MAKEMKV_VERSION=1.18.4
 
 USER root
 
-# `curl` is not one of MakeMKV's dependencies — it is the key wrapper's, and
-# the application image does not ship it. Without it the wrapper takes its
+# The runtime halves of what the build stage linked against, which the
+# application image does not otherwise carry. `curl` is not one of MakeMKV's
+# dependencies — it is the key wrapper's. Without it the wrapper takes its
 # "could not fetch a key" path on every single call, which is a working failure
 # mode and a useless one: there would never be a key to fall back to.
 # ca-certificates is already in the base image.
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends curl gnupg; \
-    mkdir -p /etc/apt/keyrings; \
-    curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${MAKEMKV_PPA_FINGERPRINT}" \
-      | gpg --dearmor -o /etc/apt/keyrings/makemkv-ppa.gpg; \
-    echo "deb [signed-by=/etc/apt/keyrings/makemkv-ppa.gpg] https://ppa.launchpadcontent.net/heyarje/makemkv-beta/ubuntu ${UBUNTU_SERIES} main" \
-      > /etc/apt/sources.list.d/makemkv-beta.list; \
-    apt-get update; \
     apt-get install -y --no-install-recommends \
-        "makemkv-bin=${MAKEMKV_VERSION}" "makemkv-oss=${MAKEMKV_VERSION}"; \
-    apt-get purge -y gnupg; \
-    apt-get autoremove -y; \
-    rm -rf /var/lib/apt/lists/*; \
-    # Fail the build rather than ship an image whose whole purpose is missing.
-    test -x /usr/bin/makemkvcon
+        curl libavcodec60 libavutil58 libexpat1 libssl3t64 zlib1g; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=makemkv /out/usr/ /usr/
+
+# Fail the build rather than ship an image whose whole purpose is missing — or
+# one whose makemkvcon cannot load, which would only show up at the first disc.
+RUN set -eux; \
+    ldconfig; \
+    test -x /usr/bin/makemkvcon; \
+    if ldd /usr/bin/makemkvcon /usr/lib/libmakemkv.so.1 /usr/lib/libdriveio.so.0 \
+           /usr/lib/libmmbd.so.0 /usr/bin/mmccextr | grep 'not found'; then \
+      exit 1; \
+    fi
 
 # `makemkvcon` on the PATH is a wrapper that makes sure a key is in place
 # before running the real one at /usr/bin/makemkvcon. Deliberately not an
@@ -88,9 +127,9 @@ RUN set -eux; \
 # that added its own would have to be undone by hand at every recreate. Doing
 # it here means the key is fetched by the right user, with HOME already set, at
 # the only moment it is needed.
-COPY docker/makemkv/makemkvcon-wrapper.sh /usr/local/bin/makemkvcon
-RUN chmod +x /usr/local/bin/makemkvcon
+COPY --chmod=755 docker/makemkv/makemkvcon-wrapper.sh /usr/local/bin/makemkvcon
 
 LABEL org.opencontainers.image.title="unfuckarr with MakeMKV" \
       org.opencontainers.image.description="Local build only — contains MakeMKV, which may not be redistributed." \
+      com.stoatworks.makemkv-version="${MAKEMKV_VERSION}" \
       com.stoatworks.redistributable="false"
