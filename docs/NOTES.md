@@ -1508,3 +1508,40 @@ together with the conversion one in the entry above:
   **+552,590,100,397**; `files_shrunk` **− 48**.
 - Optionally the gap estimates: about −5.4 GB / −4 for gap 1, and an unknown −100 to −240 GB /
   −51 to −68 for gap 2.
+
+## 2026-10-13 15:46: deployed — everything above, on the overlay
+
+`unfk` runs **`1ba9dad834dc`** = `docker/makemkv/Dockerfile.overlay` on
+`rollback-2026-10-12` (MakeMKV 1.18.4) with the app at **`451d8ef`** — so the crash guard, the
+key wrapper fix, `convert_refused`, the arrival saving fix, the overlap extras selection and
+one-job-per-file all went live together. Allan's call, asked first. Rollback tag
+**`unfuckarr-makemkv:rollback-2026-10-13`** = what was running (`1a04e237107b`, app `5a935be`);
+**keep `rollback-2026-10-12`**, it is the only local 1.18.4 the overlay can sit on. Backup at
+`/mnt/user/appdata/.unfk-backups/pre-makemkv-crash-2026-10-13/` (online `.backup()` as uid 99,
+`integrity_check ok`, 18,798 files, + `config.json`, inspect, and the keyless MakeMKV
+`settings.conf`). `/root/recreate-unfk.sh`'s recipe comment now gives the overlay build
+(backup `.bak-2026-10-13`). Nothing schema-side: no `db.py` change since `61b00de`.
+
+**Verified in the live container:** healthy, bound to the tailnet address, Sonarr/Radarr/Emby
+answering. `docker exec -u 99:100 unfk makemkvcon -r info disc:9999` — the new wrapper found the
+keyless file and fetched a key into `/config/.home/.MakeMKV/settings.conf` (`nobody:users`); the
+banner came back with no `MSG:5021`. Then, read-only, `makemkv.titles` + `select` on the real
+Jurassic World Rebirth image from inside `unfk`: 77 titles, title 0 / 8020 s / 20 chapters,
+**14 extras, 13.0 GB estimated** — the overlap selection, against the 24 / 31.6 GB the old one
+wrote in the throwaway run.
+
+**What the restart interrupted:** scan **55**, a *manual* scan started 01:16 BST (not by this
+session — its containers all used a scratch `/config`). It was 14.5 h into the repair backlog
+the 10-12 deploy released: **421 transcodes done**, 2 failed, 3 did not fix, alongside 107
+continuous-worker shrinks. Those stand; the restart only closed the row ("interrupted by a
+restart") and failed 4 in-flight jobs, which count no attempts. Remember the row's `total` and
+`checked` are written only at the end — the zeros it showed beforehand were not a hang. The
+18:01 scheduled scan picks the backlog up again.
+
+Startup also removed 71 `*.unfuckarr-*` artwork files (150 MB) Emby/Radarr had generated beside
+old temp outputs, and logged that it **could not** remove `The Hunger Games (2012) BR-DISK.unfuckarr.convert/`
+— an empty, root-owned work dir from the 08-24 conversion test, which uid 99 cannot delete. It
+holds nothing; removing it needs root.
+
+**Not done:** the `bytes_saved` / `files_shrunk` corrections in the two sections above are still
+waiting on Allan — this deploy wrote nothing to the live DB beyond what the app itself does.
