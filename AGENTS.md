@@ -952,9 +952,10 @@ container's own ffmpeg:
   changes each occurrence was one scan away from deleting a good Blu-ray.
 
 - **The tool now runs from unfuckarr's own image, and `rip` works.** MakeMKV
-  1.18.4 is installed from the `~heyarje/makemkv-beta` PPA as a signed apt
-  source — not from makemkv.com, whose download host has been answering
-  Cloudflare 525 to everyone. Built on the target and driven by this codebase:
+  1.18.4 was installed from the `~heyarje/makemkv-beta` PPA as a signed apt
+  source — not from makemkv.com, whose download host was answering
+  Cloudflare 525 to everyone — until the PPA dropped it; since 2026-10-14 it
+  is built from makemkv.com's tarballs. Built on the target and driven by this codebase:
   `titles` read 51 titles off a UHD disc, `select` picked the feature and six
   extras, and `rip` produced a 4.2 min extra in 5 seconds — **HEVC 3840x2160
   10-bit, AC3 5.1, 251.8s against the 251s MakeMKV promised (0.32% drift)**.
@@ -1007,7 +1008,11 @@ container's own ffmpeg:
   them in seconds. So **no CINFO/TINFO from 2.0 has ever been seen**, and the
   attribute ids `makemkv.py` reads are verified on 1.18.4 only. The PPA no
   longer has 1.18.4 for noble at all, which is why
-  `docker/makemkv/Dockerfile.overlay` exists. What *was* run the same day, on
+  `docker/makemkv/Dockerfile.overlay` exists, and why since 2026-10-14 the
+  image builds 1.18.4 from makemkv.com's tarballs, pinned to the hashes in
+  its signed checksum list. The crash is upstream's, on any Blu-ray without an
+  `AACS` folder — 93 of the live box's 95 images, the other two not UDF — and
+  is reported on Windows too. What *was* run the same day, on
   1.18.4 with this code, from a copy of the live box's keyless
   `settings.conf`: the full `check_file` → `decide` → `apply` on a 94.5 GB
   UHD image (Jurassic World Rebirth) — key fetched, 77 titles, 8020 s /

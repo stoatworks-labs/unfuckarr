@@ -4,33 +4,38 @@ Disc conversion needs a `makemkvcon`. unfuckarr does not ship one and cannot:
 MakeMKV's binary half is not redistributable, so an image containing it must
 not be pushed to a public registry. This directory builds that image locally.
 
-MakeMKV comes from the long-running `~heyarje/makemkv-beta` PPA rather than
-from makemkv.com's source tarballs. That was not the first choice — building
-from source was — but www.makemkv.com answered Cloudflare 525 for everyone in
-August 2026, so the tarballs could not be fetched from anywhere. It is added as
-a *signed* apt source using the PPA's own key, so apt verifies what it installs
-and resolves the dependencies against Ubuntu's own archive.
+MakeMKV 1.18.4 is built from makemkv.com's own tarballs, in a build stage, and
+pinned by version and sha256. The hashes come from the release's PGP-signed
+checksum list (`/download/old/makemkv-sha-1.18.4.txt`, signed by
+`2ECF 2330 5F1F C0B3 2001 6733 94E3 083A 1804 2697`, "MakeMKV (signature)"),
+whose signature was checked when they were pinned.
 
-> **As of 2026-10-13 the PPA has no MakeMKV this image can use.** It keeps one
-> version per series and now carries only `2.0.0-1~noble` (Launchpad has
-> already purged the 1.18.4 noble files), and **MakeMKV 2.0.0 segfaults on every
-> Blu-ray image** — a NULL read inside `makemkvcon` straight after
-> `AACS directory not present, assuming unencrypted disc`. Measured on real
-> images from the live library, in this image and in a bare `ubuntu:24.04`,
-> while 1.18.4 reads the same images; upstream has the same report
-> ([flathub/com.makemkv.MakeMKV#123](https://github.com/flathub/com.makemkv.MakeMKV/issues/123)).
-> So `Dockerfile` is left pinned to 1.18.4 and fails at `apt-get install`,
-> deliberately: bumping the pin produces an image that converts nothing. Until
-> a 2.0.x passes `makemkvcon -r info iso:<a real Blu-ray image>` — it must reach
-> `TCOUNT` — rebuild with [`Dockerfile.overlay`](Dockerfile.overlay) instead
-> (below).
+It used to come from the `~heyarje/makemkv-beta` PPA, because www.makemkv.com
+answered Cloudflare 525 for everyone in August 2026. That PPA keeps one version
+per series: on 2026-09-27 it replaced 1.18.4 with 2.0.0 and Launchpad purged
+the old files, so from then until 2026-10-14 this image could not be built at
+all and every deploy was an [overlay](#when-there-is-no-makemkv-to-build-the-overlay).
 
-Note what that changes about the licence position: the PPA is a third party
-redistributing MakeMKV's proprietary half. Using it is a decision for whoever
-builds the image, and it does not make the result any more shareable.
+> **Not 2.0.0.** MakeMKV 2.0.0 segfaults — a NULL read inside `makemkvcon`,
+> straight after `AACS directory not present, assuming unencrypted disc` — on
+> any Blu-ray without an `AACS` folder: decrypted images and BDMV folders.
+> Encrypted physical discs still work, which is no help here: 93 of the live
+> library's 95 images have no `AACS` folder and the other two are not UDF at
+> all. Measured on real images in this image and in a bare `ubuntu:24.04`;
+> reported on Windows as well
+> ([forum thread](https://forum.makemkv.com/forum/viewtopic.php?p=205783),
+> [flathub/com.makemkv.MakeMKV#123](https://github.com/flathub/com.makemkv.MakeMKV/issues/123)),
+> with no reply from upstream by 2026-10-14. Until a 2.0.x passes
+> `makemkvcon -r info iso:<a real Blu-ray image>` — it must reach `TCOUNT` —
+> stay on 1.18.4.
+
+makemkv-bin's installer stops until someone types "yes" to GuinpinSoft's EULA
+(`src/eula_en_linux.txt` in the bin tarball). A build has no one to type it, so
+the Dockerfile refuses to build unless whoever builds it says so:
 
 ```sh
-docker build -f docker/makemkv/Dockerfile -t unfuckarr-makemkv:edge .
+docker build -f docker/makemkv/Dockerfile \
+    --build-arg MAKEMKV_EULA=accepted -t unfuckarr-makemkv:edge .
 ```
 
 Then run your container from `unfuckarr-makemkv:edge` instead of
@@ -90,27 +95,37 @@ rather than with the disc — no image is ever written off for it.
 This image is pinned to a base image and a MakeMKV version:
 
 ```sh
+docker pull ghcr.io/stoatworks-labs/unfuckarr:edge
 docker build -f docker/makemkv/Dockerfile \
     --build-arg BASE_IMAGE=ghcr.io/stoatworks-labs/unfuckarr:edge \
-    --build-arg MAKEMKV_VERSION=1.18.4-1~noble \
+    --build-arg MAKEMKV_EULA=accepted \
     -t unfuckarr-makemkv:edge .
 ```
 
-`MAKEMKV_VERSION` is the PPA's version string, not MakeMKV's own — it carries
-the Ubuntu series suffix, and `UBUNTU_SERIES` has to match the base image
-(`noble` for 24.04).
+Pull first: the build uses whatever `:edge` is already on the machine, and an
+old one quietly ships old code.
+
+`BUILD_IMAGE` (default `ubuntu:24.04`) must be the distribution the base image
+is built on: MakeMKV's open half is compiled against its libavcodec, OpenSSL
+and expat, and the final stage installs the runtime packages by their noble
+names (`libavcodec60`, `libavutil58`, `libssl3t64`). The build fails if any
+MakeMKV binary or library has an unresolved dependency.
+
+To move to another MakeMKV, set `MAKEMKV_VERSION`, `MAKEMKV_OSS_SHA256` and
+`MAKEMKV_BIN_SHA256` from that release's signed checksum list, after checking
+its signature. A new MakeMKV is a reason to *try* a rebuild, not to deploy one:
+check it opens a real image first (see above).
 
 Rebuild when unfuckarr updates — the whole point of the derived image is that
-it tracks the published one rather than forking it. A new MakeMKV is a reason
-to *try* a rebuild, not to deploy one: check it opens a real image first (see
-above). A rebuild is not what fixes an expired key; the wrapper does that at
-runtime.
+it tracks the published one rather than forking it. A rebuild is not what
+fixes an expired key; the wrapper does that at runtime.
 
-### When the PPA has nothing usable: the overlay
+### When there is no MakeMKV to build: the overlay
 
-[`Dockerfile.overlay`](Dockerfile.overlay) keeps the MakeMKV of a local image
-known to work and replaces only the application — `unfuckarr/`, `web/` and the
-key wrapper:
+If makemkv.com cannot be reached, or a pinned tarball goes, the real build
+fails. [`Dockerfile.overlay`](Dockerfile.overlay) keeps the MakeMKV of a local
+image known to work and replaces only the application — `unfuckarr/`, `web/`
+and the key wrapper:
 
 ```sh
 docker build -f docker/makemkv/Dockerfile.overlay \
@@ -128,9 +143,12 @@ image with a working MakeMKV in it leaves nothing to overlay.
 
 Built on the target and run against real Blu-ray images from a live library:
 
-- **The build works.** apt verifies the PPA signature, `gnupg` is purged
-  afterwards, and the build fails rather than shipping an image whose whole
-  purpose is missing (`test -x /usr/bin/makemkvcon`).
+- **The build works.** Since 2026-10-14 from source: both tarballs pass their
+  pinned sha256, the build refuses without `MAKEMKV_EULA=accepted`, and it fails
+  rather than shipping an image whose whole purpose is missing
+  (`test -x /usr/bin/makemkvcon`, and no `not found` from `ldd` on any MakeMKV
+  binary or library). The result is 910 MB against the PPA image's 1.16 GB, as
+  it no longer pulls in Qt for a GUI nothing runs.
 - **unfuckarr's own code drives it.** `makemkv.available` reports
   `MakeMKV v1.18.4 linux(x64-release)`; `makemkv.titles` read 51 titles off a
   UHD disc and `makemkv.select` picked the 163.6 min feature with its 20
@@ -170,6 +188,20 @@ scratch), on 1.18.4, starting from a copy of the live box's keyless
 
 MakeMKV 2.0.0 did not get that far: it segfaults on `info iso:` for every
 Blu-ray image tried (see the top of this file).
+
+### The source build against the PPA's (2026-10-14)
+
+The tarball's `makemkvcon` is not byte-identical to the PPA's (the packaging
+strips it), so the source-built image was checked against the PPA-built one
+that was live, side by side, from throwaway containers with the library
+mounted read-only. Through unfuckarr's own `titles` and `select`, both gave the
+same answer on Mortal Kombat: Annihilation (one title, 5685 s, 17 chapters) and
+on Jurassic World Rebirth (30 titles over 120 s, feature title 0 at 8020 s / 20
+chapters, 13 extras, 13.1 GB). Both `rip`s of Rebirth's title 3 (173 s) came to
+339,061,527 bytes with **identical sha256 on all five streams**; the files
+differ only in container metadata. The wrapper fetched a key into a
+`settings.conf` with none, and the image's ffmpeg 8 is unaffected by the
+libavcodec60 installed beside it.
 
 ## What has not
 

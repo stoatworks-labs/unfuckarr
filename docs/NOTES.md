@@ -1629,3 +1629,57 @@ MakeMKV crash fix (`b2a5039`) merged, whose `Unavailable` paths record nothing a
 re-check.
 
 **Not deployed.**
+
+## 2026-10-14: MakeMKV 1.18.4 built from source — the real build works again
+
+Allan asked to adopt MakeMKV 2 and deploy. 2.0.0 was not adopted, and nothing has changed
+upstream since 10-13: the PPA still carries only `2.0.0-1~*` (published 09-25) and makemkv.com
+lists 2.0.0 as current. Its changelog says "almost no changes, just a version bump".
+
+**Why 2.0.0 crashes, now that more people have hit it.** The forum thread "Version 2.0.0 won't
+open the disk structure" (09-25 to 10-10, no reply from the developer) narrows it down. 2.0.0 dies
+straight after `AACS directory not present, assuming unencrypted disc` on any Blu-ray **without
+an `AACS` folder**: never-encrypted ISOs, BDMV folders, and images decrypted by
+AnyDVD HD or Xreveal. Encrypted physical discs work. Windows 11 does the same, so it is not a
+Linux packaging fault. Our library is all one kind of disc: unfuckarr's own `disc.Udf` read every
+one of the 95 `.iso` rows read-only inside `unfk`. **93 have no `AACS` folder, and the other 2
+raise `DiscError`** (not UDF). So 2.0.0 would convert nothing here. There is no workaround that
+fits the no-mount design: an ISO only gets an `AACS` folder by being mounted. 2.0.0 is not worth
+trying again until a 2.0.x changelog mentions it, and even then only after a real
+`info iso:` reaches `TCOUNT`.
+
+**What was done instead, Allan's choice:** `docker/makemkv/Dockerfile` builds 1.18.4 from
+makemkv.com's tarballs, so the real build works again and the image no longer depends on
+`rollback-2026-10-12` being the last copy of a working MakeMKV.
+
+- **Provenance:** `/download/old/makemkv-sha-1.18.4.txt` is a PGP clearsigned list. The
+  signature checked good against `2ECF23305F1FC0B32001673394E3083A18042697`, "MakeMKV (signature)
+  <support@makemkv.com>", fetched from keyserver.ubuntu.com by fingerprint. Its hashes for
+  `makemkv-oss-1.18.4.tar.gz` (`8590…a453`) and `makemkv-bin-1.18.4.tar.gz` (`cee5…1608`) are the
+  build args, and the tarballs downloaded on 10-14 match them.
+- **The EULA:** makemkv-bin's `make install` runs `ask_eula.sh` (a `less` and a `read`) unless
+  `tmp/eula_accepted` exists. The build refuses unless it is given `MAKEMKV_EULA=accepted`, and
+  that refusal was checked. Allan said to pass it for the lilnasx builds.
+- **Shape:** an `ubuntu:24.04` build stage runs `./configure --prefix=/usr --disable-gui`
+  against noble's `libavcodec-dev` (`libavcodec60`, the same one the PPA linked). The final
+  stage installs only the runtime libraries and `curl`, copies `/out/usr`, and fails on any
+  `not found` from `ldd`. Libraries land in `/usr/lib`, where the PPA used
+  `/usr/lib/x86_64-linux-gnu`. Without Qt the image is 910 MB, against 1.16 GB.
+- **Not byte-identical to the PPA:** the tarball's `bin/amd64/makemkvcon` has a different sha256
+  from the live `/usr/bin/makemkvcon` (`c6c1…` against `7214…`), presumably from the packaging's
+  strip. So it was compared by what it does, from throwaway containers with `/media` read-only,
+  scratch `HOME`, and a copy of the live `settings.conf`, at
+  `/mnt/user/appdata/.makemkv-src-test/`:
+  - `available`: `MakeMKV v1.18.4 linux(x64-release)` from both.
+  - `titles` → `select`: identical on both images. Mortal Kombat: Annihilation gave 1 title,
+    5685 s, 17 chapters. Jurassic World Rebirth gave 30 titles ≥ 120 s, feature title 0 at
+    8020 s / 20 chapters / 79.98 GB, and 13 extras at 13.1 GB.
+  - `rip` of Rebirth title 3 (173 s): 339,061,527 bytes from each image, and `ffmpeg -f
+    streamhash -hash sha256` is **identical on all five streams** (HEVC, audio, three PGS). The
+    files differ from byte 1,349 on, which is container metadata.
+  - Key wrapper: started from a `settings.conf` with its `app_Key` removed, the first
+    `info disc:9999` fetched a key, with no `MSG:5021`.
+  - `ffmpeg -version` is still 8.0.1, and `import unfuckarr.api` works.
+
+`Dockerfile.overlay` stays as the fallback for when makemkv.com cannot be reached. Keep
+`rollback-2026-10-12` for that too.
