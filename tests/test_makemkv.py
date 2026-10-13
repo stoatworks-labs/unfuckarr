@@ -404,6 +404,63 @@ def test_a_disc_becomes_a_film_with_its_extras_beside_it(
     assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 1
 
 
+def _convert_film_with_an_extra(fake_makemkv, video_factory, settings,
+                                tmp_path, padding: int, **row):
+    """Convert an image of ``padding`` bytes more than its feature, with one
+    extra, and return (image size, feature + extra on disk afterwards)."""
+    feature = video_factory("src-feature.mkv", seconds=6)
+    extra = video_factory("src-extra.mkv", seconds=3)
+    image = tmp_path / "Film (2011).iso"
+    image.write_bytes(feature.read_bytes() + b"\0" * padding)
+    image_size = image.stat().st_size
+
+    settings.policy.disc_action = "convert"
+    settings.makemkv.enabled = True
+    settings.makemkv.command = fake_makemkv({"titles": [
+        {"index": 0, "duration": "0:00:06", "file": str(feature),
+         "segments": "1,2"},
+        {"index": 1, "duration": "0:00:03", "file": str(extra),
+         "segments": "9"},
+    ]})
+    settings.makemkv.extras_min_seconds = 1
+    settings.makemkv.min_title_seconds = 1
+
+    stored = insert(image, **row)
+    result, info = check_file(str(image), settings)
+    out = Remediator(lambda: settings).apply(
+        stored, result, info, Decision("convert", "disc image"))
+    assert out["ok"], out
+    return image_size, feature.stat().st_size + extra.stat().st_size
+
+
+@needs_ffmpeg
+def test_the_saving_is_measured_off_the_image_not_its_row(
+        fake_makemkv, video_factory, settings, tmp_path):
+    """Live, 2026-10-08: a Blu-ray whose row had no size was counted as saving
+    minus the whole film, and the header's total fell by 58 GB. A watch-folder
+    arrival inserts exactly that row."""
+    pad = 4 * 1024 * 1024
+    image_size, replaced = _convert_film_with_an_extra(
+        fake_makemkv, video_factory, settings, tmp_path, pad, size=None)
+
+    assert db.totals()["bytes_saved"] == image_size - replaced > 0
+    assert db.totals()["discs_converted"] == 1
+
+
+@needs_ffmpeg
+def test_a_conversion_never_takes_the_saving_down(
+        fake_makemkv, video_factory, settings, tmp_path):
+    """Output larger than the image is a bad measurement or extras that repeat
+    one another — four live discs did the second. Logged, never subtracted."""
+    _convert_film_with_an_extra(
+        fake_makemkv, video_factory, settings, tmp_path, 0)
+
+    assert db.totals().get("bytes_saved", 0) == 0
+    assert db.totals()["discs_converted"] == 1
+    assert db.q1("SELECT COUNT(*) n FROM activity "
+                 "WHERE event='convert_output_larger'")["n"] == 1
+
+
 @needs_ffmpeg
 def test_a_copy_that_stops_early_leaves_the_image_alone(
         fake_makemkv, video_factory, settings, tmp_path):

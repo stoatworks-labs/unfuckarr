@@ -1167,3 +1167,57 @@ whatever the arrivals go on to do), which is old behaviour. Expect `arrival_chec
 "none"`; a `transcode_no_op` warning anywhere means `decide` and `plan` disagree again. The
 first scheduled scan under all of this is **18:01 on 10-13**, with ~4,000 released files — about
 1,900 of them audio-only adds, 667 of them AVI → HEVC VAAPI encodes. It will run for days.
+
+## 2026-10-13: every disc that arrived was counted as minus the whole film
+
+The header's `bytes_saved` went **down** by the size of a film each time a disc image arriving
+through the watch folder was converted. `Remediator._convert_inner` reckoned the saving as
+`file_row["size"] - (feature + extras)`, and the row a watch-folder arrival inserts has no size —
+`_check_arrival` builds `record` from the `INSERT OR IGNORE` before `persist_result` writes one.
+Fast & Furious (2009) logged `"saved": -58232878315` on 10-08: exactly minus its feature and three
+extras.
+
+**Fixed:** `_convert` measures the image with `os.stat` before anything moves it (row and
+`MediaInfo` only as fallbacks) and the saving uses that. A conversion also never debits the total
+now: a negative figure logs `convert_output_larger` (warn, with `image` and `replaced`) and counts
+nothing. `convert_done` carries `image` and `replaced` too, so the next audit does not need
+Radarr to reconstruct them.
+
+**Why "never negative" and not just "measure properly"** — four live discs genuinely came out
+*larger* than their image, with correct sizes on the row: The Hunger Games (+21.9 GB), Once Upon
+a Time in Hollywood (+12.8), Dragonslayer (+13.9), Ratatouille (+7.7). Their `extras/` folders
+repeat themselves: near-identical pairs (2,483,713,036 vs 2,483,378,542 bytes) and a long
+"play all" title beside its parts (Hunger Games' "Extra 01 (122 min)", 28 GB). `select` drops
+exact segment-map duplicates and other cuts of the feature, but not those. That is a selection
+fault to fix in `makemkv.select`, not a saving to subtract — and the warning is where it now shows.
+
+**Audit of the live counter** (read-only: live DB as uid 99 with `mode=ro`, the three backups
+`immutable=1` from a throwaway container, Radarr's history API). `discs_converted` = 22, all
+identified: 6 by 09-14, 16 between 09-22 and 10-12. (Mortal Kombat, the 08-23 kept-image test, is
+the one before the counter existed; it changed nothing either way.)
+
+- **Image sizes come from Radarr**, not from us: every `.iso` has a `downloadFolderImported` and a
+  `movieFileDeleted … MissingFromDisk` carrying its exact bytes. The recycle bin had already been
+  swept and the rows moved to the `.mkv`.
+- **Arrival vs scan** from timing: a conversion with no scan started between Radarr's import and
+  the conversion ran on a row the arrival created, so with no size. That is 14 of 22, and the
+  pre-09-14 backup's activity confirms 5 of them as `arrival_checked → convert` with the
+  `-replaced` figure.
+- 4 conversions have lost their `converted` marker (Fast & Furious, Fantastic Beasts, The Hunger
+  Games, Mad God); placed in time by their extras' mtimes. Radarr's history shows it picking up a
+  `*.unfuckarr.mkv` temp output as the movie file mid-remux — the likeliest way the row was dropped
+  and re-created.
+
+Counted so far for conversions: **−583.4 GB**. The fixed code would have counted **+97.4 GB**.
+One-off correction: **+680,813,383,056 bytes** — +646.1 GB for the 14 arrivals (each exactly the
+image's size wherever the image outweighed the output) and +34.7 GB for the two scan-driven
+negatives. Three figures (Hunger Games, Once Upon a Time, Dragonslayer) are reconstructed from
+`shrunk_from`/current size + extras on disk rather than read from a log, so they could be off by
+the few MB a no-op remux changes a file by. Not applied yet: waiting on Allan.
+
+⚠️ **The counter is wrong in the other direction too.** Since 10-07, 25 files that arrived
+through the watch folder were **shrunk twice within minutes**: the arrival path and a second
+worker both searched the same original, the first swapped its output in, and the second then
+encoded *that* output (generation loss — invariant 11) and counted a saving against the
+original's stale size. Red Dwarf S03E01: 1.75 GB file, `saved` 1.16 GB then 1.26 GB. Not fixed
+here, and the conversion correction alone does not make `bytes_saved` right.

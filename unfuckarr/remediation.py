@@ -1193,7 +1193,13 @@ class Remediator:
             db.log("makemkv_unavailable", "error", path, msg)
             return {"action": "flag", "ok": False, "message": msg}
 
-        size = file_row.get("size") or (info.size if info else 0)
+        # Measured off the disk, here, before anything moves the image: it is
+        # what the saving is counted against at the end. The row is a snapshot
+        # and can predate any size being recorded — a watch-folder arrival
+        # inserts one with none — and a saving reckoned from that is minus the
+        # whole film. Live, 14 of the first 22 conversions were arrivals, and
+        # between them they took 594 GB off the header's total.
+        size = _size_of(path) or file_row.get("size") or (info.size if info else 0)
         # A stream copy of one title is smaller than the image it came out of,
         # but the extras are extra, and for a moment both the image and its
         # replacement exist. Ask for the image's size again on top.
@@ -1209,14 +1215,15 @@ class Remediator:
         work = Path(path).with_name(f"{Path(path).stem}{transcode.TEMP_MARKER}convert")
         try:
             return self._convert_inner(job_id, file_row, info, s, work, cancel,
-                                       version)
+                                       version, size)
         finally:
             self._cancel.pop(path, None)
             shutil.rmtree(work, ignore_errors=True)
 
     def _convert_inner(self, job_id: int, file_row: dict[str, Any],
                        info: MediaInfo | None, s: Settings, work: Path,
-                       cancel: threading.Event, version: str) -> dict[str, Any]:
+                       cancel: threading.Event, version: str,
+                       image_size: int) -> dict[str, Any]:
         path = file_row["path"]
         cfg = s.makemkv
         expected = float(file_row.get("expected_runtime") or 0)
@@ -1344,10 +1351,20 @@ class Remediator:
         # counting the feature alone while the extras sit beside it would
         # report space that was never reclaimed. Keeping the image means
         # nothing was reclaimed at all, so there is nothing to count.
-        saved = 0
+        saved = replaced = 0
         if not cfg.keep_disc_image:
             replaced = _size_of(final) + sum(_size_of(p) for p in placed)
-            saved = (file_row.get("size") or 0) - replaced
+            saved = image_size - replaced
+        if saved < 0:
+            # A conversion credits what it reclaims and never debits the total.
+            # A negative figure is a measurement gone wrong, or extras that
+            # repeat one another — a "play all" title beside its parts, two
+            # playlists of one featurette — which made four live discs come out
+            # larger than their image. The second is a selection fault, and
+            # this warning is where it shows; neither is a saving to subtract.
+            db.log("convert_output_larger", "warn", final, {
+                "from": path, "image": image_size, "replaced": replaced})
+            saved = 0
         db.bump("discs_converted")
         db.bump("bytes_saved", saved)
 
@@ -1358,7 +1375,7 @@ class Remediator:
         db.log("convert_done", "info", final, {
             "from": path, "extras": len(placed), "kept_image": cfg.keep_disc_image,
             "seconds": round(main.seconds), "chapters": main.chapters,
-            "saved": saved,
+            "image": image_size, "replaced": replaced, "saved": saved,
         })
         return {"action": "convert", "ok": True, "path": final,
                 "message": summary}
