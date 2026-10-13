@@ -1624,6 +1624,8 @@ their own transcode had replaced the file. With an honest probe, the real remux 
 languages, round two's plan is a `transcode_no_op`, and the cap is never reached. They now probe
 every round and fake a remux that leaves the file as it found it, which is what "did not fix
 it" means. Both still pass on `HEAD`, and both fail when `_confirm_fixed` stops counting
-(checked by mutation in the scratch copy). Full suite: **450 pass**.
+(checked by mutation in the scratch copy). Full suite: **450 pass**, and **463** with main's
+MakeMKV crash fix (`b2a5039`) merged, whose `Unavailable` paths record nothing and so need no
+re-check.
 
 **Not deployed.**
