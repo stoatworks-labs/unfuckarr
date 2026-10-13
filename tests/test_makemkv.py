@@ -229,6 +229,185 @@ def test_the_extras_limit_is_honoured():
     assert len(chosen.extras) == 4
 
 
+# -- extras that repeat one another ---------------------------------------
+
+# Transcribed from `makemkvcon -r --cache=1 --minlength=60 info` (1.18.4) on
+# Jurassic World Rebirth (2025) BR-DISK.iso, 94,465,884,160 bytes, 77 titles:
+# (index, duration, bytes, chapters, source file, segment map). Left out are
+# 42 one-minute clips (titles 20-58 and 60-62) that use no segment any other
+# title does and sit under every extras floor here.
+JW_IMAGE = 94_465_884_160
+JW_TITLES = [
+    (0, "2:13:40", 79979642880, 20, "00040.mpls", "294"),
+    (1, "0:03:11", 1081651200, 5, "00149.mpls", "174,175,175,175,473"),
+    (2, "0:04:17", 548308992, 2, "01270.mpls", "477,478,479,480,481"),
+    (3, "0:01:21", 174090240, 1, "01271.mpls", "478,481"),
+    (4, "0:02:53", 368879616, 1, "01272.mpls", "480,481"),
+    (5, "0:01:20", 172498944, 1, "01273.mpls", "477,478"),
+    (6, "0:02:56", 375810048, 1, "01274.mpls", "479,480,481"),
+    (7, "0:56:20", 7289389056, 6, "01275.mpls",
+     "482,483,485,486,488,489,491,492,494,495,497,498,499"),
+    (8, "0:06:57", 901650432, 1, "01276.mpls", "483,484"),
+    (9, "0:09:56", 1286529024, 1, "01277.mpls", "486,487"),
+    (10, "0:09:03", 1173030912, 1, "01278.mpls", "489,490"),
+    (11, "0:08:14", 1065474048, 1, "01279.mpls", "492,493"),
+    (12, "0:10:15", 1326839808, 1, "01280.mpls", "495,496"),
+    (13, "0:11:53", 1536946176, 1, "01281.mpls", "498,499"),
+    (14, "0:06:57", 899966976, 1, "01282.mpls", "482,483"),
+    (15, "0:09:55", 1284943872, 1, "01283.mpls", "485,486"),
+    (16, "0:09:02", 1171451904, 1, "01284.mpls", "488,489"),
+    (17, "0:08:13", 1063888896, 1, "01285.mpls", "491,492"),
+    (18, "0:10:14", 1325254656, 1, "01286.mpls", "494,495"),
+    (19, "0:11:56", 1543882752, 1, "01287.mpls", "497,498,499"),
+    (59, "2:13:40", 79979642880, 0, "00294.m2ts", "294"),
+    (63, "0:01:39", 211968000, 0, "00476.m2ts", "476"),
+    (64, "0:01:17", 165574656, 0, "00478.m2ts", "478"),
+    (65, "0:02:49", 360364032, 0, "00480.m2ts", "480"),
+    (66, "0:06:53", 893042688, 0, "00483.m2ts", "483"),
+    (67, "0:09:52", 1278013440, 0, "00486.m2ts", "486"),
+    (68, "0:08:59", 1164515328, 0, "00489.m2ts", "489"),
+    (69, "0:08:10", 1056958464, 0, "00492.m2ts", "492"),
+    (70, "0:10:11", 1318324224, 0, "00495.m2ts", "495"),
+    (71, "0:11:49", 1528350720, 0, "00498.m2ts", "498"),
+    (72, "0:01:52", 241410048, 0, "00500.m2ts", "500"),
+    (73, "0:03:57", 572737536, 0, "00501.m2ts", "501"),
+    (74, "0:05:34", 808372224, 0, "00502.m2ts", "502"),
+    (75, "0:10:24", 1506816000, 0, "00503.m2ts", "503"),
+    (76, "0:06:25", 930041856, 0, "00504.m2ts", "504"),
+]
+
+
+def jurassic_world_rebirth() -> list[Title]:
+    return [Title(index=i, seconds=makemkv.parse_duration(d), size=size,
+                  chapters=chapters, source_files=[source], segments=segments)
+            for i, d, size, chapters, source, segments in JW_TITLES]
+
+
+def select_jw(**overrides) -> makemkv.Selection:
+    # The live settings: 90 s extras floor, 24 extras, the image as budget.
+    args = {"extras_min_seconds": 90, "max_extras": 24, "budget": JW_IMAGE}
+    return makemkv.select(jurassic_world_rebirth(), 8020, 25, **(args | overrides))
+
+
+def why(chosen: makemkv.Selection, index: int) -> str:
+    return next(reason for t, reason in chosen.rejected if t.index == index)
+
+
+def test_a_featurette_offered_four_ways_is_ripped_once():
+    """Live, 2026-10-13: segment 498 is the raw clip (title 71), the core of
+    two playlists that differ by a 3-second title card (13 and 19), and the
+    last part of a 56-minute "play all" (7). Matching only identical segment
+    maps kept all four, and 24 extras came to 31.6 GB beside a 76.3 GB feature
+    from a 94.5 GB image — a conversion that grew the library."""
+    chosen = select_jw()
+    assert chosen.main.index == 0
+
+    kept = [chosen.main] + chosen.extras
+    holding = [t.index for t in kept if "498" in t.segment_ids]
+    assert len(holding) == 1, holding
+    # And the same for every segment of real length: nothing is copied twice.
+    timed = {s for t in jurassic_world_rebirth() if t.is_clip
+             for s in t.segment_ids}
+    for segment in timed:
+        assert sum(segment in t.segment_ids for t in kept) <= 1, segment
+
+    assert len(chosen.extras) == 14
+    assert sum(t.size for t in kept) < JW_IMAGE
+
+
+def test_the_play_all_gives_way_to_its_pieces():
+    """Six featurettes a viewer can pick from beat one 56-minute file they
+    have to scroll through — and the pieces kept are the playlists the disc's
+    own menu plays, not the raw clips MakeMKV adds on its own account."""
+    chosen = select_jw()
+    assert why(chosen, 7) == "all but 22s of it is in titles 8, 9, 10, 11, 12, 13"
+
+    featurettes = {8, 9, 10, 11, 12, 13}
+    assert featurettes <= {t.index for t in chosen.extras}
+    for index in featurettes:
+        assert not next(t for t in chosen.extras if t.index == index).is_clip
+    # The raw clip inside each one is contained outright; its twin playlist
+    # differs from it by nothing but a title card.
+    assert why(chosen, 71) == "contained in title 13"
+    assert why(chosen, 19) == "all but 3s of it is in title 13"
+
+
+def test_what_a_rejected_play_all_alone_carried_is_held_to_the_floor():
+    """Title 2 strings together a 77-second piece (478) and a 169-second one
+    (480). The longer is kept as its own playlist; the shorter was already
+    under the 90-second floor as a title of its own, and it does not get past
+    it by riding along inside a play-all."""
+    chosen = select_jw()
+    assert why(chosen, 2) == "all but 84s of it is in title 4"
+
+    # Lower the floor and the short piece is worth keeping — as its own
+    # playlist, so the play-all still gives way and nothing is copied twice.
+    lower = select_jw(extras_min_seconds=60)
+    assert {3, 4} <= {t.index for t in lower.extras}
+    assert why(lower, 2) == "all but 7s of it is in titles 3, 4"
+
+
+def test_a_film_authored_as_clips_is_kept_whole():
+    """MakeMKV lists every clip over `--minlength` beside the playlists, so a
+    20-minute documentary authored as four clips arrives with all four listed
+    too. Waiting for those, the way a play-all waits for its playlists, would
+    swap one film for four fragments cut wherever the files happened to end."""
+    doc = Title(index=1, seconds=20 * 60, segments="11,12,13,14",
+                source_files=["00800.mpls"])
+    clips = [Title(index=2 + n, seconds=5 * 60, segments=str(11 + n),
+                   source_files=[f"000{11 + n}.m2ts"]) for n in range(4)]
+    chosen = makemkv.select([title(0, 112, segments="1"), doc, *clips],
+                            extras_min_seconds=90)
+    assert [t.index for t in chosen.extras] == [1]
+    assert all(why(chosen, c.index) == "contained in title 1" for c in clips)
+
+
+def test_an_extra_inside_the_feature_is_not_an_extra():
+    """A scene-selection playlist is frames the feature already holds."""
+    chosen = makemkv.select([title(0, 112, segments="1,2,3,4"),
+                             title(1, 9, segments="3")])
+    assert chosen.extras == []
+    assert why(chosen, 1) == "contained in title 0"
+
+
+def test_a_shared_bumper_does_not_merge_two_featurettes():
+    """Overlap nothing timed on its own counts as new. Two featurettes that
+    open on the same studio card share a segment, and that is all they
+    share; the cost of being wrong the other way is a featurette gone."""
+    chosen = makemkv.select([title(0, 112, segments="1"),
+                             title(1, 9, segments="50,51"),
+                             title(2, 8, segments="50,52")],
+                            extras_min_seconds=90)
+    assert [t.index for t in chosen.extras] == [1, 2]
+
+
+def test_the_extras_never_take_the_output_past_the_image():
+    """An image holds each segment once, so output larger than it is something
+    copied twice. A later, smaller extra still gets its turn."""
+    found = [title(0, 112, segments="1", size=80),
+             title(1, 12, segments="2", size=15),
+             title(2, 9, segments="3", size=4)]
+    chosen = makemkv.select(found, budget=90)
+    assert [t.index for t in chosen.extras] == [2]
+    assert why(chosen, 1) == "would make the output larger than the image"
+
+    # No budget, no limit: a size nobody measured is not a reason to refuse.
+    assert len(makemkv.select(found).extras) == 2
+
+
+@pytest.mark.parametrize("spec,ids", [
+    ("482,483,485", ["482", "483", "485"]),
+    ("174,175,175,175,473", ["174", "175", "175", "175", "473"]),
+    ("23-25,30", ["23", "24", "25", "30"]),
+    ("0482", ["482"]),
+    ("", []),
+])
+def test_segment_maps_are_read_as_lists(spec, ids):
+    """Repeats are kept — a title can play one clip three times — and a range
+    is expanded, because left as the string `23-25` it overlaps nothing."""
+    assert Title(index=0, segments=spec).segment_ids == ids
+
+
 # -- ripping --------------------------------------------------------------
 
 @needs_ffmpeg
@@ -459,6 +638,40 @@ def test_a_conversion_never_takes_the_saving_down(
     assert db.totals()["discs_converted"] == 1
     assert db.q1("SELECT COUNT(*) n FROM activity "
                  "WHERE event='convert_output_larger'")["n"] == 1
+
+
+@needs_ffmpeg
+def test_a_conversion_holds_its_extras_inside_the_image(
+        fake_makemkv, video_factory, settings, tmp_path):
+    """The budget is the image measured off the disk, and an extra MakeMKV
+    says would take the output past it is never ripped."""
+    feature = video_factory("src-feature.mkv", seconds=6)
+    extra = video_factory("src-extra.mkv", seconds=3)
+    image = tmp_path / "Film (2011).iso"
+    image.write_bytes(feature.read_bytes() + b"\0" * 4096)
+
+    settings.policy.disc_action = "convert"
+    settings.makemkv.enabled = True
+    settings.makemkv.command = fake_makemkv({"titles": [
+        {"index": 0, "duration": "0:00:06", "file": str(feature),
+         "segments": "1,2", "bytes": feature.stat().st_size},
+        {"index": 1, "duration": "0:00:03", "file": str(extra),
+         "segments": "9", "bytes": 8192},
+    ]})
+    settings.makemkv.extras_min_seconds = 1
+    settings.makemkv.min_title_seconds = 1
+
+    row = insert(image)
+    result, info = check_file(str(image), settings)
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("convert", "disc image"))
+    assert out["ok"], out
+
+    assert not (tmp_path / "extras").exists()
+    selected = json.loads(db.q1("SELECT detail FROM activity "
+                                "WHERE event='convert_selected'")["detail"])
+    assert selected["rejected"] == [
+        {"index": 1, "why": "would make the output larger than the image"}]
 
 
 @needs_ffmpeg

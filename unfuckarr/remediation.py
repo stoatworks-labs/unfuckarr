@@ -1352,7 +1352,7 @@ class Remediator:
         reference = info.duration if info and info.duration > 0 else expected
         selection = makemkv.select(
             found, reference, cfg.duration_tolerance_pct,
-            cfg.extras_min_seconds, cfg.max_extras)
+            cfg.extras_min_seconds, cfg.max_extras, budget=image_size)
         if selection.main is None:
             why = selection.rejected[-1][1] if selection.rejected else "no usable title"
             return self._skip_convert(job_id, file_row,
@@ -1461,8 +1461,10 @@ class Remediator:
             # A negative figure is a measurement gone wrong, or extras that
             # repeat one another — a "play all" title beside its parts, two
             # playlists of one featurette — which made four live discs come out
-            # larger than their image. The second is a selection fault, and
-            # this warning is where it shows; neither is a saving to subtract.
+            # larger than their image. `makemkv.select` now refuses both and
+            # holds the extras inside the image's size, but on MakeMKV's
+            # estimate; this is the measured check behind it, and neither
+            # cause is a saving to subtract.
             db.log("convert_output_larger", "warn", final, {
                 "from": path, "image": image_size, "replaced": replaced})
             saved = 0
