@@ -669,6 +669,72 @@ def test_conversions_have_their_own_much_smaller_cap(settings, monkeypatch):
     assert out["conversions"] == 2 and out["actions"] == 0
 
 
+def test_a_written_off_disc_does_not_spend_a_conversion_slot(settings, monkeypatch):
+    """Live, 2026-10-08 to 10-12: `decide` cannot see the row, so it went on
+    deciding `convert` for two discs that had each failed once; they were the
+    biggest, so they headed every pass, took both of its two slots to be
+    refused inside `apply`, and the disc behind them was never reached."""
+    scanner, applied = _scan_harness(settings, monkeypatch)
+    settings.policy.max_conversions_per_scan = 2
+
+    from unfuckarr.checks import CheckResult
+    refused = [
+        {"path": "/media/F9.iso", "convert_attempts": 1},
+        {"path": "/media/Blues Brothers.iso", "convert_attempts": 1},
+        {"path": "/media/Odd.iso", "convert_skipped": "no title near the runtime"},
+        {"path": "/media/Done.iso", "converted": 1760000000.0},
+    ]
+    fresh = [{"path": "/media/Rebirth.iso"}, {"path": "/media/Next.iso"}]
+    pending = [(row, CheckResult(path=row["path"]), None,
+                Decision("convert", "disc image")) for row in refused + fresh]
+    out = scanner._remediate(settings, pending, population=50)
+
+    assert applied == ["/media/Rebirth.iso", "/media/Next.iso"]
+    assert out["conversions"] == 2
+
+
+def test_a_forced_conversion_reopens_a_failed_disc_but_never_a_converted_one(
+        settings, monkeypatch):
+    """The UI's Convert button exists for a disc whose failure has since been
+    fixed; the scan must not stand between it and the remediator."""
+    scanner, applied = _scan_harness(settings, monkeypatch)
+    # Room for all three, so it is the refusal and not the cap that stops one.
+    settings.policy.max_conversions_per_scan = 5
+
+    from unfuckarr.checks import CheckResult
+    rows = [{"path": "/media/F9.iso", "convert_attempts": 1},
+            {"path": "/media/Odd.iso", "convert_skipped": "no title"},
+            {"path": "/media/Done.iso", "converted": 1760000000.0}]
+    pending = [(row, CheckResult(path=row["path"]), None,
+                Decision("convert", "requested", force=True)) for row in rows]
+    scanner._remediate(settings, pending, population=50)
+
+    assert applied == ["/media/F9.iso", "/media/Odd.iso"]
+
+
+def test_the_remediator_still_refuses_a_written_off_disc(settings, tmp_path):
+    """The scan's check is a filter, not the enforcement: the watch folder and
+    the UI reach `apply` without passing through it."""
+    from unfuckarr.checks import CheckResult
+
+    settings.policy.disc_action = "convert"
+    settings.makemkv.enabled = True
+    # Never run: a refusal returns before MakeMKV is asked anything, and a
+    # disc that got past it would come back "not usable" instead.
+    settings.makemkv.command = str(tmp_path / "no-such-makemkvcon")
+    rem = Remediator(lambda: settings)
+
+    for name, extra, expected in [
+            ("Failed", {"convert_attempts": 1}, "not trying again"),
+            ("Skipped", {"convert_skipped": "no title"}, "already assessed"),
+            ("Done", {"converted": 1760000000.0}, "already converted")]:
+        row = insert(tmp_path / f"{name}.iso", **extra)
+        out = rem.apply(row, CheckResult(path=row["path"]), None,
+                        Decision("convert", "disc image"))
+        assert out["action"] == "flag" and out["ok"], (name, out)
+        assert expected in out["message"], (name, out)
+
+
 # -- what the first real conversion found ---------------------------------
 
 def test_seek_artefacts_only_count_against_an_ordinary_file():

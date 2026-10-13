@@ -196,6 +196,18 @@ Break any of these and the failure is quiet and expensive.
     feature. Hence `makemkv.KeyExpired`, which is an `Unavailable`, and the
     availability check that runs before every conversion.
 
+    Because those markers are permanent, **the scan must read them before it
+    spends a conversion slot**, the same rule invariant 25 sets for the
+    research cooldown. `decide` cannot see the row, so it goes on deciding
+    `convert` for a disc that is converted, skipped or out of attempts; the
+    pass orders discs biggest first, so the same written-off discs head it
+    every night. `Remediator.convert_refused` is asked in `Scanner._remediate`
+    before the cap and again inside `_convert` as the backstop (the watch
+    folder and the UI reach `apply` without the scan). `force` reopens a
+    skipped or failed disc, never a converted one. Live, 2026-10-08 to 10-12:
+    F9 and The Blues Brothers, each failed once, took both of the two nightly
+    slots to be refused, and the 84 discs behind them waited five days.
+
 21. **The tool is never bundled, and that is a licence fact, not a preference.**
     MakeMKV's binary half is not redistributable, so a public image cannot ship
     it. `MakeMKVConfig.command` is a whole command line rather than a path so
