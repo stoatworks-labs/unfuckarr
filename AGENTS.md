@@ -104,6 +104,16 @@ Break any of these and the failure is quiet and expensive.
     settings may have changed; it never reopens a *shrunk* one, because generation loss does not
     become untrue.
 
+    The markers are only as good as the row the job reads, and every caller reads it *before*
+    waiting for the slot. So `Remediator.apply` allows **one job per file** (`busy_paths`; a
+    second caller stands down at once, and the continuous worker's candidate query skips a busy
+    file rather than spin on the refusal), and `_shrink` re-reads the row and re-stats the file
+    against the probe's `size`/`mtime` (`_superseded`) when it gets the slot, after the search,
+    after the encode and before the swap — standing down, counting nothing, if either moved.
+    Without both, the watch-folder arrival and the worker shrank the same file within minutes at
+    least 48 times (2026-08-26 to 10-12): the second job's search sampled the original, the first
+    swapped its output in, and the second encoded *that* and counted the saving a second time.
+
 12. **The measurement is the gate — nothing decides in advance which files are "too big".**
     An earlier version of `checks/efficiency.py` selected candidates by video bitrate against a
     target for their resolution. That is a guess about how an encoder will behave on content it
@@ -204,6 +214,18 @@ Break any of these and the failure is quiet and expensive.
     titles reported" — `convert_skipped`, permanently, two discs a scan. The
     availability check does not catch it, because `info disc:9999` opens no
     image and 2.0.0 answers it normally.
+
+    Because those markers are permanent, **the scan must read them before it
+    spends a conversion slot**, the same rule invariant 25 sets for the
+    research cooldown. `decide` cannot see the row, so it goes on deciding
+    `convert` for a disc that is converted, skipped or out of attempts; the
+    pass orders discs biggest first, so the same written-off discs head it
+    every night. `Remediator.convert_refused` is asked in `Scanner._remediate`
+    before the cap and again inside `_convert` as the backstop (the watch
+    folder and the UI reach `apply` without the scan). `force` reopens a
+    skipped or failed disc, never a converted one. Live, 2026-10-08 to 10-12:
+    F9 and The Blues Brothers, each failed once, took both of the two nightly
+    slots to be refused, and the 84 discs behind them waited five days.
 
 21. **The tool is never bundled, and that is a licence fact, not a preference.**
     MakeMKV's binary half is not redistributable, so a public image cannot ship
@@ -627,6 +649,32 @@ Break any of these and the failure is quiet and expensive.
   tags, and it cannot be shrunk from where it sits; one conversion clears all
   of it. It is also strictly better than what the compat path would otherwise
   do to a disc, which is the byte-range encode that came out short live.
+- **A disc offers one featurette several ways, and only one pair of them has
+  identical segment maps.** Jurassic World Rebirth (2025), 77 titles: segment
+  498 is the raw clip (title 71), the core of two playlists that differ only
+  by a 3-second title card (`498,499` and `497,498,499`), and the tail of a
+  56-minute "play all" of six featurettes. Deduping on an identical map kept
+  all four, so 24 extras came to 31.6 GB beside a 76.3 GB feature, out of a
+  94.5 GB image — with `keep_disc_image` off, a conversion that *grows* the
+  library. `makemkv.select` now keeps an extra only for what it adds: at least
+  `extras_min_seconds` not already in the feature or an extra already kept,
+  with the shared part measured from below, out of durations MakeMKV itself
+  reported. Two decisions inside that are deliberate:
+  - **The pieces beat the play-all.** In Emby an extra is one item in a list,
+    so six featurettes are choosable and one 56-minute file is not. Longest-
+    first would keep the play-all and measure every piece against it, so a
+    title waits until every candidate *playlist* inside it has been weighed.
+  - **It waits for playlists, never for raw clips.** MakeMKV lists every
+    `.m2ts` over `--minlength` beside the playlists, so a documentary
+    authored as four clips arrives with all four listed; waiting for them
+    would swap one film for four fragments cut at file boundaries.
+
+  Behind both, `select` refuses any extra that would take MakeMKV's estimate
+  of the output past the image's size: an image holds each segment once, so
+  output bigger than it is something copied twice. The estimate runs a few
+  percent high (79.98 GB promised, 76.3 GB written), so this errs towards
+  dropping an extra, and `convert_output_larger` is still the measured check
+  after the fact.
 
 ## Verified vs assumed
 
@@ -744,7 +792,11 @@ which is the safe direction but does nothing useful.
   measures below target being discarded, one bad sample failing a passing mean, an unverifiable
   output being discarded, HDR left alone, a missing metric not writing the file off, the shrink
   window wrapping past midnight, shrinks staying out of the abort ratio, their own cap, repairs
-  ordered ahead of them, and the six new columns migrating onto a 1.0.0-shaped database.
+  ordered ahead of them, and the six new columns migrating onto a 1.0.0-shaped database. And
+  one job per file: a second job for a file being shrunk standing down (and the worker not
+  offered it), a job that waited not re-shrinking what another just shrank, and a file that
+  changed during the search or the encode being neither encoded nor replaced, with nothing
+  counted — each run against the old source first and failing there.
 - That VMAF actually discriminates: a near-lossless re-encode scores above 90 and CRF 51 below
   80, measured against media ffmpeg rendered.
 - **Disc images**, against ISO9660 volumes the tests assemble byte by byte (so no fixture and no
@@ -907,11 +959,27 @@ container's own ffmpeg:
   MakeMKV cannot be installed there. What none of it proves is the only thing
   MakeMKV is here for: that it picks the right playlist off a real Blu-ray with
   seamless branching.
-- **The extras heuristic is a length heuristic and nothing more.** "The longest
+- **The feature is still chosen by length and nothing more.** "The longest
   title is the feature" was right on every disc measured, and the discs where
   it will not be — an anthology, a TV season on one disc, a concert film with
   a longer bonus concert — are real and are not represented in any test here.
   `max_extras` and the extras floor limit the damage; nothing prevents it.
+- **The extras are now chosen by overlap, and that is verified on one disc's
+  structure, not on a rip.** The real 77-title output of Jurassic World Rebirth
+  is a test fixture: the old selection kept 24 extras (33.5 GB by MakeMKV's
+  estimate), the new one keeps 14 (13.0 GB), every featurette once, and
+  feature plus extras come to 93.0 GB against a 94.5 GB image. What that does
+  *not* cover: no conversion has run with the new selection, so the written
+  sizes are MakeMKV's estimates; and the four live discs that came out larger
+  than their image (The Hunger Games, Once Upon a Time in Hollywood,
+  Dragonslayer, Ratatouille) were converted before anyone captured their
+  robot output, so that this catches them is inferred from their `extras/`
+  folders — near-identical pairs and a 122-minute play-all — not measured.
+  Overlap made of clips shorter than `--minlength` cannot be measured and
+  counts as new, so it can still be copied twice; on Rebirth every such clip
+  is a 3–4 second title card. One deliberate loss: a 77-second piece reached
+  only through a play-all (Rebirth's title 2) goes when the play-all does,
+  because on its own it is under the 90-second floor.
 - **MakeMKV 2.0.0 cannot open a Blu-ray image, so the image is not on it.**
   Measured 2026-10-13 on the deployment target: the PPA's `2.0.0-1~noble`
   builds cleanly and answers `info disc:9999` in exactly 1.18.4's shape, then
@@ -926,9 +994,10 @@ container's own ffmpeg:
   `settings.conf`: the full `check_file` → `decide` → `apply` on a 94.5 GB
   UHD image (Jurassic World Rebirth) — key fetched, 77 titles, 8020 s /
   20-chapter feature verified to 0.01 s, HEVC 10-bit PQ and TrueHD intact,
-  24 extras placed, 1,307 s. It also measured the extras heuristic's cost on a
-  disc with nested playlists: 31.6 GB of extras, the library 13 GB *larger*
-  than the image (see `docs/NOTES.md`).
+  24 extras placed, 1,307 s. That rip is also the one *written* measurement of
+  the old extras selection on this disc: 31.6 GB of extras on disk (MakeMKV
+  estimated 33.5), feature plus extras 13 GB *larger* than the image — the
+  case the overlap selection above was built for.
 - **No Unraid server has installed the CA template.** It is written against the CA conventions
   used elsewhere in this fleet (root `<Container version="2">`, no trailing colon on subcategory
   tokens, per-image `<Registry>` URL) and `scripts/validate_template.py` checks those in CI, but

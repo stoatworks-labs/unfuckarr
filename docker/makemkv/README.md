@@ -177,10 +177,12 @@ Blu-ray image tried (see the top of this file).
 is a single segment, which the old largest-`.m2ts` heuristic would also have
 found. The discs that justify MakeMKV are the ones not yet tried.
 
-**Extras are not deduplicated beyond an identical segment map.** On the disc
-above, nested playlists (a 56 min "play all" and featurettes that are subsets
-of it) produced 31.6 GB of extras, leaving the feature plus extras 13 GB larger
-than the image.
+**The overlap-based extras selection has not been through a rip.** On the
+disc above the old selection wrote 31.6 GB of extras from nested playlists (a
+56 min "play all" and featurettes that are subsets of it), leaving the feature
+plus extras 13 GB larger than the image. `select` now keeps an extra only for
+what it adds; replayed against that disc's real output it keeps 14 extras,
+about 13 GB by MakeMKV's estimate — an estimate until a conversion writes them.
 
 **Nothing from MakeMKV 2.0 has been parsed**, because it has never got as far
 as printing a title.

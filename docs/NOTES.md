@@ -1224,13 +1224,13 @@ reads discs normally. Reproduced from a copy of the live file: old wrapper → n
 Fixed: the wrapper refetches whenever the file has no `app_Key`. The **unfixed live wrapper
 should heal itself at ~13:05 today**, before the 18:01 scan, if the forum fetch works.
 
-**Then something else stops them anyway** — not fixed here, chipped as its own task: the two
-conversion slots per scan have gone to **F9 and The Blues Brothers** every night since 10-09.
+**Then something else stops them anyway** — fixed since, in "two refused discs had been spending
+the whole conversion cap" below: the two conversion slots per scan have gone to **F9 and The Blues Brothers** every night since 10-09.
 Both carry `convert_attempts=1` and `_convert` refuses them, but the scanner spends the slot
 before it asks (`convert_cap_reached` against Jurassic World Rebirth on 10-08…10-12). Same
 trap invariant 25 fixed for `research`. And the Fast & Furious `convert_done` logged
 `"saved": -58232878315`: the image's row had no size, so the conversion took 58 GB *off*
-`bytes_saved` — also chipped.
+`bytes_saved` — fixed in "every disc that arrived was counted as minus the whole film" below.
 
 **What did pass: a full conversion on 1.18.4, from the live key state.** What an overlay rebuild
 would ship (rollback-2026-10-12's MakeMKV + this branch's code and wrapper), started
@@ -1245,7 +1245,8 @@ more audio tracks with their languages, five PGS tracks, 20 chapters, **8020.01 
 8020 s promised** and 8019.97 s measured off the disc by `disc.py`. `_verify_conversion`
 passed, the row moved to the `.mkv` with `converted_from` set, 24 extras placed.
 
-**And it found the extras heuristic's real failure** — chipped, not fixed: those 24 extras are
+**And it found the extras heuristic's real failure** — fixed since in `select`, see "Jurassic World
+Rebirth — extras that repeat one another" below: those 24 extras are
 **31.6 GB**, so feature + extras = **107.9 GB from a 94.5 GB image**. The playlists are
 *nested*: title 7 (56 min, "play all") is segments 482–499, title 19 is 497–499, 13 is 498–499,
 71 is 498 alone — `select` dedupes only an *identical* map, so segment 498 was written four
@@ -1270,3 +1271,240 @@ old version is unknown.
 Left on lilnasx for inspection, safe to delete: images `unfuckarr-makemkv:makemkv2-test` and
 `unfuckarr-makemkv:overlay-test`; scratch at `/mnt/user/appdata/.makemkv2-test/` (the raw
 `info` captures for both versions are in `out/`; the 108 GB of conversion output is deleted).
+
+## 2026-10-13: two refused discs had been spending the whole conversion cap
+
+The last real conversion was Fast & Furious on 10-08. Every scan since logged
+`convert_cap_reached` against Jurassic World Rebirth, the next disc in line, and the only two
+`convert` jobs in the 10-12 17:01 scan were `F9 (2021) BR-DISK.iso` and `The Blues Brothers (1980)
+BR-DISK.iso` — both `convert_attempts` 1, both refused inside `apply` with *a previous conversion
+of this disc failed — not trying again*. (Read-only queries against the live DB.)
+
+Why: `decide` cannot see the file row, so it keeps deciding `convert` for a disc `_convert` will
+refuse (converted, `convert_skipped`, or attempts ≥ `MAX_CONVERT_ATTEMPTS`). The scanner counted
+the slot whatever `apply` returned, and its biggest-first order put the same two written-off discs
+at the head of every pass, so with `max_conversions_per_scan` 2 nothing behind them could ever be
+reached. It is exactly the trap invariant 25 had already fixed for `research`'s cooldown, one
+branch further down the same loop.
+
+Fix: `Remediator.convert_refused(row, force=)` holds the three refusals; `Scanner._remediate`
+asks it before the cap and `continue`s without spending a slot, and `_convert` asks it again as
+the backstop (the watch folder and the UI go straight to `apply`). `force` reopens a skipped or
+failed disc and never a converted one, as before. Three tests beside the cap tests; the two
+scanner ones were run against the old `scanner.py` first and failed there — the first with
+`applied == [F9, Blues Brothers]`, i.e. the live shape. AGENTS.md invariant 20.
+
+**Not deployed.** The live box is still on `5a935be`. The 84 discs waiting on the cap stay
+waiting until it is — and the overlay recipe from the entry above (the PPA has moved to MakeMKV
+2.0.0) is still the only way to ship it without a MakeMKV version change.
+
+## 2026-10-13: every disc that arrived was counted as minus the whole film
+
+The header's `bytes_saved` went **down** by the size of a film each time a disc image arriving
+through the watch folder was converted. `Remediator._convert_inner` reckoned the saving as
+`file_row["size"] - (feature + extras)`, and the row a watch-folder arrival inserts has no size —
+`_check_arrival` builds `record` from the `INSERT OR IGNORE` before `persist_result` writes one.
+Fast & Furious (2009) logged `"saved": -58232878315` on 10-08: exactly minus its feature and three
+extras.
+
+**Fixed:** `_convert` measures the image with `os.stat` before anything moves it (row and
+`MediaInfo` only as fallbacks) and the saving uses that. A conversion also never debits the total
+now: a negative figure logs `convert_output_larger` (warn, with `image` and `replaced`) and counts
+nothing. `convert_done` carries `image` and `replaced` too, so the next audit does not need
+Radarr to reconstruct them.
+
+**Why "never negative" and not just "measure properly"** — four live discs genuinely came out
+*larger* than their image, with correct sizes on the row: The Hunger Games (+21.9 GB), Once Upon
+a Time in Hollywood (+12.8), Dragonslayer (+13.9), Ratatouille (+7.7). Their `extras/` folders
+repeat themselves: near-identical pairs (2,483,713,036 vs 2,483,378,542 bytes) and a long
+"play all" title beside its parts (Hunger Games' "Extra 01 (122 min)", 28 GB). `select` drops
+exact segment-map duplicates and other cuts of the feature, but not those. That is a selection
+fault to fix in `makemkv.select`, not a saving to subtract — and the warning is where it now shows.
+
+**Audit of the live counter** (read-only: live DB as uid 99 with `mode=ro`, the three backups
+`immutable=1` from a throwaway container, Radarr's history API). `discs_converted` = 22, all
+identified: 6 by 09-14, 16 between 09-22 and 10-12. (Mortal Kombat, the 08-23 kept-image test, is
+the one before the counter existed; it changed nothing either way.)
+
+- **Image sizes come from Radarr**, not from us: every `.iso` has a `downloadFolderImported` and a
+  `movieFileDeleted … MissingFromDisk` carrying its exact bytes. The recycle bin had already been
+  swept and the rows moved to the `.mkv`.
+- **Arrival vs scan** from timing: a conversion with no scan started between Radarr's import and
+  the conversion ran on a row the arrival created, so with no size. That is 14 of 22, and the
+  pre-09-14 backup's activity confirms 5 of them as `arrival_checked → convert` with the
+  `-replaced` figure.
+- 4 conversions have lost their `converted` marker (Fast & Furious, Fantastic Beasts, The Hunger
+  Games, Mad God); placed in time by their extras' mtimes. Radarr's history shows it picking up a
+  `*.unfuckarr.mkv` temp output as the movie file mid-remux — the likeliest way the row was dropped
+  and re-created.
+
+Counted so far for conversions: **−583.4 GB**. The fixed code would have counted **+97.4 GB**.
+One-off correction: **+680,813,383,056 bytes** — +646.1 GB for the 14 arrivals (each exactly the
+image's size wherever the image outweighed the output) and +34.7 GB for the two scan-driven
+negatives. Three figures (Hunger Games, Once Upon a Time, Dragonslayer) are reconstructed from
+`shrunk_from`/current size + extras on disk rather than read from a log, so they could be off by
+the few MB a no-op remux changes a file by. Not applied yet: waiting on Allan.
+
+⚠️ **The counter is wrong in the other direction too.** Since 10-07, 25 files that arrived
+through the watch folder were **shrunk twice within minutes**: the arrival path and a second
+worker both searched the same original, the first swapped its output in, and the second then
+encoded *that* output (generation loss — invariant 11) and counted a saving against the
+original's stale size. Red Dwarf S03E01: 1.75 GB file, `saved` 1.16 GB then 1.26 GB. Not fixed
+here, and the conversion correction alone does not make `bytes_saved` right. (Fixed and measured
+in "two jobs shrank the same file" below: it is 48 files back to 08-26, not 25.)
+
+## 2026-10-13: Jurassic World Rebirth — extras that repeat one another, fixed in `select`
+
+Measured on lilnasx in a throwaway container (not the live `unfk`): the real `_convert` path with
+MakeMKV 1.18.4 on `Jurassic World Rebirth (2025) BR-DISK.iso` (94,465,884,160 bytes, 77 titles)
+chose the right feature — title 0, 8020 s, 20 chapters, 76.3 GB written — and then **24 extras,
+31.6 GB**, hitting `max_extras` with 6 more turned away. Feature + extras = 107.9 GB, 13 GB more
+than the image. On the live setting (`keep_disc_image` off) that conversion grows the library.
+
+The disc offers each of six featurettes four ways. From the robot output
+(`/mnt/user/appdata/.makemkv2-test/out/jw-1184.txt` on lilnasx, `--minlength=60`):
+
+| title | length | segments | what it is |
+|---|---|---|---|
+| 7 | 56:20 | 482,483,485,…,497,498,499 | "play all" of the six |
+| 19 | 11:56 | 497,498,499 | title card + featurette + tail |
+| 13 | 11:53 | 498,499 | featurette + tail |
+| 71 | 11:49 | 498 | the raw clip, added by MakeMKV |
+
+Segments 482, 485 … 497 and 484, 487 … 499 are 3–4 s cards — MakeMKV logs each one as under the
+minimum (`MSG:3025 … has length of 3 seconds`). `select` deduped only on an *identical* map, so 498
+was ripped four times; the extras came out in near-identical groups (1,457,198,695 /
+1,456,907,560 / 1,449,320,915 bytes at 12 min).
+
+**Fix, in `makemkv.select`** (docstring rules 5–7, AGENTS.md disc-conversion traps):
+
+- An extra is kept for what it **adds**: at least `extras_min_seconds` not already in the feature
+  or an extra kept so far. The shared part is measured from below, out of titles MakeMKV timed
+  that fit inside it without sharing a segment (`_overlap`) — so only MakeMKV's own durations are
+  used, and an overlap nothing timed (clips under `--minlength`) counts as new. Of the 75 segments
+  Rebirth's titles use, 57 are titles in their own right and the other 18 are logged short.
+- **The pieces beat the play-all**: a title waits until every candidate *playlist* inside it has
+  been weighed. Not raw clips (`Title.is_clip`, source `.m2ts`) — a documentary authored as four
+  clips would otherwise become four fragments.
+- **A budget**: extras that would take MakeMKV's size estimate past the image are refused
+  (`_convert` passes the measured image size). Belt and braces; it does not fire on Rebirth.
+
+Replayed against the real output: **14 extras, 13.0 GB** by MakeMKV's estimate (was 24 / 33.5 GB),
+feature + extras 93.0 GB against 94.5. Every featurette once, as the disc's own playlist (8–13)
+rather than the bare clip, so each keeps its 3–4 s tail card and loses its opening one. The play-all
+goes with *all but 22s of it is in titles 8, 9, 10, 11, 12, 13*. Mortal Kombat's 3-title output
+selects exactly as before. One loss, deliberate: title 2 strings together a 77 s piece and a 169 s
+one; the 169 s one is kept as its own playlist, the 77 s one was already under the 90 s floor on its
+own and goes with the play-all (lower the floor to 60 and it comes back as title 3).
+
+Tests in `tests/test_makemkv.py` carry the real segment maps (the 42 one-minute clips that overlap
+nothing are left out). Run against the old `select` with only a `budget` parameter shimmed in, the
+six selection tests failed there; the shared-bumper test passes on both, which is its point —
+it guards against the fix over-reaching.
+
+**Not verified:** no rip has been done with the new selection, so 13.0 GB is an estimate (it ran
+~4.6% high on the feature). The four live discs that already came out larger than their image
+(Hunger Games, Once Upon a Time in Hollywood, Dragonslayer, Ratatouille) have no captured robot
+output; that this catches them is an inference from their `extras/` folders. **Not deployed.**
+
+## 2026-10-13: two jobs shrank the same file, and the counter counted both
+
+**What happened** (read-only: live DB as uid 99 `mode=ro`, the three backups `immutable=1` from a
+throwaway container, `config.json`). Live runs `shrink.continuous` on, `max_concurrent` 1, and
+watch folders on `/media/tv` and `/media/movies`, so the scanner skips shrinks entirely and only
+two callers ever start one: the arrival check (`_check_arrival` → `apply`) and the continuous
+worker (`_shrink_one` → `apply`). Both read the row and probe the file *before* `_shrink` waits
+for the one slot, and nothing looked again afterwards. Nothing claimed a path either: `_cancel`
+is keyed by path but registered only at the slot and popped as soon as the encode ends, before
+verification and the swap, which is exactly the window the second job came through.
+
+Red Dwarf S03E01, BST: `arrival_checked → shrink` 23:38; first search 23:48:11; first encode
+23:50:59. The encode ends and frees the slot; the second job takes it at **23:53:02** and searches
+with `size` 1,748,079,760, the original's; the first job verifies and swaps at **23:53:48**. The
+second search's CRF ladder is identical to the first's to four decimals (92.0746 / 91.5604 /
+89.9326 / 87.5444), so it cut its windows out of the original. Its encode at 23:55:42 read the
+path, which by then held the first output. VMAF **93.5** is gen 2 against gen 1, not against the
+original. `saved` was then reckoned from the stale size, and `shrunk_from` got the original's
+size from both jobs.
+
+**Scale: 48 files, not 25.** Merging the activity from all four databases: 48 paths with two
+`shrink_done` 4–38 minutes apart. The first was **2026-08-26** (Jeeves and Wooster S01E01); 25
+are since 10-07 and 23 sit in the 09-14 and 09-22 backups. Every one has exactly one
+`arrival_checked` and two `shrink_search_started` at the same (original) size. None before
+08-24, which is when the counters arrived (seeded honestly from `shrunk_from − size`).
+
+- Red Dwarf 10 (S01E04, S02E01, S02E02, S03E01–03, S04E03, S04E05, S05E02, S05E03)
+- Have I Got a Bit More News for You 10 (S57E02/03/05/07, S60E10, S65E01/02/07/08/09)
+- Jeeves and Wooster 9 (S01E01, S01E02, S02E02, S02E03, S03E03, S03E04, S03E06, S04E04, S04E05)
+- It's Always Sunny S18E04, S18E05; Taskmaster S22E02, S22E06
+- 1 each: Fantastic Beasts: The Crimes of Grindelwald, Argo, Bad Boys (1995), Bad Boys: Ride or
+  Die, Silo S03E09, Paul Merton in India S01E03, Stuart Fails to Save the Universe S01E07,
+  Dispatches S2026E07, Cornwall: This Fishing Life S02E03, Deadliest Catch S21E06, Teachers
+  S01E01, Scrubs (2026) S02E03, Have I Got News for You S72E02, Mad Men S07E04, Last Week
+  Tonight S13E26
+
+46 of these files are still the gen-2 encode on disk. Jeeves S03E03 and Scrubs S02E03 have been
+replaced since. **The originals are gone**: the bin holds one file from today. Each file passed
+VMAF 92 against the original *once*. The second generation was never measured against it, so
+these files are probably under the target. Re-grabbing them through the *arr is the only way back.
+
+**Fixed:**
+
+- `Remediator.apply` allows **one job per file** (`_busy`, `busy_paths()`). A second caller for a
+  path that already has a job logs `already_in_flight` and returns `busy` at once, rather than
+  queueing on the slot. This applies to every acting decision, not just shrink: two transcodes or
+  a transcode and a conversion on one file race the same way.
+- `Service._next_shrink_candidate(busy)` skips claimed paths. Without that, the worker would pick
+  the arrival's file every time it looked and spin on the refusal.
+- `MediaInfo.mtime` is recorded by `probe` (stat'd *before* ffprobe runs). `_shrink` calls
+  `_superseded` at four points: when it gets the slot, after the search (the check the live race
+  needed), after the encode (before any verdict is recorded), and before the recycle/swap. It
+  re-reads `shrunk`/`shrink_skipped` and compares the file's size and mtime with the probe. If
+  anything moved, it deletes any output, logs `shrink_superseded`, and returns `superseded`: no
+  attempt, no verdict, no counter. The worker waits 60 s after a superseded outcome so that a
+  file still being written is not re-probed in a tight loop.
+- **Verified the size half cannot misfire:** `probe().size == os.stat().st_size` on 15 live files
+  across mkv, mp4, avi, ts and mpg (read-only, the container's own `probe`). Disc images already
+  take `os.path.getsize`.
+- 5 new tests in `test_shrink.py`, "one job per file", all run against the old source first.
+  They failed there with the live shapes: the second job queued behind the first; a job that
+  waited re-shrank the file (`'shrink' != 'shrink'`, two encodes); an encode ran after the file
+  changed during the search, both for a replacement and for an mtime-only rewrite; and an *arr
+  upgrade was recycled and replaced after the file changed during the encode. Full suite: 436 pass (with main's `select` fix merged).
+
+**The over-count is the *first* `saved` of each pair, not the second.** The second job measured
+against the original's stale size, so its `saved` alone is already the whole original → gen 2
+reduction. It equals `shrunk_from − size` on the row **exactly** for 46 of 48 (the other two
+files have been replaced since). The counter got `s1 + s2`, the disk changed by `s2`, so `s1` is
+spurious. Subtracting `s2` instead would leave the counter `s2 − s1` short on every file (gen 2 is
+smaller than gen 1).
+
+| window | pairs | over-count (Σ first `saved`) |
+|---|---|---|
+| 10-07 → 10-12 (live log) | 25 | 32,245,577,801 |
+| 08-26 → 09-22 (backups) | 23 | 95,977,704,858 |
+| **logged total** | **48** | **128,223,282,659 (128.2 GB)** |
+
+(Σ second `saved` would be 139,090,486,980.) `files_shrunk` is over by the same 48.
+
+**Unlogged gaps.** The activity log keeps ~5,000 rows. 09-14 17:34 → 09-21 19:07 and 09-22 20:24 →
+10-07 20:10 exist in no database, the bin has been emptied, and `jobs` is pruned. Estimated by
+reconciling the counters against the rows shrunk in each window. Validated on 10-07 → 10-12,
+where it gives 26 files / 32.65 GB against the known 25 / 32.25 GB, and on 09-21/22 (1 against 1):
+
+- **Gap 1: ~4 files, ~5.4 GB.** No conversions in that window, so this is reasonably firm.
+- **Gap 2: ~51–68 files, bytes not measurable.** 68 is the `files_shrunk` excess, an upper bound
+  inflated by rows later replaced. 51–54 comes from the recorded VMAF: a double's score is gen 2
+  against gen 1 and reads high, 73% ≥ 93.5 against 10% of singles. The bytes residual mixes in
+  15 conversions, and two of the six counted by 09-14 ran between the counters landing
+  (08-24 01:53) and the log starting (06:19), so their figures are unknown. The
+  double count comes out somewhere around **100–240 GB** depending on those two. Pinning it
+  needs the per-disc conversion figures from the audit above.
+
+**Not deployed, and nothing written to the live DB.** Corrections waiting on Allan, best applied
+together with the conversion one in the entry above:
+
+- `bytes_saved` **+680,813,383,056** (conversions) **− 128,223,282,659** (logged doubles) =
+  **+552,590,100,397**; `files_shrunk` **− 48**.
+- Optionally the gap estimates: about −5.4 GB / −4 for gap 1, and an unknown −100 to −240 GB /
+  −51 to −68 for gap 2.
