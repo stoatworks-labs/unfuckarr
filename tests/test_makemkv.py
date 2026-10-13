@@ -145,6 +145,36 @@ def test_no_titles_at_all_is_an_error_not_an_empty_list(fake_makemkv, tmp_path):
         makemkv.titles(str(image), command)
 
 
+def test_a_crash_is_the_installation_failing_not_the_disc(fake_makemkv,
+                                                          tmp_path):
+    """MakeMKV 2.0.0 segfaulted on every Blu-ray image on the live library,
+    where 1.18.4 read them. Read as "no titles", that is a verdict on the disc,
+    and the caller writes it off for ever."""
+    image = tmp_path / "film.iso"
+    image.write_bytes(b"x")
+    command = fake_makemkv({"crash": "info", "titles": [
+        {"index": 0, "duration": "1:52:31"}]})
+
+    with pytest.raises(makemkv.Crashed, match="SIGSEGV.*AACS directory"):
+        makemkv.titles(str(image), command)
+    assert issubclass(makemkv.Crashed, makemkv.Unavailable)
+    # The version probe does not open an image, and 2.0.0 answered it
+    # normally — so the gate before every conversion lets this through.
+    assert makemkv.available(command).startswith("MakeMKV")
+
+
+@pytest.mark.parametrize("code, crashed", [
+    (-11, True), (139, True), (137, True),   # direct, and through a shim
+    (0, False), (1, False), (128, False), (255, False),
+])
+def test_a_signal_is_told_apart_from_an_exit_code(code, crashed):
+    if crashed:
+        with pytest.raises(makemkv.Crashed):
+            makemkv._check_crash(code, [])
+    else:
+        makemkv._check_crash(code, [])
+
+
 # -- choosing what to rip -------------------------------------------------
 
 def title(index, minutes, segments="", size=0):
@@ -486,6 +516,120 @@ def test_an_expired_key_does_not_write_the_disc_off(
     assert image.exists()
 
 
+@needs_ffmpeg
+@pytest.mark.parametrize("where", ["info", "mkv"])
+def test_a_makemkv_crash_does_not_write_the_disc_off(
+        where, fake_makemkv, video_factory, settings, tmp_path):
+    """Both places it can crash. Reading the titles used to record the disc
+    as unreadable; copying used to spend its one attempt — and so would a key
+    lapsing mid-copy. Either way the disc was never looked at again, by a
+    MakeMKV that would have worked."""
+    image = tmp_path / "Film.iso"
+    shutil.copy(video_factory("src.mkv", seconds=4), image)
+
+    settings.policy.disc_action = "convert"
+    settings.makemkv.enabled = True
+    settings.makemkv.min_title_seconds = 1
+    settings.makemkv.command = fake_makemkv({"crash": where, "titles": [
+        {"index": 0, "duration": "0:00:04", "file": str(image)}]})
+
+    row = insert(image)
+    result, info = check_file(str(image), settings)
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("convert", "disc image"))
+
+    assert not out["ok"]
+    assert "crashed" in out["message"]
+    stored = db.q1("SELECT convert_skipped s, convert_attempts a "
+                   "FROM files WHERE path=?", (str(image),))
+    assert stored["s"] is None
+    assert (stored["a"] or 0) == 0
+    assert db.q1("SELECT COUNT(*) n FROM activity "
+                 "WHERE event='makemkv_unavailable'")["n"] == 1
+    assert image.exists()
+    assert not list(tmp_path.glob("*.unfuckarr.*")), "the half-copy is gone"
+
+
+# -- the key wrapper ------------------------------------------------------
+
+WRAPPER = (Path(__file__).resolve().parent.parent
+           / "docker" / "makemkv" / "makemkvcon-wrapper.sh")
+FORUM_KEY = "T-" + "Ab3x" * 16
+
+# What MakeMKV leaves behind when it removes an expired key itself — the live
+# file on 2026-10-13, which had been like this since 10-05.
+EMPTIED_BY_MAKEMKV = textwrap.dedent("""\
+    #
+    # MakeMKV settings file, written by MakeMKV v1.18.4 linux(x64-release)
+    #
+
+    sdf_Stop = ""
+""")
+
+
+@pytest.fixture
+def wrapper(tmp_path):
+    """Run the real wrapper with the forum and makemkvcon stubbed out."""
+    import subprocess
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "forum-calls"
+    curl = bin_dir / "curl"
+    curl.write_text(f'#!/bin/sh\necho x >> "{calls}"\n'
+                    f'echo "<code>{FORUM_KEY}</code>"\n')
+    real = bin_dir / "real-makemkvcon"
+    real.write_text('#!/bin/sh\necho "ran $*"\n')
+    for stub in (curl, real):
+        stub.chmod(0o755)
+    home = tmp_path / "home"
+    (home / ".MakeMKV").mkdir(parents=True)
+    settings_conf = home / ".MakeMKV" / "settings.conf"
+
+    def run() -> int:
+        proc = subprocess.run(
+            ["sh", str(WRAPPER), "-r", "info", "disc:9999"],
+            env={"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(home),
+                 "MAKEMKVCON_REAL": str(real)},
+            capture_output=True, text=True, check=True)
+        assert proc.stdout.strip() == "ran -r info disc:9999"
+        return len(calls.read_text().splitlines()) if calls.exists() else 0
+
+    return run, settings_conf
+
+
+def test_a_key_makemkv_removed_is_fetched_again_at_once(wrapper):
+    """The file had just been rewritten, so by age alone it was fresh — and
+    stayed keyless for eight days while every conversion was refused."""
+    run, conf = wrapper
+    conf.write_text(EMPTIED_BY_MAKEMKV)
+
+    assert run() == 1
+    text = conf.read_text()
+    assert f'app_Key = "{FORUM_KEY}"' in text
+    assert 'sdf_Stop = ""' in text, "the rest of the file is kept"
+
+
+def test_a_fresh_key_is_not_fetched_again(wrapper):
+    run, conf = wrapper
+    conf.write_text(EMPTIED_BY_MAKEMKV + 'app_Key = "T-already-here"\n')
+    assert run() == 0
+    assert "T-already-here" in conf.read_text()
+
+
+def test_a_stale_key_is_refreshed(wrapper):
+    import os
+    import time
+
+    run, conf = wrapper
+    conf.write_text('app_Key = "T-last-month"\n')
+    old = time.time() - 10 * 86400
+    os.utime(conf, (old, old))
+    assert run() == 1
+    assert FORUM_KEY in conf.read_text()
+    assert "T-last-month" not in conf.read_text()
+
+
 # -- helpers --------------------------------------------------------------
 
 def insert(path: Path, **extra) -> dict:
@@ -501,13 +645,27 @@ def insert(path: Path, **extra) -> dict:
 FAKE = textwrap.dedent('''\
     #!/usr/bin/env python3
     """A stand-in for makemkvcon: same robot protocol, real files out."""
-    import json, os, shutil, sys
+    import json, os, shutil, signal, sys
     from pathlib import Path
 
     plan = json.loads(Path(os.environ["FAKE_MAKEMKV_PLAN"]).read_text())
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     print('MSG:1005,0,1,"MakeMKV v1.17.7 linux(x64-release) started",'
           '"%1 started","MakeMKV v1.17.7 linux(x64-release)"')
+
+    # MakeMKV 2.0.0 on every Blu-ray image tried: these two lines, then a
+    # segfault. Only for an image, as there — `info disc:9999` ran normally.
+    if (plan.get("crash") and args and args[0] == plan["crash"]
+            and len(args) > 1 and args[1].startswith("iso:")):
+        print('MSG:3007,0,0,"Using direct disc access mode",'
+              '"Using direct disc access mode"')
+        print('MSG:3305,0,0,"AACS directory not present, assuming '
+              'unencrypted disc","AACS directory not present, assuming '
+              'unencrypted disc"')
+        if args[0] == "mkv":
+            Path(args[3], "title_t00.mkv").write_bytes(b"half a film")
+        sys.stdout.flush()
+        os.kill(os.getpid(), signal.SIGSEGV)
 
     if plan.get("message"):
         print('MSG:5021,0,1,"%s","%%1",""' % plan["message"])

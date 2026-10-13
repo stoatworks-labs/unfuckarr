@@ -18,7 +18,7 @@
 # none of this runs at all.
 set -eu
 
-REAL=/usr/bin/makemkvcon
+REAL="${MAKEMKVCON_REAL:-/usr/bin/makemkvcon}"
 SETTINGS_DIR="${HOME:-/config/.home}/.MakeMKV"
 SETTINGS="$SETTINGS_DIR/settings.conf"
 BETA_URL="https://forum.makemkv.com/forum/viewtopic.php?f=5&t=1053"
@@ -39,9 +39,18 @@ write_key() {
     mv "$SETTINGS.new" "$SETTINGS"
 }
 
+# The age alone is not enough. When a key expires MakeMKV removes it *itself*
+# and rewrites settings.conf, so the file that has just lost its key is also
+# the freshest it has ever been — and an age check then leaves it keyless for
+# the whole MAX_AGE_DAYS. Live: the key was removed on 2026-10-05, 1.18.4 still
+# converted a disc without one on 10-08, and by 10-13 it answered "This
+# application version is too old" to every call — while the key on the forum
+# made the same 1.18.4 read discs normally. With no key there is nothing to
+# fall back to, so it is fetched on every call until there is one.
 if [ -n "${MAKEMKV_APP_KEY:-}" ]; then
     [ -f "$SETTINGS" ] && grep -q "$MAKEMKV_APP_KEY" "$SETTINGS" || write_key "$MAKEMKV_APP_KEY"
-elif [ ! -f "$SETTINGS" ] || [ -n "$(find "$SETTINGS" -mtime "+$MAX_AGE_DAYS" 2>/dev/null)" ]; then
+elif [ ! -f "$SETTINGS" ] || ! grep -q '^app_Key' "$SETTINGS" \
+        || [ -n "$(find "$SETTINGS" -mtime "+$MAX_AGE_DAYS" 2>/dev/null)" ]; then
     KEY="$(curl -fsSL --max-time 30 "$BETA_URL" 2>/dev/null \
            | grep -oE 'T-[A-Za-z0-9@_%+/-]{40,}' | head -1 || true)"
     if [ -n "$KEY" ]; then

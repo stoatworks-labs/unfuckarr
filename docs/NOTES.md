@@ -1132,7 +1132,8 @@ version under disc conversion is not something to slip in with an unrelated fix,
 change — between `61b00de` and `5a935be` only the Python package changed (no `web/`,
 requirements, entrypoint or base-image change) — and it keeps MakeMKV 1.18.4. Labelled
 `com.stoatworks.overlay-of=rollback-2026-10-12`. **The next real rebuild has to bump
-`MAKEMKV_VERSION` and verify a conversion first.**
+`MAKEMKV_VERSION` and verify a conversion first.** → **It cannot: 2.0.0 segfaults on every
+Blu-ray image.** See the next section; the overlay is now `docker/makemkv/Dockerfile.overlay`.
 
 **Counters.** With the container stopped, as uid 99 from a throwaway container:
 
@@ -1167,3 +1168,105 @@ whatever the arrivals go on to do), which is old behaviour. Expect `arrival_chec
 "none"`; a `transcode_no_op` warning anywhere means `decide` and `plan` disagree again. The
 first scheduled scan under all of this is **18:01 on 10-13**, with ~4,000 released files — about
 1,900 of them audio-only adds, 667 of them AVI → HEVC VAAPI encodes. It will run for days.
+
+## 2026-10-13: MakeMKV 2.0.0 cannot open a Blu-ray image — the bump that was not made
+
+The job was "bump `MAKEMKV_VERSION` to whatever the PPA has, check the parser against it, verify
+a conversion, merge". The verification failed at the first disc, so **the pin was not bumped**.
+What was found instead, all measured on lilnasx from throwaway containers with `/media`
+mounted read-only (`unfk`, its config and the library were not touched):
+
+**The PPA.** `~heyarje/makemkv-beta` carries only `2.0.0-1~noble` (amd64 + arm64, published
+09-26). The 1.18.4 noble publications were superseded on 09-27 and Launchpad has **already
+purged their files** (`binaryFileUrls` is empty) — so there is no 1.18.4 for noble anywhere
+except the local images on lilnasx. **Keep `unfuckarr-makemkv:rollback-2026-10-12`** (and the
+older rollback tags): they are now the only copies. www.makemkv.com is up again and lists
+2.0.0 (20.9.2026) as current, with 1.18.4 still under `/download/old/`.
+
+**2.0.0 builds, and segfaults on every image.** `docker build --build-arg
+MAKEMKV_VERSION=2.0.0-1~noble` → `unfuckarr-makemkv:makemkv2-test` (`c3505691f10b`) is clean,
+and `info disc:9999` is line-for-line the shape 1.18.4 prints (`MSG:1005` banner,
+`MakeMKV v2.0.0 linux(x64-release)`, 5074, 5042, 16× `DRV`, 5010, `TCOUNT:0`). But
+`info iso:` on Mortal Kombat: Annihilation and Jurassic World Rebirth exits **139** after
+`MSG:3007 Using direct disc access mode` and `MSG:3305 AACS directory not present, assuming
+unencrypted disc`; the kernel logs `segfault at 0 … error 4 in makemkvcon[5a6422,…]` — a NULL
+read in makemkvcon itself, same offset every run. Same through the real entrypoint (uid 99
+*with* a passwd entry), as root, with `LD_LIBRARY_PATH` cleared, with 1.18.4's downloaded SDF
+copied in, and in a **bare `ubuntu:24.04`** with only the PPA — so it is not this image.
+1.18.4 with the same key reads both in 3–5 s (`TCOUNT:3`, 436 lines; 6,357 lines). Upstream
+has the identical report, same last two messages:
+[flathub/com.makemkv.MakeMKV#123](https://github.com/flathub/com.makemkv.MakeMKV/issues/123),
+open since 10-04, no response.
+
+So the parser check could only cover what 2.0.0 emits before it dies — the banner, the `MSG`
+record shape and `DRV` — and those are unchanged. **No CINFO/TINFO has ever been seen from
+2.0**; the attribute ids remain verified on 1.18.4 only. Re-check them the day a 2.0.x opens an
+image.
+
+**What deploying 2.0.0 would have done**, which is the part worth fixing regardless: a crash
+printed no TINFO, `titles` raised "no titles reported", and `_convert` wrote **`convert_skipped`
+permanently** — two discs a scan, for a bug in the tool. `makemkv.available` would not have
+caught it (2.0.0 answers `disc:9999` normally). Fixed: `makemkv.Crashed` (an `Unavailable`)
+for a signal death, negative or 128+N through a shim, from `available`, `titles` and `rip`;
+the rip handler now lets an `Unavailable` through before it counts the disc's one attempt —
+which also means a key lapsing mid-copy no longer spends it. Verified against the real crash:
+unfuckarr's own `check_file` → `decide` → `apply` in the 2.0.0 container gave `makemkv_unavailable:
+makemkvcon crashed (SIGSEGV) after: AACS directory not present…`, `convert_skipped` NULL,
+`convert_attempts` 0.
+
+**Live conversions were already stopped, by the key — and the wrapper could not see it.** The
+live `settings.conf` has had **no `app_Key` line since 10-05 13:05**: MakeMKV removed the expired
+key itself and rewrote the file — which made it look *freshly written* to the wrapper's
+`find -mtime +7`, so nothing would refetch until the file was 8 days old (~10-13 13:05). 1.18.4
+still converted Fast & Furious keyless on 10-08; by today `docker exec … /usr/bin/makemkvcon`
+answers `MSG:5021 This application version is too old`. With the forum's key the same 1.18.4
+reads discs normally. Reproduced from a copy of the live file: old wrapper → no fetch → 5021.
+Fixed: the wrapper refetches whenever the file has no `app_Key`. The **unfixed live wrapper
+should heal itself at ~13:05 today**, before the 18:01 scan, if the forum fetch works.
+
+**Then something else stops them anyway** — not fixed here, chipped as its own task: the two
+conversion slots per scan have gone to **F9 and The Blues Brothers** every night since 10-09.
+Both carry `convert_attempts=1` and `_convert` refuses them, but the scanner spends the slot
+before it asks (`convert_cap_reached` against Jurassic World Rebirth on 10-08…10-12). Same
+trap invariant 25 fixed for `research`. And the Fast & Furious `convert_done` logged
+`"saved": -58232878315`: the image's row had no size, so the conversion took 58 GB *off*
+`bytes_saved` — also chipped.
+
+**What did pass: a full conversion on 1.18.4, from the live key state.** What an overlay rebuild
+would ship (rollback-2026-10-12's MakeMKV + this branch's code and wrapper), started
+from a copy of the live keyless `settings.conf`, ran unfuckarr's own `check_file` → `decide` →
+`Remediator.apply` on **Jurassic World Rebirth** — the disc the live scanner reaches next —
+bind-mounted read-only into a scratch folder, `keep_disc_image` on. The wrapper fetched a key on
+the first call; MakeMKV listed **77 titles**; `select` took title 0, **8020 s, 20 chapters**;
+the whole apply, feature and extras, took **1,307 s** (≈ 80 MB/s off the array, sharing it
+with the live shrink worker).
+Output **76.3 GB HEVC 3840x2160 10-bit, `smpte2084`** — HDR untouched — TrueHD 7.1 and seven
+more audio tracks with their languages, five PGS tracks, 20 chapters, **8020.01 s against the
+8020 s promised** and 8019.97 s measured off the disc by `disc.py`. `_verify_conversion`
+passed, the row moved to the `.mkv` with `converted_from` set, 24 extras placed.
+
+**And it found the extras heuristic's real failure** — chipped, not fixed: those 24 extras are
+**31.6 GB**, so feature + extras = **107.9 GB from a 94.5 GB image**. The playlists are
+*nested*: title 7 (56 min, "play all") is segments 482–499, title 19 is 497–499, 13 is 498–499,
+71 is 498 alone — `select` dedupes only an *identical* map, so segment 498 was written four
+times, and 24 is `max_extras` (6 more were turned away). On the live box (`keep_disc_image`
+off) converting this disc would grow the library by 13 GB.
+
+**The rebuild recipe, until a 2.0.x is verified:** `docker/makemkv/Dockerfile.overlay`
+(new) — `FROM` a local image whose MakeMKV works, `COPY` `unfuckarr/`, `web/` and the key
+wrapper, `import unfuckarr.api`. Built on lilnasx from this branch as
+`unfuckarr-makemkv:overlay-test` (`e53ca6cd27a0`): 1.18.4 kept, fixed wrapper at mode 755,
+`Crashed` present. Exact only while `requirements.txt`, `docker/entrypoint.sh` and the
+`Dockerfile` are what they were for the image it sits on — none has changed since `61b00de`,
+which `rollback-2026-10-12` was built from. `docker/makemkv/Dockerfile` stays pinned to
+1.18.4 and fails at `apt-get install` on purpose: a build that fails is better than one that
+produces an image converting nothing.
+
+Options for later, none taken: wait for a 2.0.x; or build 1.18.4 from makemkv.com's
+`/download/old/` tarballs (sha256-pinned), which would make the recipe reproducible again —
+but 1.18.4 now depends on the beta key alone, and how long the forum's keys keep accepting an
+old version is unknown.
+
+Left on lilnasx for inspection, safe to delete: images `unfuckarr-makemkv:makemkv2-test` and
+`unfuckarr-makemkv:overlay-test`; scratch at `/mnt/user/appdata/.makemkv2-test/` (the raw
+`info` captures for both versions are in `out/`; the 108 GB of conversion output is deleted).

@@ -1,0 +1,32 @@
+# unfuckarr + MakeMKV, without reinstalling MakeMKV
+#
+# For when docker/makemkv/Dockerfile cannot produce a working MakeMKV — as on
+# 2026-10-13, when the PPA had dropped 1.18.4 and its 2.0.0 segfaulted on every
+# Blu-ray image. This takes a local image whose MakeMKV is known to work and
+# replaces only what unfuckarr ships on top of it:
+#
+#   docker build -f docker/makemkv/Dockerfile.overlay \
+#       --build-arg MAKEMKV_IMAGE=unfuckarr-makemkv:rollback-2026-10-12 \
+#       -t unfuckarr-makemkv:edge .
+#
+# Exact only while the rest of the image has not moved underneath: no change to
+# requirements.txt, docker/entrypoint.sh or the base image's ffmpeg since the
+# image named here was built. Check `git diff <its revision> -- requirements.txt
+# docker/entrypoint.sh Dockerfile` first; anything there needs the real build.
+# The label records which image this sits on, so a later rebuild can tell.
+#
+# Same rule as the real one: contains MakeMKV, never push it.
+
+ARG MAKEMKV_IMAGE=unfuckarr-makemkv:rollback-2026-10-12
+FROM ${MAKEMKV_IMAGE}
+ARG MAKEMKV_IMAGE
+
+COPY unfuckarr/ /app/unfuckarr/
+COPY web/ /app/web/
+COPY --chmod=755 docker/makemkv/makemkvcon-wrapper.sh /usr/local/bin/makemkvcon
+
+# A broken copy otherwise only shows up as a 500 after the swap.
+RUN python -c "import unfuckarr.api" && test -x /usr/bin/makemkvcon
+
+LABEL com.stoatworks.overlay-of="${MAKEMKV_IMAGE}" \
+      com.stoatworks.redistributable="false"
