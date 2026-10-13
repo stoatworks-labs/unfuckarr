@@ -1163,23 +1163,15 @@ class Remediator:
             self._set_job(job_id, "done", 1.0, blocked)
             return {"action": "flag", "ok": True, "message": blocked}
 
-        if file_row.get("converted"):
-            msg = "already converted"
-            self._set_job(job_id, "done", 1.0, msg)
-            return {"action": "flag", "ok": True, "message": msg}
-        if file_row.get("convert_skipped") and not decision.force:
-            msg = f"already assessed and left alone: {file_row['convert_skipped']}"
-            self._set_job(job_id, "done", 1.0, msg)
-            return {"action": "flag", "ok": True, "message": msg}
+        refused = self.convert_refused(file_row, force=decision.force)
+        if refused is not None:
+            self._set_job(job_id, "done", 1.0, refused)
+            return {"action": "flag", "ok": True, "message": refused}
         if decision.force:
             db.ex("UPDATE files SET convert_skipped=NULL, convert_attempts=0 "
                   "WHERE path=?", (path,))
             file_row["convert_skipped"] = None
             file_row["convert_attempts"] = 0
-        if (file_row.get("convert_attempts") or 0) >= MAX_CONVERT_ATTEMPTS:
-            msg = "a previous conversion of this disc failed — not trying again"
-            self._set_job(job_id, "done", 1.0, msg)
-            return {"action": "flag", "ok": True, "message": msg}
 
         # Whether the configured command runs at all, asked every time: the
         # failure this catches is an expired beta key, which arrives one
@@ -1454,6 +1446,35 @@ class Remediator:
                 db.log("convert_extra_unplaced", "warn", source,
                        {"title": title.index, "error": str(exc)})
         return placed
+
+    @staticmethod
+    def convert_refused(file_row: dict[str, Any],
+                        force: bool = False) -> str | None:
+        """Why this disc will not be converted, ever, or None.
+
+        Split out from `_convert` for the reason `research_blocked` is: the
+        scan has to ask *before* spending one of its capped slots. `decide`
+        cannot see the file's row, so it keeps deciding `convert` for a disc
+        that is already done or written off, and the scan orders the backlog
+        biggest first — so the same written-off discs head it every night.
+        Live, 2026-10-08 to 10-12: two discs that had each failed once took
+        both of the pass's two slots on every scan, and nothing behind them
+        was converted for five days.
+
+        ``force`` (the UI asking for this disc specifically) reopens a disc
+        that was skipped or failed, because whatever stopped it may since have
+        been fixed. It never reopens one marked converted: the row moved with
+        the conversion, so it now describes the Matroska file that came out.
+        """
+        if file_row.get("converted"):
+            return "already converted"
+        if force:
+            return None
+        if file_row.get("convert_skipped"):
+            return f"already assessed and left alone: {file_row['convert_skipped']}"
+        if (file_row.get("convert_attempts") or 0) >= MAX_CONVERT_ATTEMPTS:
+            return "a previous conversion of this disc failed — not trying again"
+        return None
 
     def _skip_convert(self, job_id: int, file_row: dict[str, Any],
                       reason: str) -> dict[str, Any]:

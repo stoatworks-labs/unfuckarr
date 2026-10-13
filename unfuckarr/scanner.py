@@ -558,6 +558,15 @@ class Scanner:
                         capped_researches = True
                     continue
             elif decision.action == "convert":
+                # The same trap as the cooldown above, and it has bitten:
+                # `decide` cannot see that a disc was already converted,
+                # written off or failed once, and the biggest-first order puts
+                # the same written-off discs at the head of every pass. Asked
+                # only inside `apply`, two of them took both slots every night
+                # and nothing behind them was converted for five days.
+                if self.remediator.convert_refused(
+                        row, force=decision.force) is not None:
+                    continue
                 if conversions >= s.policy.max_conversions_per_scan:
                     if not capped_conversions:
                         db.log("convert_cap_reached", "info", row["path"],

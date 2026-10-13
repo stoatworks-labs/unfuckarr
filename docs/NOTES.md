@@ -1167,3 +1167,29 @@ whatever the arrivals go on to do), which is old behaviour. Expect `arrival_chec
 "none"`; a `transcode_no_op` warning anywhere means `decide` and `plan` disagree again. The
 first scheduled scan under all of this is **18:01 on 10-13**, with ~4,000 released files — about
 1,900 of them audio-only adds, 667 of them AVI → HEVC VAAPI encodes. It will run for days.
+
+## 2026-10-13: two refused discs had been spending the whole conversion cap
+
+The last real conversion was Fast & Furious on 10-08. Every scan since logged
+`convert_cap_reached` against Jurassic World Rebirth, the next disc in line, and the only two
+`convert` jobs in the 10-12 17:01 scan were `F9 (2021) BR-DISK.iso` and `The Blues Brothers (1980)
+BR-DISK.iso` — both `convert_attempts` 1, both refused inside `apply` with *a previous conversion
+of this disc failed — not trying again*. (Read-only queries against the live DB.)
+
+Why: `decide` cannot see the file row, so it keeps deciding `convert` for a disc `_convert` will
+refuse (converted, `convert_skipped`, or attempts ≥ `MAX_CONVERT_ATTEMPTS`). The scanner counted
+the slot whatever `apply` returned, and its biggest-first order put the same two written-off discs
+at the head of every pass, so with `max_conversions_per_scan` 2 nothing behind them could ever be
+reached. It is exactly the trap invariant 25 had already fixed for `research`'s cooldown, one
+branch further down the same loop.
+
+Fix: `Remediator.convert_refused(row, force=)` holds the three refusals; `Scanner._remediate`
+asks it before the cap and `continue`s without spending a slot, and `_convert` asks it again as
+the backstop (the watch folder and the UI go straight to `apply`). `force` reopens a skipped or
+failed disc and never a converted one, as before. Three tests beside the cap tests; the two
+scanner ones were run against the old `scanner.py` first and failed there — the first with
+`applied == [F9, Blues Brothers]`, i.e. the live shape. AGENTS.md invariant 20.
+
+**Not deployed.** The live box is still on `5a935be`. The 84 discs waiting on the cap stay
+waiting until it is — and the overlay recipe from the entry above (the PPA has moved to MakeMKV
+2.0.0) is still the only way to ship it without a MakeMKV version change.
