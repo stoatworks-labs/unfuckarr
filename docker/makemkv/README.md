@@ -6,12 +6,24 @@ not be pushed to a public registry. This directory builds that image locally.
 
 MakeMKV comes from the long-running `~heyarje/makemkv-beta` PPA rather than
 from makemkv.com's source tarballs. That was not the first choice — building
-from source was — but www.makemkv.com answers Cloudflare 525 for everyone at
-the time of writing, so the tarballs cannot be fetched from anywhere. The PPA
-carries the same 1.18.4 for noble, which is what this image is, on both amd64
-and arm64. It is added as a *signed* apt source using the PPA's own key, so apt
-verifies what it installs and resolves the dependencies against Ubuntu's own
-archive.
+from source was — but www.makemkv.com answered Cloudflare 525 for everyone in
+August 2026, so the tarballs could not be fetched from anywhere. It is added as
+a *signed* apt source using the PPA's own key, so apt verifies what it installs
+and resolves the dependencies against Ubuntu's own archive.
+
+> **As of 2026-10-13 the PPA has no MakeMKV this image can use.** It keeps one
+> version per series and now carries only `2.0.0-1~noble` (Launchpad has
+> already purged the 1.18.4 noble files), and **MakeMKV 2.0.0 segfaults on every
+> Blu-ray image** — a NULL read inside `makemkvcon` straight after
+> `AACS directory not present, assuming unencrypted disc`. Measured on real
+> images from the live library, in this image and in a bare `ubuntu:24.04`,
+> while 1.18.4 reads the same images; upstream has the same report
+> ([flathub/com.makemkv.MakeMKV#123](https://github.com/flathub/com.makemkv.MakeMKV/issues/123)).
+> So `Dockerfile` is left pinned to 1.18.4 and fails at `apt-get install`,
+> deliberately: bumping the pin produces an image that converts nothing. Until
+> a 2.0.x passes `makemkvcon -r info iso:<a real Blu-ray image>` — it must reach
+> `TCOUNT` — rebuild with [`Dockerfile.overlay`](Dockerfile.overlay) instead
+> (below).
 
 Note what that changes about the licence position: the PPA is a third party
 redistributing MakeMKV's proprietary half. Using it is a decision for whoever
@@ -52,9 +64,18 @@ images are Alpine, and musl-linked binaries will not run on this one.
 
 MakeMKV is free while in beta, and the beta key expires roughly monthly. The
 `makemkvcon` on the PATH here is a wrapper that fetches a current key when the
-one on disk is missing or more than a week old, and writes it to
-`$HOME/.MakeMKV/settings.conf` — `/config/.home/.MakeMKV/settings.conf`, which
-is inside appdata and survives a recreate.
+file on disk has no key in it, or is missing, or is more than a week old, and
+writes it to `$HOME/.MakeMKV/settings.conf` —
+`/config/.home/.MakeMKV/settings.conf`, which is inside appdata and survives a
+recreate.
+
+"Has no key in it" is the case that matters. When a key expires MakeMKV removes
+it itself and rewrites the file, so by age alone the file looks freshly written
+— and before the wrapper checked for the key, it stayed keyless for eight days.
+That happened live: the key went on 2026-10-05, 1.18.4 carried on without one
+until at least 10-08, and by 10-13 it refused every call with
+`This application version is too old`, while the key on the forum made the
+same 1.18.4 read discs normally.
 
 Set `MAKEMKV_APP_KEY` to a purchased key and the wrapper writes that instead
 and never contacts the forum.
@@ -80,9 +101,28 @@ the Ubuntu series suffix, and `UBUNTU_SERIES` has to match the base image
 (`noble` for 24.04).
 
 Rebuild when unfuckarr updates — the whole point of the derived image is that
-it tracks the published one rather than forking it — and when MakeMKV releases,
-which is roughly monthly alongside the key. A rebuild is not what fixes an
-expired key; the wrapper does that at runtime.
+it tracks the published one rather than forking it. A new MakeMKV is a reason
+to *try* a rebuild, not to deploy one: check it opens a real image first (see
+above). A rebuild is not what fixes an expired key; the wrapper does that at
+runtime.
+
+### When the PPA has nothing usable: the overlay
+
+[`Dockerfile.overlay`](Dockerfile.overlay) keeps the MakeMKV of a local image
+known to work and replaces only the application — `unfuckarr/`, `web/` and the
+key wrapper:
+
+```sh
+docker build -f docker/makemkv/Dockerfile.overlay \
+    --build-arg MAKEMKV_IMAGE=unfuckarr-makemkv:rollback-2026-10-12 \
+    -t unfuckarr-makemkv:edge .
+```
+
+It is exact only while nothing else has moved: `requirements.txt`,
+`docker/entrypoint.sh` and the base image's ffmpeg must be what they were when
+the image it sits on was built. Anything there needs the real build, which
+means a MakeMKV that works. Keep the image it names — deleting the last local
+image with a working MakeMKV in it leaves nothing to overlay.
 
 ## What has been checked
 
@@ -112,20 +152,40 @@ The key wrapper is verified end to end against the same image: it fetches when
 there is no key, leaves a fresh one alone, honours `MAKEMKV_APP_KEY` without
 contacting anything, refreshes a stale one, never leaves two `app_Key` lines,
 and when the forum is unreachable it runs anyway, warns on stderr, keeps the
-existing key and bumps the mtime so it does not retry on every call.
+existing key and bumps the mtime so it does not retry on every call. Since
+2026-10-13 it also refetches into a file MakeMKV has emptied — verified by
+starting a throwaway container from a copy of the live, keyless
+`settings.conf`: the old wrapper left it keyless and 1.18.4 answered "too old";
+the new one fetched a key on the first call. The tests run the wrapper itself
+against that same file.
+
+### Since then (2026-10-13)
+
+A full conversion ran through unfuckarr's own `check_file` → `decide` →
+`apply` on a 94.5 GB UHD Blu-ray image (bind-mounted read-only, output to
+scratch), on 1.18.4, starting from a copy of the live box's keyless
+`settings.conf`: the wrapper fetched a key, MakeMKV listed 77 titles, and the
+8020 s, 20-chapter feature came out as HEVC 2160p 10-bit PQ with TrueHD 7.1,
+8020.01 s against the 8020 s promised, with 24 extras — in 1,307 s.
+
+MakeMKV 2.0.0 did not get that far: it segfaults on `info iso:` for every
+Blu-ray image tried (see the top of this file).
 
 ## What has not
-
-**No disc has been converted end to end.** Everything above is the read path
-and a single short extra. A real conversion replaces a 90 GB image with the
-feature, writes the extras, recycles the original and tells the *arr — none of
-which has run against real media.
 
 **No seamless-branching disc has been tested.** Every feature measured so far
 is a single segment, which the old largest-`.m2ts` heuristic would also have
 found. The discs that justify MakeMKV are the ones not yet tried.
 
-## Do not push this image
+**The overlap-based extras selection has not been through a rip.** On the
+disc above the old selection wrote 31.6 GB of extras from nested playlists (a
+56 min "play all" and featurettes that are subsets of it), leaving the feature
+plus extras 13 GB larger than the image. `select` now keeps an extra only for
+what it adds; replayed against that disc's real output it keeps 14 extras,
+about 13 GB by MakeMKV's estimate — an estimate until a conversion writes them.
+
+**Nothing from MakeMKV 2.0 has been parsed**, because it has never got as far
+as printing a title.
 
 ## Do not push this image
 

@@ -27,10 +27,21 @@ FROM ${BASE_IMAGE}
 
 # MakeMKV comes from the long-running Launchpad PPA rather than being built
 # from makemkv.com's tarballs. Not a preference — building from source is the
-# obvious thing and was the first attempt — but www.makemkv.com answers
-# Cloudflare 525 for everyone at the time of writing, so the tarballs cannot be
-# fetched from anywhere. The PPA carries the same 1.18.4 for noble, which is
-# what this image is, on both amd64 and arm64.
+# obvious thing and was the first attempt — but www.makemkv.com answered
+# Cloudflare 525 for everyone in August 2026, so the tarballs could not be
+# fetched from anywhere.
+#
+# ⚠️ As of 2026-10-13 this does not build, and must not be "fixed" by bumping
+# the pin. The PPA keeps one version per series and now carries only
+# 2.0.0-1~noble; Launchpad has already purged the 1.18.4 noble files. And
+# MakeMKV 2.0.0 segfaults on every Blu-ray image tried — a NULL read inside
+# makemkvcon, straight after "AACS directory not present" — on the live
+# library, in this image and in a bare ubuntu:24.04, while 1.18.4 reads the
+# same images (upstream: github.com/flathub/com.makemkv.MakeMKV/issues/123).
+# An image built on 2.0.0 converts nothing. Until a 2.0.x is verified with
+# `makemkvcon -r info iso:<a real Blu-ray image>` reaching TCOUNT, rebuild with
+# docker/makemkv/Dockerfile.overlay, which keeps the MakeMKV of a known-good
+# local image and replaces only the application.
 #
 # It is added as a signed apt source, with the PPA's own key, rather than
 # fetching .deb files over HTTPS and hoping: apt then verifies what it

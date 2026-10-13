@@ -1377,10 +1377,7 @@ class Remediator:
         try:
             version = makemkv.available(cfg.command)
         except makemkv.MakeMKVError as exc:
-            msg = f"MakeMKV is not usable: {exc}"
-            self._set_job(job_id, "failed", 0, msg, error=msg)
-            db.log("makemkv_unavailable", "error", path, msg)
-            return {"action": "flag", "ok": False, "message": msg}
+            return self._makemkv_unusable(job_id, path, exc)
 
         # Measured off the disk, here, before anything moves the image: it is
         # what the saving is counted against at the end. The row is a snapshot
@@ -1429,9 +1426,7 @@ class Remediator:
             found = makemkv.titles(path, cfg.command, cfg.min_title_seconds,
                                    timeout=INFO_TIMEOUT_SECONDS)
         except makemkv.Unavailable as exc:
-            msg = f"MakeMKV is not usable: {exc}"
-            self._set_job(job_id, "failed", 0, msg, error=msg)
-            return {"action": "flag", "ok": False, "message": msg}
+            return self._makemkv_unusable(job_id, path, exc)
         except makemkv.MakeMKVError as exc:
             found, unreadable = [], f"MakeMKV cannot read this image: {exc}"
 
@@ -1482,6 +1477,11 @@ class Remediator:
                                    cfg.min_title_seconds,
                                    timeout=cfg.timeout_hours * 3600,
                                    on_progress=on_progress, cancel=cancel)
+        except makemkv.Unavailable as exc:
+            # Ahead of the clause below, which counts the one attempt a disc
+            # gets: a key lapsing mid-copy, or a makemkvcon that crashed, is
+            # not the disc's fault (invariant 20).
+            return self._makemkv_unusable(job_id, path, exc)
         except makemkv.MakeMKVError as exc:
             if cancel.is_set():
                 # A user cancel says nothing about the disc, exactly as it does
@@ -1689,6 +1689,14 @@ class Remediator:
                 db.log("convert_extra_unplaced", "warn", source,
                        {"title": title.index, "error": str(exc)})
         return placed
+
+    def _makemkv_unusable(self, job_id: int, path: str,
+                          exc: Exception) -> dict[str, Any]:
+        """The installation failed, not the disc: nothing is recorded on the row."""
+        msg = f"MakeMKV is not usable: {exc}"
+        self._set_job(job_id, "failed", 0, msg, error=msg)
+        db.log("makemkv_unavailable", "error", path, msg)
+        return {"action": "flag", "ok": False, "message": msg}
 
     @staticmethod
     def convert_refused(file_row: dict[str, Any],

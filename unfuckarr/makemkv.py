@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -106,6 +107,20 @@ class KeyExpired(Unavailable):
     Separate from every other failure because it is temporary and global: it
     says nothing about the disc, and recording it against one would write that
     disc off permanently for a reason that a new key fixes.
+    """
+
+
+class Crashed(Unavailable):
+    """makemkvcon died on a signal instead of exiting.
+
+    A crash is the tool's fault, whatever it was reading, so it is treated the
+    way an expired key is: never recorded against the disc. Measured on
+    2026-10-13: MakeMKV 2.0.0 segfaults — a NULL read inside makemkvcon — on
+    every Blu-ray image it was pointed at, straight after "AACS directory not
+    present", while 1.18.4 reads the same images. Upstream has the same report.
+    Before this class that crash surfaced as "no titles reported", which the
+    caller records permanently, so each scan would have written off its two
+    discs for a bug the next MakeMKV release fixes.
     """
 
 
@@ -264,6 +279,31 @@ def _check_messages(lines: Iterable[str]) -> None:
             raise KeyExpired(text.strip())
 
 
+def _crash_signal(returncode: int | None) -> str | None:
+    """The signal that killed makemkvcon, or None if it exited.
+
+    Negative is Python reporting a signal directly; above 128 is a shell or a
+    `docker run` shim reporting one (139 is SIGSEGV), which `command` allows.
+    """
+    if returncode is None or 0 <= returncode <= 128:
+        return None
+    number = -returncode if returncode < 0 else returncode - 128
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return None
+
+
+def _check_crash(returncode: int | None, lines: Iterable[str]) -> None:
+    """Raise if makemkvcon was killed by a signal rather than exiting."""
+    name = _crash_signal(returncode)
+    if name is None:
+        return
+    last = _last_message(lines)
+    raise Crashed(f"makemkvcon crashed ({name})"
+                  + (f" after: {last}" if last else ""))
+
+
 def available(command: str, timeout: int = 60) -> str:
     """The version string, or raise.
 
@@ -274,6 +314,7 @@ def available(command: str, timeout: int = 60) -> str:
     proc = _run(argv, timeout)
     lines = (proc.stdout or "").splitlines() + (proc.stderr or "").splitlines()
     _check_messages(lines)
+    _check_crash(proc.returncode, lines)
     for line in lines:
         # MSG:1005 is the banner. Captured from a real makemkvcon 1.18.4:
         #
@@ -308,6 +349,9 @@ def titles(path: str, command: str, min_seconds: int = 120,
     proc = _run(argv, timeout)
     lines = (proc.stdout or "").splitlines()
     _check_messages(lines + (proc.stderr or "").splitlines())
+    # Before the titles are read, not only when there are none: a crash
+    # part-way through the listing leaves a list that looks complete.
+    _check_crash(proc.returncode, lines)
 
     found: dict[int, Title] = {}
     for line in lines:
@@ -620,6 +664,11 @@ def rip(path: str, title: Title, out_dir: str, command: str,
         for stray in produced:
             stray.unlink(missing_ok=True)
         raise MakeMKVError(killed)
+    if _crash_signal(proc.returncode):
+        # Whatever it wrote before dying is a partial file.
+        for stray in produced:
+            stray.unlink(missing_ok=True)
+        _check_crash(proc.returncode, tail)
     if not produced:
         raise MakeMKVError(_last_message(tail) or
                            f"makemkvcon exited {proc.returncode} without writing anything")

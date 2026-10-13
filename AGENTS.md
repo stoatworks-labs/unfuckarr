@@ -210,6 +210,15 @@ Break any of these and the failure is quiet and expensive.
     feature. Hence `makemkv.KeyExpired`, which is an `Unavailable`, and the
     availability check that runs before every conversion.
 
+    A `makemkvcon` killed by a signal is the same kind of failure:
+    `makemkv.Crashed`, also an `Unavailable`, whether it dies reading the
+    titles or part-way through the copy (where it would otherwise spend the
+    disc's one attempt). Not hypothetical: MakeMKV 2.0.0 segfaults on every
+    Blu-ray image in the live library, and before `Crashed` that read as "no
+    titles reported" — `convert_skipped`, permanently, two discs a scan. The
+    availability check does not catch it, because `info disc:9999` opens no
+    image and 2.0.0 answers it normally.
+
     Because those markers are permanent, **the scan must read them before it
     spends a conversion slot**, the same rule invariant 25 sets for the
     research cooldown. `decide` cannot see the row, so it goes on deciding
@@ -960,14 +969,14 @@ container's own ffmpeg:
   Building it also found that the application image ships no `curl`, which the
   key wrapper needs and whose absence is silent by design.
 
-- **No disc has ever been converted.** Every part of the path is exercised — the
-  robot-output parsing, the title selection, the duration checks, the extras
-  placement, the recycle and the swap — but against a stand-in that speaks
-  MakeMKV's protocol and copies files ffmpeg rendered, because MakeMKV cannot
-  be installed in CI. What that cannot prove is the only thing MakeMKV is here
-  for: that it picks the right playlist off a real Blu-ray with seamless
-  branching. Convert one disc by hand, with `keep_disc_image` on, and compare
-  the result against the image before trusting it with a library.
+- **Discs are converted live, but only single-segment ones have been seen.**
+  `disc_action` has been `convert` on the live instance since 2026-08-24, and
+  `totals.discs_converted` read 22 on 2026-10-13 (Fast & Furious on 10-08: a
+  107 min, 20-chapter feature and three extras placed in `extras/`). CI still
+  runs the path against a stand-in that speaks MakeMKV's protocol, because
+  MakeMKV cannot be installed there. What none of it proves is the only thing
+  MakeMKV is here for: that it picks the right playlist off a real Blu-ray with
+  seamless branching.
 - **The feature is still chosen by length and nothing more.** "The longest
   title is the feature" was right on every disc measured, and the discs where
   it will not be — an anthology, a TV season on one disc, a concert film with
@@ -989,8 +998,24 @@ container's own ffmpeg:
   is a 3–4 second title card. One deliberate loss: a 77-second piece reached
   only through a play-all (Rebirth's title 2) goes when the play-all does,
   because on its own it is under the 90-second floor.
-- **Nothing has been converted on the live library**, and the live instance's
-  `disc_action` default (`flag`) means nothing will be until someone sets it.
+- **MakeMKV 2.0.0 cannot open a Blu-ray image, so the image is not on it.**
+  Measured 2026-10-13 on the deployment target: the PPA's `2.0.0-1~noble`
+  builds cleanly and answers `info disc:9999` in exactly 1.18.4's shape, then
+  segfaults (exit 139, a NULL read inside `makemkvcon`) on `info iso:` against
+  two library Blu-rays — in this image and in a bare `ubuntu:24.04` — straight
+  after `AACS directory not present`, where 1.18.4 with the same key lists
+  them in seconds. So **no CINFO/TINFO from 2.0 has ever been seen**, and the
+  attribute ids `makemkv.py` reads are verified on 1.18.4 only. The PPA no
+  longer has 1.18.4 for noble at all, which is why
+  `docker/makemkv/Dockerfile.overlay` exists. What *was* run the same day, on
+  1.18.4 with this code, from a copy of the live box's keyless
+  `settings.conf`: the full `check_file` → `decide` → `apply` on a 94.5 GB
+  UHD image (Jurassic World Rebirth) — key fetched, 77 titles, 8020 s /
+  20-chapter feature verified to 0.01 s, HEVC 10-bit PQ and TrueHD intact,
+  24 extras placed, 1,307 s. That rip is also the one *written* measurement of
+  the old extras selection on this disc: 31.6 GB of extras on disk (MakeMKV
+  estimated 33.5), feature plus extras 13 GB *larger* than the image — the
+  case the overlap selection above was built for.
 - **No Unraid server has installed the CA template.** It is written against the CA conventions
   used elsewhere in this fleet (root `<Container version="2">`, no trailing colon on subcategory
   tokens, per-image `<Registry>` URL) and `scripts/validate_template.py` checks those in CI, but
