@@ -81,7 +81,11 @@ Break any of these and the failure is quiet and expensive.
    before the swap, and a re-check that still shows the findings the transcode was meant to
    clear — hygiene included, because a hygiene-triggered remux whose warnings survive has fixed
    nothing. Only a user cancel does not count, and a redownload resets the counter (the
-   replacement is a different file). At `MAX_FIX_ATTEMPTS` (2) `_transcode` refuses. Without
+   replacement is a different file). Nor does a stand-down: `_transcode_superseded` re-stats the
+   file against the probe the plan came from, and re-reads the counter, on getting the slot,
+   after the run and before the recycle. A file that moved meanwhile is not the one measured,
+   and a failed repair on it would otherwise fall through to a redownload of whatever replaced
+   it. At `MAX_FIX_ATTEMPTS` (2) `_transcode` refuses. Without
    this, a transcode that does not clear the finding is redone on *every* scan, for ever, with
    nothing in the log saying why — live proof: 86 identical remuxes of one film (2026-08),
    because the hygiene path and the failure paths never counted.
@@ -217,6 +221,14 @@ Break any of these and the failure is quiet and expensive.
     skipped or failed disc, never a converted one. Live, 2026-10-08 to 10-12:
     F9 and The Blues Brothers, each failed once, took both of the two nightly
     slots to be refused, and the 84 discs behind them waited five days.
+
+    For the same reason, a verdict is only recorded against the image it is
+    about. `_convert_superseded` re-reads the row and re-stats the image on
+    entry, after MakeMKV reads the structure, after the copy and before the
+    swap, and stands down with nothing written if either moved. The row check
+    includes `converted_from`, because with `keep_disc_image` on a conversion
+    leaves the image byte-for-byte as it was: a second job holding the old
+    row would copy the whole disc out again and count it twice.
 
 21. **The tool is never bundled, and that is a licence fact, not a preference.**
     MakeMKV's binary half is not redistributable, so a public image cannot ship
@@ -788,6 +800,12 @@ which is the safe direction but does nothing useful.
   offered it), a job that waited not re-shrinking what another just shrank, and a file that
   changed during the search or the encode being neither encoded nor replaced, with nothing
   counted — each run against the old source first and failing there.
+- **The same race for a transcode and a conversion.** A job that waited does not re-run its
+  plan on what another just transcoded, re-convert a disc another just converted (image
+  recycled or kept), or retry past a cap another job has just reached. A file or disc replaced
+  while queued for the slot, after its probe, while MakeMKV read it, during the remux, copy or
+  verification is never swapped. A failure on a replaced file is neither counted, written off,
+  nor redownloaded. Each was run against the old source first and failed there.
 - That VMAF actually discriminates: a near-lossless re-encode scores above 90 and CRF 51 below
   80, measured against media ffmpeg rendered.
 - **Disc images**, against ISO9660 volumes the tests assemble byte by byte (so no fixture and no

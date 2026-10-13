@@ -1404,3 +1404,84 @@ together with the conversion one in the entry above:
   **+552,590,100,397**; `files_shrunk` **− 48**.
 - Optionally the gap estimates: about −5.4 GB / −4 for gap 1, and an unknown −100 to −240 GB /
   −51 to −68 for gap 2.
+
+## 2026-10-13: a transcode or a conversion acted on the file it was handed, not the one there
+
+**The gap ee4bac2 left.** The claim in `apply` stops two jobs on one file *overlapping*; it
+does not stop one running after the other. Every caller reads the row and probes the file before
+`apply`, and `_transcode` and `_convert` then built their plan from that and never looked again,
+while `_shrink` now looks four times. Found by reading the code after the shrink fix, not by a
+live incident. **Not looked for on the live box** (this change did not touch it). The query that
+found the 48 shrink doubles finds these too: two `transcode_done`, or two `convert_done`, for one
+path minutes apart.
+
+What the old code did, each one a new test that failed on it with exactly this:
+
+- **Transcode, second caller after the first finished** (arrival and scan both decide one):
+  the old plan ran on the first job's output, and `_confirm_fixed` judged a file the job never
+  measured (`2 == 1` runs).
+- **Repair queued on the slot while an *arr upgrade lands:** the remux ran on the upgrade,
+  recycled it, and put a remux of it in its place.
+- **Changed during the remux, or during verification:** swapped in over the change.
+- **Repair fails because the file is being replaced:** counted, then fell through to the
+  **redownload** and recycled the upgrade. The most expensive one: the replacement is gone, and
+  if an *arr owns the row, a delete through the *arr follows it.
+- **Stale `fix_attempts`:** one failure on record, two callers. Both ran, and both wrote 2, so
+  the cap took three runs to reach.
+- **Conversion, second caller after the first finished.** With the image recycled, MakeMKV was
+  asked about a file that was not there. The stand-in copied it anyway; a real one fails, and
+  that failure is a permanent `convert_skipped`. With `keep_disc_image` on, the image is
+  untouched and only the row moved, so the whole disc was copied out again, swapped over the
+  first output, and `discs_converted` was counted twice.
+- **Disc replaced after its probe:** copied out a disc nobody measured, against the old
+  reference runtime.
+- **Disc replaced while MakeMKV read it:** `convert_skipped` was written for both verdicts
+  (unreadable, no title matching the runtime).
+- **Disc replaced during the feature or an extra:** upgrade recycled, old copy swapped in.
+- **Copy fails on a replaced disc:** `convert_attempts` 1, which is `MAX_CONVERT_ATTEMPTS`, so
+  the upgrade was written off for good.
+
+**Fixed** (`remediation.py`):
+
+- `_changed(path, size, mtime)` is the stat half of the old `_superseded`. `_stand_down`
+  deletes any output, logs `<action>_superseded`, and returns `superseded` with nothing
+  recorded. All three actions use both. The job message is now *"stood down, nothing recorded
+  — <reason>"*, because the old *"the file changed after it was measured"* is wrong when only
+  the row moved.
+- `_superseded` (shrink) keeps `shrunk`/`shrink_skipped`, and only the shrink path asks them. A
+  shrink has no bearing on whether a repair or a conversion should run.
+- `_transcode_superseded`: re-stat against the probe, then re-read `fix_attempts` from the row
+  (refreshing `file_row`, and standing down at the cap). It runs **on getting the slot**,
+  **after the run** (before any verdict, including the redownload fall-through; skipped on a
+  cancel, which already counts nothing) and **before the recycle**.
+- `_convert_superseded`: first a row elsewhere with `converted_from` = this path and
+  `converted > mtime`, which is the kept-image case. Then `convert_refused` on the row as it is
+  now. Then re-stat. It runs **on entry** (before `force` clears anything), **after MakeMKV
+  reads the structure** (before either skip verdict and before the rip), **after the copy**
+  (before the attempt count and verification) and **before the swap**. The baseline is the
+  probe's `size`/`mtime`. A disc that did not probe (the libudfread refusals) is stat'd on entry,
+  so it is guarded from there but cannot catch a change made before the job began; for those
+  the row check is the only defence against the second-caller case.
+
+**Edges, deliberately in the safe direction:**
+
+- `converted > mtime` is what keeps an *old* conversion from blocking a *new* image at the same
+  path. An *arr set to change file dates (Radarr "Change File Date") can backdate the new image
+  below that time. That disc then stands down until the next scan's sync drops the Matroska row
+  the *arr no longer lists. Nothing is recorded meanwhile.
+- A stand-down takes a slot from the scan's cap, exactly as `already_in_flight` does. The file
+  is probed afresh on the next pass.
+
+**Tests:** 14 new cases: 6 in `test_remediation.py` and 8 in `test_makemkv.py`, five functions
+each.
+Run against `HEAD` first, in a scratch export with only the test files swapped in: those 14
+failed and the other 102 in both files passed. Two existing tests changed, and both had been
+leaning on the bug. `test_a_transcode_that_does_not_fix_it_is_not_repeated_for_ever` and
+`test_hygiene_remux_that_leaves_its_warning_counts_attempts` replayed the first probe after
+their own transcode had replaced the file. With an honest probe, the real remux tags the
+languages, round two's plan is a `transcode_no_op`, and the cap is never reached. They now probe
+every round and fake a remux that leaves the file as it found it, which is what "did not fix
+it" means. Both still pass on `HEAD`, and both fail when `_confirm_fixed` stops counting
+(checked by mutation in the scratch copy). Full suite: **450 pass**.
+
+**Not deployed.**

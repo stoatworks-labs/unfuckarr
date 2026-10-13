@@ -992,3 +992,203 @@ def test_a_disc_with_integrity_findings_converts_rather_than_being_deleted(
     # stands rather than the file being left broken.
     settings.makemkv.enabled = False
     assert decide(result, settings).action in ("repair", "redownload")
+
+
+# -- a disc that changed under the job ------------------------------------
+#
+# The conversion's version of the race in test_shrink.py's "one job per
+# file": the claim in `apply` stops two jobs overlapping, but a caller reads
+# the row and probes the image before it gets there, and a conversion is then
+# hours of copying. A disc another job has just converted, or one the *arr
+# has replaced, is not the disc this job measured.
+
+UPGRADE = b"an upgrade the arr just imported" * 4096
+
+
+def convertible_disc(fake_makemkv, video_factory, settings, tmp_path,
+                     titles: list[dict] | None = None) -> Path:
+    """An image holding a 6-second feature and a 3-second extra."""
+    feature = video_factory("src-feature.mkv", seconds=6)
+    extra = video_factory("src-extra.mkv", seconds=3)
+    image = tmp_path / "Film (2011).iso"
+    shutil.copy(feature, image)
+
+    if titles is None:
+        titles = [
+            {"index": 0, "duration": "0:00:06", "file": str(feature),
+             "segments": "1,2"},
+            {"index": 1, "duration": "0:00:03", "file": str(extra),
+             "segments": "9"},
+        ]
+    settings.policy.disc_action = "convert"
+    settings.makemkv.enabled = True
+    settings.makemkv.command = fake_makemkv({"titles": titles})
+    settings.makemkv.extras_min_seconds = 1
+    settings.makemkv.min_title_seconds = 1
+    return image
+
+
+def watch_rips(monkeypatch, during=None) -> list[int]:
+    """Count MakeMKV's copies, calling ``during(n)`` as the nth one ends."""
+    rips: list[int] = []
+    real = makemkv.rip
+
+    def rip(path, title, *a, **k):
+        rips.append(title.index)
+        try:
+            return real(path, title, *a, **k)
+        finally:
+            if during is not None:
+                during(len(rips))
+    monkeypatch.setattr(makemkv, "rip", rip)
+    return rips
+
+
+def convert_state(path: Path) -> dict:
+    row = db.q1("SELECT converted, convert_skipped, convert_attempts "
+                "FROM files WHERE path=?", (str(path),))
+    return {k: row[k] for k in row.keys()}
+
+
+UNTOUCHED = {"converted": None, "convert_skipped": None, "convert_attempts": 0}
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("keep_image", [False, True])
+def test_a_job_that_waited_does_not_convert_what_another_just_converted(
+        fake_makemkv, video_factory, settings, tmp_path, monkeypatch,
+        keep_image):
+    """The arrival check and a scan both decide `convert` for one disc. With
+    the image recycled, the second asks MakeMKV about a file that is not
+    there, and an image MakeMKV cannot read is written off for good. With
+    the image kept, nothing on disk has changed and only the row moved: the
+    second copies the whole disc out again, swaps it over the first job's
+    output and counts the disc twice."""
+    image = convertible_disc(fake_makemkv, video_factory, settings, tmp_path)
+    settings.makemkv.keep_disc_image = keep_image
+    rips = watch_rips(monkeypatch)
+    row = insert(image)
+    result, info = check_file(str(image), settings)
+    rem = Remediator(lambda: settings)
+
+    first = rem.apply(dict(row), result, info, Decision("convert", "arrival"))
+    assert first["ok"] and first["action"] == "convert", first
+    copied = len(rips)
+    second = rem.apply(dict(row), result, info, Decision("convert", "scan"))
+
+    assert len(rips) == copied, "the disc was copied out a second time"
+    assert second["ok"] and second.get("superseded"), second
+    assert db.totals()["discs_converted"] == 1
+    assert db.q1("SELECT COUNT(*) n FROM activity "
+                 "WHERE event='convert_skipped'")["n"] == 0
+    assert db.q1("SELECT converted_from f FROM files WHERE path=?",
+                 (first["path"],))["f"] == str(image)
+
+
+@needs_ffmpeg
+def test_a_disc_replaced_after_it_was_probed_is_not_converted(
+        fake_makemkv, video_factory, settings, tmp_path, monkeypatch):
+    """Most discs do probe — 99 of 104 on the live library — and then the
+    probe is the measurement, as it is for a transcode: a scan probes the
+    whole library hours before its repair pass reaches the disc, and the
+    reference runtime the title is chosen against came from that probe."""
+    from unfuckarr.checks import CheckResult
+    from unfuckarr.probe import MediaInfo
+
+    image = convertible_disc(fake_makemkv, video_factory, settings, tmp_path)
+    row = insert(image)
+    st = image.stat()
+    info = MediaInfo(path=str(image), disc_kind="bluray", container="bluray",
+                     duration=6.0, size=st.st_size, mtime=st.st_mtime)
+    image.write_bytes(UPGRADE)
+    rips = watch_rips(monkeypatch)
+
+    out = Remediator(lambda: settings).apply(
+        row, CheckResult(path=str(image)), info,
+        Decision("convert", "disc image"))
+
+    assert not rips, "a disc nobody measured was copied out"
+    assert out["ok"] and out.get("superseded"), out
+    assert image.read_bytes() == UPGRADE
+    assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 0
+    assert convert_state(image) == UNTOUCHED
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("why", ["unreadable", "no title"])
+def test_a_disc_replaced_while_makemkv_read_it_is_not_written_off(
+        fake_makemkv, video_factory, settings, tmp_path, monkeypatch, why):
+    """Both verdicts that follow reading the structure are permanent
+    (`convert_skipped`), and both are about the image that was read. If that
+    is not the image there now, nothing has been learned about this one."""
+    feature = video_factory("src-feature.mkv", seconds=6)
+    titles = ([] if why == "unreadable" else
+              [{"index": 0, "duration": "0:00:06", "file": str(feature),
+                "segments": "1"}])
+    image = convertible_disc(fake_makemkv, video_factory, settings, tmp_path,
+                             titles=titles)
+    row = insert(image, expected_runtime=3600)    # a trailer, not the film
+    result, info = check_file(str(image), settings)
+    real = makemkv.titles
+
+    def read_while_replaced(*a, **k):
+        image.write_bytes(UPGRADE)
+        return real(*a, **k)
+    monkeypatch.setattr(makemkv, "titles", read_while_replaced)
+    rips = watch_rips(monkeypatch)
+
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("convert", "disc image"))
+
+    assert not rips
+    assert out["ok"] and out.get("superseded"), out
+    assert convert_state(image) == UNTOUCHED, \
+        "a verdict about the old image was recorded against the new one"
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("during", ["the feature", "an extra"])
+def test_a_disc_replaced_during_the_copy_is_not_swapped(
+        fake_makemkv, video_factory, settings, tmp_path, monkeypatch, during):
+    """Hours of copying out of a UHD disc is ample time for the *arr to import
+    an upgrade over the image. What was copied belongs to the image that has
+    gone, and the swap would recycle the upgrade."""
+    image = convertible_disc(fake_makemkv, video_factory, settings, tmp_path)
+    when = 1 if during == "the feature" else 2
+    rips = watch_rips(monkeypatch, lambda n: n == when and image.write_bytes(UPGRADE))
+    row = insert(image)
+    result, info = check_file(str(image), settings)
+
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("convert", "disc image"))
+
+    assert out["ok"] and out.get("superseded"), out
+    assert rips == [0, 1][:when], "extras were copied out of a disc that had gone"
+    assert image.read_bytes() == UPGRADE, "the upgrade was replaced"
+    assert not (tmp_path / "Film (2011).mkv").exists()
+    assert not (tmp_path / "extras").exists()
+    assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 0
+    assert convert_state(image) == UNTOUCHED
+    assert "discs_converted" not in db.totals()
+
+
+@needs_ffmpeg
+def test_a_copy_that_failed_on_a_replaced_disc_is_not_counted_against_it(
+        fake_makemkv, video_factory, settings, tmp_path, monkeypatch):
+    """One failed copy writes a disc off for good (MAX_CONVERT_ATTEMPTS is 1),
+    and an image being replaced under MakeMKV is a good reason for a copy to
+    fail. The failure belongs to the image that went."""
+    image = convertible_disc(
+        fake_makemkv, video_factory, settings, tmp_path,
+        titles=[{"index": 0, "duration": "0:00:06", "segments": "1"}])
+    watch_rips(monkeypatch, lambda n: image.write_bytes(UPGRADE))
+    row = insert(image)
+    result, info = check_file(str(image), settings)
+
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("convert", "disc image"))
+
+    assert out["ok"] and out.get("superseded"), out
+    assert convert_state(image) == UNTOUCHED
+    assert db.q1("SELECT COUNT(*) n FROM activity "
+                 "WHERE event='convert_failed'")["n"] == 0

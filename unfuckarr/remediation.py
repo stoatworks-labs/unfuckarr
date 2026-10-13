@@ -392,6 +392,53 @@ class Remediator:
         self._set_job(job_id, "cancelled", 0, "cancelled")
         return {"action": action, "ok": False, "message": "cancelled"}
 
+    @staticmethod
+    def _changed(path: str, size: int, mtime: float) -> str | None:
+        """Why the file at ``path`` is no longer the one measured as ``size``
+        bytes at ``mtime``, or None while it still is. A figure of 0 means
+        "not known" and is not compared.
+
+        Size and mtime both, because an in-place rewrite need not change the
+        size. `probe` stats the file before ffprobe reads it, so a file that
+        changed during the probe reads as changed rather than as measured.
+        """
+        try:
+            st = os.stat(path)
+        except OSError as exc:
+            return f"it is no longer there: {exc.strerror or exc}"
+        if size and st.st_size != size:
+            return (f"it is {st.st_size:,} bytes now, against the "
+                    f"{size:,} that were measured")
+        if mtime and st.st_mtime != mtime:
+            return "it has been rewritten since it was measured"
+        return None
+
+    def _stand_down(self, job_id: int, action: str, path: str,
+                    reason: str | None, measured_size: int,
+                    dst: str | None = None) -> dict[str, Any] | None:
+        """End a job whose file is no longer the one it measured, or return
+        None when ``reason`` is None and the job may go on.
+
+        Every caller of `apply` reads the row and probes the file before it
+        gets there, and a job then waits — for the slot, behind a search,
+        through an encode or a rip. A job that ran start to finish meanwhile,
+        or an *arr importing an upgrade, leaves it holding a plan for a file
+        that has gone. Nothing is recorded, because nothing has been learned
+        about the file that is there: no attempt, no verdict, no counter, and
+        the next look starts from a fresh probe.
+        """
+        if reason is None:
+            return None
+        if dst:
+            Path(dst).unlink(missing_ok=True)
+        self._cancel.pop(path, None)
+        msg = f"stood down, nothing recorded — {reason}"
+        self._set_job(job_id, "done", 1.0, msg)
+        db.log(f"{action}_superseded", "info", path,
+               {"reason": reason, "measured_size": measured_size})
+        return {"action": "flag", "ok": True, "superseded": True,
+                "message": msg}
+
     # -- entry point ------------------------------------------------------
 
     def apply(self, file_row: dict[str, Any], result: CheckResult,
@@ -547,6 +594,12 @@ class Remediator:
         with self._slot(sema, cancel) as got:
             if not got:
                 return self._cancelled(job_id, path, "flag")
+            # The row and the probe were read before the wait for the slot,
+            # which can be the length of another file's encode — and the plan
+            # was made from that probe.
+            gone = self._transcode_superseded(job_id, file_row, info)
+            if gone is not None:
+                return gone
             self._set_job(job_id, "running", 0.0, plan.describe)
             set_task(f"remediate:{path}", kind="transcoding", path=path,
                      title=file_row.get("title") or Path(path).name,
@@ -565,6 +618,15 @@ class Remediator:
                 source=path,
             )
             self._cancel.pop(path, None)
+
+        # Before any verdict, and above all before the redownload a failed
+        # repair falls through to: if the file the remux read is not the one
+        # on disk now, a failure is no evidence about this one, and the
+        # delete-and-re-search would take the file that replaced it.
+        if not cancel.is_set():
+            gone = self._transcode_superseded(job_id, file_row, info, dst)
+            if gone is not None:
+                return gone
 
         if not ok:
             Path(dst).unlink(missing_ok=True)
@@ -606,6 +668,10 @@ class Remediator:
 
         final = dst
         if s.transcode.replace_original:
+            # The last look before the one step that cannot be undone.
+            gone = self._transcode_superseded(job_id, file_row, info, dst)
+            if gone is not None:
+                return gone
             try:
                 recycled = recycle.store(
                     path, f"replaced by transcode ({plan.describe})",
@@ -639,6 +705,33 @@ class Remediator:
                {"from": path, "plan": plan.describe, "message": message})
         return {"action": "transcode", "ok": True, "path": final,
                 "message": plan.describe}
+
+    def _transcode_superseded(self, job_id: int, file_row: dict[str, Any],
+                              info: MediaInfo,
+                              dst: str | None = None) -> dict[str, Any] | None:
+        """`_stand_down` for a transcode whose file changed, or whose attempt
+        count did, since the caller read them.
+
+        The file first: when it is not the one probed, the plan was made for
+        a file that has gone, and `_confirm_fixed` and `_count_attempt` would
+        record whatever happened against one the job never measured. Then the
+        counter, which is the cap and was read with the row: with one failure
+        on record and two callers holding that, both run, and both write the
+        same second count. It is refreshed here so the count this job writes
+        is the real next one.
+        """
+        path = file_row["path"]
+        reason = self._changed(path, info.size, info.mtime)
+        if reason is None:
+            row = db.q1("SELECT fix_attempts FROM files WHERE path=?", (path,))
+            if row is not None:
+                attempts = row["fix_attempts"] or 0
+                file_row["fix_attempts"] = attempts
+                if attempts >= MAX_FIX_ATTEMPTS:
+                    reason = (f"another job has transcoded it {attempts} "
+                              "time(s) since without clearing the problem")
+        return self._stand_down(job_id, "transcode", path, reason, info.size,
+                                dst)
 
     def _verify_output(self, dst: str, source: MediaInfo,
                        s: Settings) -> str | None:
@@ -1157,42 +1250,21 @@ class Remediator:
         """Stand down when the file is no longer the one this job measured.
 
         A shrink reads its row and its probe before it waits for the slot,
-        and takes its CRF from a search minutes long. Anything that touches
-        the file meanwhile — another job's swap, an *arr upgrade — leaves it
-        holding numbers about a file that is gone. Nothing is recorded,
-        because nothing has been learned about the file that is there: no
-        attempt, no verdict, and the next look starts from a fresh probe.
-        Returns None when the file is still the one measured.
+        and takes its CRF from a search minutes long. The markers come first,
+        because a job that priced the file and declined it left the file
+        exactly as it was, and both markers are permanent (invariant 11).
+        They are asked only here: a shrink does not supersede a transcode or
+        a conversion of the same file, which have their own reasons to run.
         """
         row = db.q1("SELECT shrunk, shrink_skipped FROM files WHERE path=?",
                     (path,))
-        reason = None
         if row is not None and row["shrunk"]:
             reason = "another job has shrunk it since"
         elif row is not None and row["shrink_skipped"] and not decision.force:
             reason = f"another job has assessed it since: {row['shrink_skipped']}"
         else:
-            try:
-                st = os.stat(path)
-            except OSError as exc:
-                reason = f"it is no longer there: {exc.strerror or exc}"
-            else:
-                if info.size and st.st_size != info.size:
-                    reason = (f"it is {st.st_size:,} bytes now, against the "
-                              f"{info.size:,} that were measured")
-                elif info.mtime and st.st_mtime != info.mtime:
-                    reason = "it has been rewritten since it was measured"
-        if reason is None:
-            return None
-        if dst:
-            Path(dst).unlink(missing_ok=True)
-        self._cancel.pop(path, None)
-        msg = f"the file changed after it was measured — {reason}; left alone"
-        self._set_job(job_id, "done", 1.0, msg)
-        db.log("shrink_superseded", "info", path,
-               {"reason": reason, "measured_size": info.size})
-        return {"action": "flag", "ok": True, "superseded": True,
-                "message": msg}
+            reason = self._changed(path, info.size, info.mtime)
+        return self._stand_down(job_id, "shrink", path, reason, info.size, dst)
 
     def _count_shrink_attempt(self, path: str, file_row: dict[str, Any]) -> int:
         attempts = (file_row.get("shrink_attempts") or 0) + 1
@@ -1276,6 +1348,22 @@ class Remediator:
         if refused is not None:
             self._set_job(job_id, "done", 1.0, refused)
             return {"action": "flag", "ok": True, "message": refused}
+
+        # The row and the probe were read before this job began, and another
+        # conversion can have run start to finish in between. A disc that did
+        # not probe — the images libudfread refuses — has no earlier
+        # measurement, so it is measured here and guarded from here on.
+        if info is not None:
+            measured = (info.size, info.mtime)
+        else:
+            try:
+                st = os.stat(path)
+                measured = (st.st_size, st.st_mtime)
+            except OSError:
+                measured = (0, 0.0)
+        gone = self._convert_superseded(job_id, file_row, measured, decision)
+        if gone is not None:
+            return gone
         if decision.force:
             db.ex("UPDATE files SET convert_skipped=NULL, convert_attempts=0 "
                   "WHERE path=?", (path,))
@@ -1315,16 +1403,17 @@ class Remediator:
         self._cancel[path] = cancel
         work = Path(path).with_name(f"{Path(path).stem}{transcode.TEMP_MARKER}convert")
         try:
-            return self._convert_inner(job_id, file_row, info, s, work, cancel,
-                                       version, size)
+            return self._convert_inner(job_id, file_row, info, decision, s,
+                                       work, cancel, version, size, measured)
         finally:
             self._cancel.pop(path, None)
             shutil.rmtree(work, ignore_errors=True)
 
     def _convert_inner(self, job_id: int, file_row: dict[str, Any],
-                       info: MediaInfo | None, s: Settings, work: Path,
-                       cancel: threading.Event, version: str,
-                       image_size: int) -> dict[str, Any]:
+                       info: MediaInfo | None, decision: Decision,
+                       s: Settings, work: Path, cancel: threading.Event,
+                       version: str, image_size: int,
+                       measured: tuple[int, float]) -> dict[str, Any]:
         path = file_row["path"]
         cfg = s.makemkv
         expected = float(file_row.get("expected_runtime") or 0)
@@ -1332,6 +1421,7 @@ class Remediator:
         set_task(f"remediate:{path}", kind="analysing", path=path, progress=-1,
                  detail="asking MakeMKV what is on the disc")
         self._set_job(job_id, "running", 0.0, "reading the disc structure")
+        unreadable = None
         try:
             # Not `timeout_hours`: that budget belongs to the copy. Reading
             # the structure of a disc is minutes at worst, and a hung one
@@ -1343,8 +1433,16 @@ class Remediator:
             self._set_job(job_id, "failed", 0, msg, error=msg)
             return {"action": "flag", "ok": False, "message": msg}
         except makemkv.MakeMKVError as exc:
-            return self._skip_convert(job_id, file_row,
-                                      f"MakeMKV cannot read this image: {exc}")
+            found, unreadable = [], f"MakeMKV cannot read this image: {exc}"
+
+        # Nothing is decided from what MakeMKV read until the image is known
+        # to be the one it read: both verdicts below are permanent, and the
+        # copy after them is hours.
+        gone = self._convert_superseded(job_id, file_row, measured, decision)
+        if gone is not None:
+            return gone
+        if unreadable is not None:
+            return self._skip_convert(job_id, file_row, unreadable)
 
         # The disc's own measured duration is the better cross-check when there
         # is one — `disc.stream_duration` agreed with libbluray to within 0.3s
@@ -1378,6 +1476,7 @@ class Remediator:
             set_task(f"remediate:{path}", progress=frac)
             db.ex("UPDATE jobs SET progress=? WHERE id=?", (frac, job_id))
 
+        reason = None
         try:
             produced = makemkv.rip(path, main, str(work / "main"), cfg.command,
                                    cfg.min_title_seconds,
@@ -1389,7 +1488,17 @@ class Remediator:
                 # not for a transcode.
                 self._set_job(job_id, "cancelled", 0, "cancelled")
                 return {"action": "convert", "ok": False, "message": "cancelled"}
-            reason = f"MakeMKV could not copy the feature: {exc}"
+            produced, reason = "", f"MakeMKV could not copy the feature: {exc}"
+
+        # Whatever the copy made of it, if the image it read is not the one on
+        # disk now — an *arr imported over it, hours in — the result says
+        # nothing about either, and one failure writes a disc off for good.
+        gone = self._convert_superseded(job_id, file_row, measured, decision,
+                                        produced or None)
+        if gone is not None:
+            return gone
+
+        if reason is not None:
             self._set_job(job_id, "failed", 0, reason, error=reason)
             if transcode.out_of_space(reason):
                 # About the disk, not the disc — invariant 20's reasoning.
@@ -1414,6 +1523,12 @@ class Remediator:
         # was never going to work does not spend an hour on its trailers first.
         saved_extras = self._rip_extras(job_id, path, extras, work, cfg, cancel)
 
+        # The last look before the one step that cannot be undone. The
+        # extras sit in the work directory, which `_convert` removes.
+        gone = self._convert_superseded(job_id, file_row, measured, decision,
+                                        produced)
+        if gone is not None:
+            return gone
         try:
             recycled = None
             if not cfg.keep_disc_image:
@@ -1603,6 +1718,40 @@ class Remediator:
         if (file_row.get("convert_attempts") or 0) >= MAX_CONVERT_ATTEMPTS:
             return "a previous conversion of this disc failed — not trying again"
         return None
+
+    def _convert_superseded(self, job_id: int, file_row: dict[str, Any],
+                            measured: tuple[int, float], decision: Decision,
+                            dst: str | None = None) -> dict[str, Any] | None:
+        """`_stand_down` for a conversion whose disc is no longer the one this
+        job measured, or which another job has dealt with since.
+
+        The row first, because the image need not change for that to be true.
+        With `keep_disc_image` on, a conversion leaves the image exactly as it
+        was and moves the row to the Matroska file, so a second job holding
+        the old row would copy the whole disc out again, swap it over the
+        first job's output and count the disc twice. ``converted > mtime``
+        makes that "converted from *this* image": a new image later put where
+        a converted one used to be is a different disc. Then
+        `convert_refused` on the row as it is now, for a disc another job has
+        written off or failed meanwhile. Then the image itself.
+        """
+        path = file_row["path"]
+        size, mtime = measured
+        moved = db.q1("SELECT path FROM files WHERE converted_from=? "
+                      "AND converted > ? LIMIT 1", (path, mtime))
+        row = db.q1("SELECT converted, convert_skipped, convert_attempts "
+                    "FROM files WHERE path=?", (path,))
+        refused = (self.convert_refused({k: row[k] for k in row.keys()},
+                                        force=decision.force)
+                   if row is not None else None)
+        if moved is not None:
+            reason = ("another job has converted it since, to "
+                      f"{Path(moved['path']).name}")
+        elif refused is not None:
+            reason = f"another job has been at it since ({refused})"
+        else:
+            reason = self._changed(path, size, mtime)
+        return self._stand_down(job_id, "convert", path, reason, size, dst)
 
     def _skip_convert(self, job_id: int, file_row: dict[str, Any],
                       reason: str) -> dict[str, Any]:

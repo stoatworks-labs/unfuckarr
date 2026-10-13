@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -437,6 +440,20 @@ def test_vaapi_never_reemits_closed_captions():
 
 # -- end to end -----------------------------------------------------------
 
+def remux_changes_nothing(monkeypatch) -> None:
+    """A remux that leaves the file exactly as it found it.
+
+    That is what "the transcode did not fix it" has to mean once every round
+    starts from a fresh probe, as every caller's does. A real remux of these
+    clips tags their languages, so the next probe finds nothing left to change
+    and the plan is refused as a no-op before the cap is ever reached.
+    """
+    def unchanged(cmd, *a, **k):
+        shutil.copy(cmd[cmd.index("-i") + 1], cmd[-1])
+        return True, "faked"
+    monkeypatch.setattr(transcode, "run", unchanged)
+
+
 @needs_ffmpeg
 def test_incompatible_file_is_transcoded_and_verified(video_factory, settings):
     path = video_factory("legacy.avi", seconds=8, vcodec="mpeg2video",
@@ -522,14 +539,21 @@ def test_a_transcode_that_does_not_fix_it_is_not_repeated_for_ever(
         result.add(Finding("compat", "bad_container", "error", "still wrong"))
         return result, info
     monkeypatch.setattr(scanner_mod, "check_file", always_bad)
+    remux_changes_nothing(monkeypatch)
 
     rem = Remediator(lambda: settings)
-    result, info = check_file(str(path), settings)
-    result.add(Finding("compat", "bad_container", "error", ""))
+
+    def probed(p: str):
+        # Afresh every round, as every caller does: each transcode replaces
+        # the file, and a job holding an old probe stands down.
+        result, info = check_file(p, settings)
+        result.add(Finding("compat", "bad_container", "error", ""))
+        return result, info
 
     current = str(path)
     for _ in range(MAX_FIX_ATTEMPTS):
-        out = rem.apply(row, result, info, Decision("transcode", "incompatible"))
+        out = rem.apply(row, *probed(current),
+                        Decision("transcode", "incompatible"))
         assert out["ok"], out
         current = out["path"]
         row = {**row, "path": current,
@@ -537,7 +561,7 @@ def test_a_transcode_that_does_not_fix_it_is_not_repeated_for_ever(
                                      (current,))["fix_attempts"]}
 
     # The cap is now reached, so the next attempt refuses rather than running.
-    out = rem.apply(row, result, info, Decision("transcode", "incompatible"))
+    out = rem.apply(row, *probed(current), Decision("transcode", "incompatible"))
     assert out["action"] == "flag"
     assert "not trying again" in out["message"]
 
@@ -689,13 +713,19 @@ def test_hygiene_remux_that_leaves_its_warning_counts_attempts(
         result.add(Finding("hygiene", "image_subtitles_only", "warning", ""))
         return result, info
     monkeypatch.setattr(scanner_mod, "check_file", still_grubby)
+    remux_changes_nothing(monkeypatch)
 
     path = video_factory("tidy.mkv", seconds=6)
     db.ex("INSERT INTO files (path, title) VALUES (?,?)", (str(path), "Tidy"))
     rem = Remediator(lambda: settings)
 
-    result, info = check_file(str(path), settings)
-    result.add(Finding("hygiene", "image_subtitles_only", "warning", ""))
+    def probed(p: str):
+        # Afresh every round, as every caller does: each remux replaces the
+        # file, and a job holding an old probe stands down.
+        result, info = check_file(p, settings)
+        result.add(Finding("hygiene", "image_subtitles_only", "warning", ""))
+        return result, info
+
     decision = Decision("transcode", "stream metadata needs tidying",
                         ["image_subtitles_only"])
 
@@ -705,7 +735,7 @@ def test_hygiene_remux_that_leaves_its_warning_counts_attempts(
                "arr_id": None, "arr_parent_id": None,
                "fix_attempts": db.q1("SELECT fix_attempts FROM files WHERE path=?",
                                      (current,))["fix_attempts"]}
-        out = rem.apply(row, result, info, decision)
+        out = rem.apply(row, *probed(current), decision)
         assert out["ok"], out
         current = out["path"]
         assert db.q1("SELECT fix_attempts FROM files WHERE path=?",
@@ -714,7 +744,7 @@ def test_hygiene_remux_that_leaves_its_warning_counts_attempts(
     row = {"path": current, "source": "folder", "title": "Tidy",
            "arr_id": None, "arr_parent_id": None,
            "fix_attempts": MAX_FIX_ATTEMPTS}
-    out = rem.apply(row, result, info, decision)
+    out = rem.apply(row, *probed(current), decision)
     assert out["action"] == "flag"
     assert "not trying again" in out["message"]
 
@@ -765,6 +795,231 @@ def test_fix_attempts_column_is_added_to_an_existing_database(tmp_path):
     assert db.q1("SELECT status FROM files WHERE path='/old.mkv'")["status"] == "ok"
     cols = {r["name"] for r in db.connect().execute("PRAGMA table_info(files)")}
     assert "fix_attempts" in cols
+
+
+# -- a file that changed under the job ------------------------------------
+#
+# `apply` allows one job per file, but every caller reads the row and probes
+# the file *before* it gets there, and a transcode then waits for the one
+# slot — the length of another file's encode, with `max_concurrent` at 1. A
+# job that ran start to finish meanwhile, or an *arr importing an upgrade,
+# leaves it holding a plan for a file that is gone. The same race shrank 48
+# live files twice (test_shrink.py, "one job per file"); these are its
+# transcode shapes.
+
+UPGRADE = b"an upgrade the arr just imported" * 4096
+
+
+def changed_row(path: Path) -> dict:
+    db.ex("INSERT INTO files (path, title) VALUES (?,?)", (str(path), path.stem))
+    return {"path": str(path), "source": "folder", "title": path.stem,
+            "arr_id": None, "arr_parent_id": None, "fix_attempts": 0}
+
+
+def incompatible(path: Path, settings) -> tuple[CheckResult, MediaInfo]:
+    result, info = check_file(str(path), settings)
+    result.add(Finding("compat", "bad_container", "error", ""))
+    return result, info
+
+
+def fix_attempts(path: Path) -> int:
+    return db.q1("SELECT fix_attempts FROM files WHERE path=?",
+                 (str(path),))["fix_attempts"]
+
+
+def arm_transcode(monkeypatch) -> tuple[list, list]:
+    """A remux that writes a different file and is taken as a fix. These are
+    about which file the job acts on, not about ffmpeg."""
+    monkeypatch.setattr(Remediator, "_verify_output", lambda *a, **k: None)
+    ran: list = []
+    confirmed: list = []
+
+    def fake_run(cmd, *a, **k):
+        ran.append(cmd)
+        source = Path(cmd[cmd.index("-i") + 1])
+        Path(cmd[-1]).write_bytes(source.read_bytes() + b"remuxed")
+        return True, "faked"
+    monkeypatch.setattr(transcode, "run", fake_run)
+    monkeypatch.setattr(Remediator, "_confirm_fixed",
+                        lambda self, old, final, row, decision:
+                        confirmed.append(final))
+    return ran, confirmed
+
+
+@needs_ffmpeg
+def test_a_job_that_waited_does_not_transcode_what_another_just_fixed(
+        video_factory, settings, monkeypatch):
+    """The arrival check and a scan both decide a transcode for one file. The
+    claim stops them overlapping, not running one after the other: the second
+    reaches `apply` after the first has swapped its output in, holding a plan
+    made from the old probe. Run on the new file it makes the same change
+    twice, and its outcome is confirmed or counted against a file it never
+    measured."""
+    path = video_factory("twice.mkv", seconds=4)
+    row = changed_row(path)
+    ran, confirmed = arm_transcode(monkeypatch)
+    result, info = incompatible(path, settings)
+    rem = Remediator(lambda: settings)
+
+    first = rem.apply(dict(row), result, info, Decision("transcode", "arrival"))
+    assert first["action"] == "transcode" and first["ok"], first
+    second = rem.apply(dict(row), result, info, Decision("transcode", "scan"))
+
+    assert len(ran) == 1, "the old plan was run on the file that replaced it"
+    assert second["ok"] and second.get("superseded"), second
+    assert confirmed == [first["path"]], \
+        "the second job's outcome was recorded against the first job's output"
+    assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 1
+    assert fix_attempts(path) == 0, "standing down is not a failed attempt"
+
+
+@needs_ffmpeg
+def test_a_repair_that_queued_for_the_slot_leaves_an_upgrade_alone(
+        video_factory, settings, monkeypatch):
+    """A scan's repair queues for the one slot behind another file's encode,
+    and the *arr imports an upgrade over the broken file meanwhile. The remux
+    was planned from a probe of the broken file; run when the slot comes
+    free, it recycles the upgrade and puts a remux in its place."""
+    holder = video_factory("holder.mkv", seconds=4)
+    path = video_factory("broken.mkv", seconds=4)
+    ran, confirmed = arm_transcode(monkeypatch)
+    armed_run = transcode.run
+    encoding, finish = threading.Event(), threading.Event()
+
+    def slow_run(cmd, *a, **k):
+        if Path(cmd[cmd.index("-i") + 1]) == holder:
+            encoding.set()
+            finish.wait(10)
+        return armed_run(cmd, *a, **k)
+    monkeypatch.setattr(transcode, "run", slow_run)
+    settings.transcode.max_concurrent = 1
+
+    holder_row = changed_row(holder)
+    holder_result, holder_info = incompatible(holder, settings)
+    row = changed_row(path)
+    result, info = check_file(str(path), settings)
+    result.add(Finding("integrity", "decode_errors", "error", ""))
+    rem = Remediator(lambda: settings)
+    outcomes: dict[str, dict] = {}
+
+    def job(name: str, *args) -> threading.Thread:
+        t = threading.Thread(target=lambda: outcomes.__setitem__(
+            name, rem.apply(*args)))
+        t.start()
+        return t
+
+    first = job("holder", holder_row, holder_result, holder_info,
+                Decision("transcode", "incompatible"))
+    try:
+        assert encoding.wait(10)
+        repair = job("repair", row, result, info,
+                     Decision("repair", "container damage"))
+        deadline = time.time() + 10
+        while str(path) not in rem.busy_paths() and time.time() < deadline:
+            time.sleep(0.01)
+        assert str(path) in rem.busy_paths()
+        path.write_bytes(UPGRADE)
+    finally:
+        finish.set()
+        first.join(10)
+    repair.join(10)
+
+    assert outcomes["holder"]["action"] == "transcode"
+    assert len(ran) == 1, "the repair was run on the upgrade"
+    assert outcomes["repair"]["ok"] and outcomes["repair"].get("superseded")
+    assert path.read_bytes() == UPGRADE, "the upgrade was replaced"
+    assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 1   # the holder's
+    assert fix_attempts(path) == 0
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("during", ["the remux", "verification"])
+def test_a_file_that_changed_during_the_transcode_is_not_replaced(
+        video_factory, settings, monkeypatch, during):
+    """An *arr importing an upgrade while the remux runs, or while its output
+    is being checked: the output was made from the old file, and swapping it
+    in would recycle the upgrade for a remux of what it replaced."""
+    path = video_factory("upgraded.mkv", seconds=4)
+    row = changed_row(path)
+    ran, confirmed = arm_transcode(monkeypatch)
+    if during == "the remux":
+        armed_run = transcode.run
+
+        def run_then_upgrade(cmd, *a, **k):
+            done = armed_run(cmd, *a, **k)
+            path.write_bytes(UPGRADE)
+            return done
+        monkeypatch.setattr(transcode, "run", run_then_upgrade)
+    else:
+        monkeypatch.setattr(Remediator, "_verify_output",
+                            lambda *a, **k: path.write_bytes(UPGRADE) and None)
+    result, info = incompatible(path, settings)
+
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("transcode", "incompatible"))
+
+    assert len(ran) == 1
+    assert out["ok"] and out.get("superseded"), out
+    assert path.read_bytes() == UPGRADE, "the upgrade was replaced"
+    assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 0
+    assert not Path(transcode.output_path(str(path), "mkv")).exists(), \
+        "the discarded output was left behind"
+    assert not confirmed
+    assert fix_attempts(path) == 0
+
+
+@needs_ffmpeg
+def test_a_repair_that_failed_on_a_changed_file_does_not_redownload_it(
+        video_factory, settings, monkeypatch):
+    """The expensive shape. A failed remux falls through to a redownload —
+    delete and re-search — and a file being replaced mid-read is a likely
+    reason for ffmpeg to fail. What would be deleted is the upgrade, which is
+    not the file that was found broken."""
+    path = video_factory("repair.mkv", seconds=4)
+    row = changed_row(path)
+
+    def fail_on_upgrade(cmd, *a, **k):
+        path.write_bytes(UPGRADE)
+        return False, "Invalid data found when processing input"
+    monkeypatch.setattr(transcode, "run", fail_on_upgrade)
+    result, info = check_file(str(path), settings)
+    result.add(Finding("integrity", "decode_errors", "error", ""))
+
+    out = Remediator(lambda: settings).apply(
+        row, result, info, Decision("repair", "container damage"))
+
+    assert out["action"] != "redownload", out
+    assert out["ok"] and out.get("superseded"), out
+    assert path.read_bytes() == UPGRADE, "the upgrade was deleted"
+    assert db.q1("SELECT COUNT(*) n FROM recycle")["n"] == 0
+    assert fix_attempts(path) == 0
+
+
+@needs_ffmpeg
+def test_a_job_that_waited_does_not_retry_what_another_gave_up_on(
+        video_factory, settings, monkeypatch):
+    """The cap is read off the row, and the row was read before the wait. With
+    one failure on record and two callers holding that, the first fails again
+    and reaches the cap; the second has to see that rather than run a third
+    time and write the same count over it."""
+    from unfuckarr.remediation import MAX_FIX_ATTEMPTS
+
+    path = video_factory("stubborn.mkv", seconds=4)
+    row = changed_row(path)
+    db.ex("UPDATE files SET fix_attempts=? WHERE path=?",
+          (MAX_FIX_ATTEMPTS - 1, str(path)))
+    row["fix_attempts"] = MAX_FIX_ATTEMPTS - 1
+    ran = []
+    monkeypatch.setattr(transcode, "run",
+                        lambda cmd, *a, **k: ran.append(cmd) or (False, "ffmpeg died"))
+    result, info = incompatible(path, settings)
+    rem = Remediator(lambda: settings)
+
+    for caller in ("arrival", "scan"):
+        rem.apply(dict(row), result, info, Decision("transcode", caller))
+
+    assert len(ran) == 1, "a third attempt ran on a file already at the cap"
+    assert fix_attempts(path) == MAX_FIX_ATTEMPTS
 
 
 # -- recycle bin ----------------------------------------------------------
