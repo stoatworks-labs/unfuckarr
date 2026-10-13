@@ -1683,3 +1683,23 @@ makemkv.com's tarballs, so the real build works again and the image no longer de
 
 `Dockerfile.overlay` stays as the fallback for when makemkv.com cannot be reached. Keep
 `rollback-2026-10-12` for that too.
+
+### 2026-10-14 00:42: deployed — the real build, MakeMKV from source, the app at `c747ba4`
+
+`unfk` runs **`7f86f6202`** = `docker/makemkv/Dockerfile` (`MAKEMKV_EULA=accepted`), on base
+`ghcr.io/stoatworks-labs/unfuckarr:edge` at `b309a8e`, so `ee862af` (re-checking the file before
+acting) is live too. Labels: `makemkv-version=1.18.4`, `app-revision=c747ba4` (docs only since
+`b309a8e`). Rollback tag **`unfuckarr-makemkv:rollback-2026-10-14`** = what was running
+(`1ba9dad834dc`, the overlay at `451d8ef`). Backup at
+`/mnt/user/appdata/.unfk-backups/pre-makemkv-source-2026-10-14/`: an online `.backup()` as uid 99,
+`integrity_check ok`, 18,799 files, plus `config.json`, inspect and the old recreate script.
+`/root/recreate-unfk.sh`'s comment now gives this build (`.bak-2026-10-14` beside it).
+
+**Verified live:** healthy, the web UI answers 200 on the tailnet, and Sonarr, Radarr and Emby
+answered at startup. The code in `/app` is identical to `origin/main`. As uid 99 with the live
+`HOME`, `makemkvcon -r info disc:9999` printed `MakeMKV v1.18.4 linux(x64-release)` with no
+`MSG:5021`.
+
+**What the restart interrupted:** scan **56** (manual, started 00:24) was closed as "interrupted
+by a restart", and one queued transcode (Back to the Future Part III) failed the same way. That
+counts no attempts. The shrink that was running had finished as `done`.
