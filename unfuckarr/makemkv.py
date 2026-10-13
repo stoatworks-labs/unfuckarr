@@ -44,6 +44,7 @@ import shlex
 import subprocess
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -131,6 +132,36 @@ class Title:
         worth taking.
         """
         return self.segments or f"{self.seconds:.0f}:{self.size}"
+
+    @property
+    def segment_ids(self) -> list[str]:
+        """The segment map as a list, repeats kept.
+
+        Every disc measured here writes it as a plain list (`482,483,485`), and
+        a title can name one segment more than once. A range is expanded in
+        case a release abbreviates one: left as the string `23-25` it would
+        silently overlap nothing.
+        """
+        out: list[str] = []
+        for token in self.segments.split(","):
+            token = token.strip()
+            lo, dash, hi = token.partition("-")
+            if dash and lo.isdigit() and hi.isdigit() and int(lo) <= int(hi):
+                out.extend(str(n) for n in range(int(lo), int(hi) + 1))
+            elif token:
+                out.append(str(int(token)) if token.isdigit() else token)
+        return out
+
+    @property
+    def is_clip(self) -> bool:
+        """A bare stream file MakeMKV offers on its own account.
+
+        MakeMKV lists every `.m2ts` at least `--minlength` long as a title of
+        its own, alongside the playlists the disc was authored with — so a
+        featurette arrives twice, once as the playlist the disc's menu plays
+        and once as the raw clip inside it.
+        """
+        return any(f.lower().endswith(".m2ts") for f in self.source_files)
 
 
 @dataclass
@@ -325,7 +356,7 @@ def _last_message(lines: Iterable[str]) -> str:
 
 def select(found: list[Title], expected_seconds: float = 0.0,
            tolerance_pct: float = 10.0, extras_min_seconds: int = 60,
-           max_extras: int = 24) -> Selection:
+           max_extras: int = 24, budget: int = 0) -> Selection:
     """Decide which title is the film and which are bonus features.
 
     The rules, in the order they matter:
@@ -345,6 +376,49 @@ def select(found: list[Title], expected_seconds: float = 0.0,
        wildly wrong — a trailer where a film should be — and the tolerance is
        wide on purpose. See `duration_below_expected` for the same reasoning
        applied to the integrity check.
+    5. **An extra is kept for what it adds, not for what it is.** Rule 2 only
+       catches an *identical* map, and extras nest. Jurassic World Rebirth
+       (2025), 77 titles, offers each of six featurettes four ways — a "play
+       all" of all six (title 7, 56 min), two playlists per featurette that
+       differ by a 3-second title card (`497,498,499` and `498,499`), and the
+       raw clip (`498`) — so segment 498 was ripped four times, and 24 extras
+       came to 31.6 GB beside a 76.3 GB feature, from a 94.5 GB image. An
+       extra is now measured against everything already kept, the feature
+       included, and is refused when less than ``extras_min_seconds`` of it is
+       new: the same yardstick that decides whether a title is worth keeping
+       on its own. That disc now keeps 14 extras, every featurette once.
+
+       How much of it is new is measured *from below*, and only from durations
+       MakeMKV itself reported: the shared part is filled with titles that lie
+       wholly inside it, no two using the same segment. MakeMKV lists every
+       clip at least ``--minlength`` long as a title of its own — on that
+       disc, of the 75 segments its titles use, 57 are titles in their own
+       right and MakeMKV logged each of the other 18 as under the minimum —
+       so the only overlap that goes unmeasured is made of clips shorter than
+       that. There, every one is a 3–4 second title card. Unmeasured overlap
+       counts as *new*, which errs towards keeping an extra, not losing one.
+    6. **Individual featurettes win over the "play all" that strings them
+       together.** In Emby each extra is one item in a list, so six named
+       pieces are something a viewer can pick from and one 56-minute file is
+       something they scroll through. Longest-first would do the opposite —
+       the play-all is the longest, so it would be kept and every piece
+       measured against it — hence a title waits until every *playlist*
+       inside it has been considered, and is then measured against whichever
+       of them were kept. It waits for playlists only, never for raw clips:
+       a 20-minute documentary authored as four clips arrives with those four
+       clips listed beside it, and waiting for them would swap one whole film
+       for four fragments cut wherever the author's files happened to end.
+       That is what a clip *is*, not a featurette, and nothing in the metadata
+       says otherwise.
+    7. **What comes out is never larger than what went in.** ``budget`` is
+       the image's size, and extras are refused once MakeMKV's own estimate of
+       the feature plus the extras would pass it. An image holds each segment
+       once, so output bigger than the image can only be something copied
+       twice; rules 5 and 6 should mean this never fires, and it is here
+       because the cost when they miss is a conversion that grows the library
+       it was meant to shrink. The estimate runs a few percent high (79.98 GB
+       promised, 76.3 GB written, on the disc above), which errs towards
+       refusing an extra rather than growing the library.
     """
     usable = [t for t in found if t.seconds > 0]
     if not usable:
@@ -380,7 +454,7 @@ def select(found: list[Title], expected_seconds: float = 0.0,
                                    f"against an expected {expected_seconds / 60:.0f} "
                                    f"min — the wrong title, or a damaged image")])
 
-    extras: list[Title] = []
+    candidates: list[Title] = []
     for title in ordered[1:]:
         if title.seconds < extras_min_seconds:
             rejected.append((title, "shorter than the extras floor"))
@@ -391,12 +465,74 @@ def select(found: list[Title], expected_seconds: float = 0.0,
         if title.seconds >= main.seconds * 0.9:
             rejected.append((title, "another version of the feature"))
             continue
+        candidates.append(title)
+
+    # Rule 6: a title waits for every candidate playlist inside it.
+    owned = [(t, set(t.segment_ids)) for t in candidates]
+
+    def waits_for(title: Title) -> int:
+        mine = set(title.segment_ids)
+        return sum(1 for other, theirs in owned
+                   if other is not title and not other.is_clip
+                   and theirs and theirs < mine)
+
+    kept = [main]
+    extras: list[Title] = []
+    used = main.size
+    for title in sorted(candidates, key=lambda t: (waits_for(t), *richest(t))):
+        sources, adds = _overlap(title, kept, usable)
+        if sources and adds < max(extras_min_seconds, 1):
+            names = _names(sources)
+            rejected.append((title, f"contained in {names}" if adds < 1 else
+                             f"all but {adds:.0f}s of it is in {names}"))
+            continue
+        if budget and used + title.size > budget:
+            rejected.append((title, "would make the output larger than the image"))
+            continue
         if len(extras) >= max_extras:
             rejected.append((title, "past the extras limit"))
             continue
         extras.append(title)
+        kept.append(title)
+        used += title.size
 
-    return Selection(main, extras, rejected)
+    # Longest first, whatever order they were weighed in: it is the order they
+    # are ripped in and numbered in `extras/`.
+    return Selection(main, sorted(extras, key=richest), rejected)
+
+
+def _overlap(title: Title, kept: list[Title],
+             measured: list[Title]) -> tuple[list[Title], float]:
+    """Which kept titles ``title`` repeats, and how many seconds of it are new.
+
+    The shared part is measured from below, out of titles MakeMKV timed that
+    fit inside it without two of them using the same segment — so "new" is an
+    upper bound, and a shared segment nothing timed on its own counts as new.
+    """
+    have: set[str] = set()
+    for k in kept:
+        have.update(k.segment_ids)
+    own = Counter(title.segment_ids)
+    shared = Counter({s: n for s, n in own.items() if s in have})
+    if not shared:
+        return [], title.seconds
+    sources = [k for k in kept if shared.keys() & set(k.segment_ids)]
+    if shared == own:
+        return sources, 0.0
+    room, known = shared.copy(), 0.0
+    for t in sorted(measured, key=lambda t: (-t.seconds, t.index)):
+        need = Counter(t.segment_ids)
+        if need and need <= room:
+            room -= need
+            known += t.seconds
+    return sources, max(0.0, title.seconds - known)
+
+
+def _names(titles: list[Title]) -> str:
+    indices = sorted(t.index for t in titles)
+    if len(indices) == 1:
+        return f"title {indices[0]}"
+    return "titles " + ", ".join(str(i) for i in indices)
 
 
 def rip(path: str, title: Title, out_dir: str, command: str,

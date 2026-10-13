@@ -1247,3 +1247,57 @@ worker both searched the same original, the first swapped its output in, and the
 encoded *that* output (generation loss — invariant 11) and counted a saving against the
 original's stale size. Red Dwarf S03E01: 1.75 GB file, `saved` 1.16 GB then 1.26 GB. Not fixed
 here, and the conversion correction alone does not make `bytes_saved` right.
+
+## 2026-10-13: Jurassic World Rebirth — extras that repeat one another, fixed in `select`
+
+Measured on lilnasx in a throwaway container (not the live `unfk`): the real `_convert` path with
+MakeMKV 1.18.4 on `Jurassic World Rebirth (2025) BR-DISK.iso` (94,465,884,160 bytes, 77 titles)
+chose the right feature — title 0, 8020 s, 20 chapters, 76.3 GB written — and then **24 extras,
+31.6 GB**, hitting `max_extras` with 6 more turned away. Feature + extras = 107.9 GB, 13 GB more
+than the image. On the live setting (`keep_disc_image` off) that conversion grows the library.
+
+The disc offers each of six featurettes four ways. From the robot output
+(`/mnt/user/appdata/.makemkv2-test/out/jw-1184.txt` on lilnasx, `--minlength=60`):
+
+| title | length | segments | what it is |
+|---|---|---|---|
+| 7 | 56:20 | 482,483,485,…,497,498,499 | "play all" of the six |
+| 19 | 11:56 | 497,498,499 | title card + featurette + tail |
+| 13 | 11:53 | 498,499 | featurette + tail |
+| 71 | 11:49 | 498 | the raw clip, added by MakeMKV |
+
+Segments 482, 485 … 497 and 484, 487 … 499 are 3–4 s cards — MakeMKV logs each one as under the
+minimum (`MSG:3025 … has length of 3 seconds`). `select` deduped only on an *identical* map, so 498
+was ripped four times; the extras came out in near-identical groups (1,457,198,695 /
+1,456,907,560 / 1,449,320,915 bytes at 12 min).
+
+**Fix, in `makemkv.select`** (docstring rules 5–7, AGENTS.md disc-conversion traps):
+
+- An extra is kept for what it **adds**: at least `extras_min_seconds` not already in the feature
+  or an extra kept so far. The shared part is measured from below, out of titles MakeMKV timed
+  that fit inside it without sharing a segment (`_overlap`) — so only MakeMKV's own durations are
+  used, and an overlap nothing timed (clips under `--minlength`) counts as new. Of the 75 segments
+  Rebirth's titles use, 57 are titles in their own right and the other 18 are logged short.
+- **The pieces beat the play-all**: a title waits until every candidate *playlist* inside it has
+  been weighed. Not raw clips (`Title.is_clip`, source `.m2ts`) — a documentary authored as four
+  clips would otherwise become four fragments.
+- **A budget**: extras that would take MakeMKV's size estimate past the image are refused
+  (`_convert` passes the measured image size). Belt and braces; it does not fire on Rebirth.
+
+Replayed against the real output: **14 extras, 13.0 GB** by MakeMKV's estimate (was 24 / 33.5 GB),
+feature + extras 93.0 GB against 94.5. Every featurette once, as the disc's own playlist (8–13)
+rather than the bare clip, so each keeps its 3–4 s tail card and loses its opening one. The play-all
+goes with *all but 22s of it is in titles 8, 9, 10, 11, 12, 13*. Mortal Kombat's 3-title output
+selects exactly as before. One loss, deliberate: title 2 strings together a 77 s piece and a 169 s
+one; the 169 s one is kept as its own playlist, the 77 s one was already under the 90 s floor on its
+own and goes with the play-all (lower the floor to 60 and it comes back as title 3).
+
+Tests in `tests/test_makemkv.py` carry the real segment maps (the 42 one-minute clips that overlap
+nothing are left out). Run against the old `select` with only a `budget` parameter shimmed in, the
+six selection tests failed there; the shared-bumper test passes on both, which is its point —
+it guards against the fix over-reaching.
+
+**Not verified:** no rip has been done with the new selection, so 13.0 GB is an estimate (it ran
+~4.6% high on the feature). The four live discs that already came out larger than their image
+(Hunger Games, Once Upon a Time in Hollywood, Dragonslayer, Ratatouille) have no captured robot
+output; that this catches them is an inference from their `extras/` folders. **Not deployed.**

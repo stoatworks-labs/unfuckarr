@@ -630,6 +630,32 @@ Break any of these and the failure is quiet and expensive.
   tags, and it cannot be shrunk from where it sits; one conversion clears all
   of it. It is also strictly better than what the compat path would otherwise
   do to a disc, which is the byte-range encode that came out short live.
+- **A disc offers one featurette several ways, and only one pair of them has
+  identical segment maps.** Jurassic World Rebirth (2025), 77 titles: segment
+  498 is the raw clip (title 71), the core of two playlists that differ only
+  by a 3-second title card (`498,499` and `497,498,499`), and the tail of a
+  56-minute "play all" of six featurettes. Deduping on an identical map kept
+  all four, so 24 extras came to 31.6 GB beside a 76.3 GB feature, out of a
+  94.5 GB image — with `keep_disc_image` off, a conversion that *grows* the
+  library. `makemkv.select` now keeps an extra only for what it adds: at least
+  `extras_min_seconds` not already in the feature or an extra already kept,
+  with the shared part measured from below, out of durations MakeMKV itself
+  reported. Two decisions inside that are deliberate:
+  - **The pieces beat the play-all.** In Emby an extra is one item in a list,
+    so six featurettes are choosable and one 56-minute file is not. Longest-
+    first would keep the play-all and measure every piece against it, so a
+    title waits until every candidate *playlist* inside it has been weighed.
+  - **It waits for playlists, never for raw clips.** MakeMKV lists every
+    `.m2ts` over `--minlength` beside the playlists, so a documentary
+    authored as four clips arrives with all four listed; waiting for them
+    would swap one film for four fragments cut at file boundaries.
+
+  Behind both, `select` refuses any extra that would take MakeMKV's estimate
+  of the output past the image's size: an image holds each segment once, so
+  output bigger than it is something copied twice. The estimate runs a few
+  percent high (79.98 GB promised, 76.3 GB written), so this errs towards
+  dropping an extra, and `convert_output_larger` is still the measured check
+  after the fact.
 
 ## Verified vs assumed
 
@@ -910,11 +936,27 @@ container's own ffmpeg:
   for: that it picks the right playlist off a real Blu-ray with seamless
   branching. Convert one disc by hand, with `keep_disc_image` on, and compare
   the result against the image before trusting it with a library.
-- **The extras heuristic is a length heuristic and nothing more.** "The longest
+- **The feature is still chosen by length and nothing more.** "The longest
   title is the feature" was right on every disc measured, and the discs where
   it will not be — an anthology, a TV season on one disc, a concert film with
   a longer bonus concert — are real and are not represented in any test here.
   `max_extras` and the extras floor limit the damage; nothing prevents it.
+- **The extras are now chosen by overlap, and that is verified on one disc's
+  structure, not on a rip.** The real 77-title output of Jurassic World Rebirth
+  is a test fixture: the old selection kept 24 extras (33.5 GB by MakeMKV's
+  estimate), the new one keeps 14 (13.0 GB), every featurette once, and
+  feature plus extras come to 93.0 GB against a 94.5 GB image. What that does
+  *not* cover: no conversion has run with the new selection, so the written
+  sizes are MakeMKV's estimates; and the four live discs that came out larger
+  than their image (The Hunger Games, Once Upon a Time in Hollywood,
+  Dragonslayer, Ratatouille) were converted before anyone captured their
+  robot output, so that this catches them is inferred from their `extras/`
+  folders — near-identical pairs and a 122-minute play-all — not measured.
+  Overlap made of clips shorter than `--minlength` cannot be measured and
+  counts as new, so it can still be copied twice; on Rebirth every such clip
+  is a 3–4 second title card. One deliberate loss: a 77-second piece reached
+  only through a play-all (Rebirth's title 2) goes when the play-all does,
+  because on its own it is under the 90-second floor.
 - **Nothing has been converted on the live library**, and the live instance's
   `disc_action` default (`flag`) means nothing will be until someone sets it.
 - **No Unraid server has installed the CA template.** It is written against the CA conventions
