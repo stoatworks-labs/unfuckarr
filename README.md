@@ -388,7 +388,7 @@ Image tags:
 
 | Tag | Means | Architectures |
 |---|---|---|
-| `latest`, `1.3.0`, `1.3` | the newest release | amd64 + arm64 |
+| `latest`, `1.4.0`, `1.4` | the newest release | amd64 + arm64 |
 | `edge` | current `main` | amd64 only |
 | `sha-abc1234` | one specific commit | amd64 (arm64 too, on releases) |
 
