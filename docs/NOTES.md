@@ -1762,3 +1762,65 @@ nothing is deployed. Allan asked for that separately. The payload shape comes fr
 API (`NotificationPlaybackInfo`: `PositionTicks`, `PlayedToCompletion`, `PlaySessionId`,
 `MediaSource`) and a 4.7.2 `playback.stop` posted on the Emby forum. No real 4.10.2 webhook has
 been received yet, so the first one should be checked against `parse`.
+
+
+## 2026-10-22: good conversions thrown away as "the wrong title"
+
+How it surfaced: three of the four films that failed in Emby this morning (Jason and the
+Argonauts, Prometheus, My Neighbor Totoro) were BR-DISK images, which Emby cannot read at all. Its
+ffmpeg is handed the raw `.iso` and answers *Invalid data found when processing input*. 97 images
+were still waiting, and the last conversion had been Fast & Furious on 10-08. Scan 57 (the
+default-audio re-transcode, started 10-14) was still running eight days later, so with
+`max_conversions_per_scan` 2 only two discs were tried in that time, both on 10-21 — and both were
+good copies, refused:
+
+- Pitch Black (2000): *the converted file is 112 min against an expected 56 min — the wrong title*.
+- Riddick (2013): 127 min against 95.
+
+Why: `_verify_conversion` compared the copy with the disc's measured duration both ways at
+`output_tolerance_pct` (2%), and that duration is the largest `.m2ts` — one segment of the film on
+a seamless-branching disc (see the largest-`.m2ts` note in AGENTS.md). MakeMKV had picked the
+right title both times; Pitch Black's 112 min is the director's cut. Neither film has an *arr
+runtime, so nothing else was consulted. Ten more waiting discs measure far short of Radarr's
+runtime and would have gone the same way: The Blues Brothers (19 of 133 min), F9 (22 of 143),
+Underworld (21 of 122), Independence Day (26 of 145), Furious 7, King Kong, Attack of the Clones,
+Gone in Sixty Seconds, The Phantom Menace, Return of the Jedi. F9 and The Blues Brothers had
+already failed once before 10-08 (the activity log no longer reaches back to say why).
+
+Fix (`3f9b8b4`): the measured length is a floor. A copy short of it is still refused at the tight
+tolerance; a copy matching it still passes on that alone, whatever the *arr says; a copy longer
+than it is judged on the *arr runtime at `duration_tolerance_pct` (25%), or on MakeMKV's promised
+length alone when there is no runtime, as for a disc nothing could measure. Five tests; the two
+Pitch Black-shaped ones fail on the old code with the live message.
+
+### 2026-10-22 11:24: deployed `3f9b8b4`, four discs given their attempt back
+
+`unfk` ran **`67e9fd0a8439`** = `docker/makemkv/Dockerfile` (`MAKEMKV_EULA=accepted`, MakeMKV
+1.18.4) on base `ghcr.io/stoatworks-labs/unfuckarr:edge` at `3f9b8b4`, app 1.4.0. The 31 code files
+in `/app` hash identical to the commit. Rollback tag **`unfuckarr-makemkv:rollback-2026-10-22`** =
+what was running (`7f86f6202`, app `c747ba4`). Backup at
+`/mnt/user/appdata/.unfk-backups/pre-conversion-floor-2026-10-22/`: `.backup()` as uid 99 with the
+container stopped, `integrity_check ok`, 18,886 files, plus `config.json`, inspect and the recreate
+script.
+
+With the container stopped, `convert_attempts` 1 → 0 on Pitch Black, Riddick, F9 and The Blues
+Brothers (all four `converted` and `convert_skipped` NULL before and after).
+
+**What the restart interrupted:** scan **57** closed as "interrupted by a restart" after eight
+days, plus one queued transcode and one queued shrink (X-Files S06E15, S06E14). No attempts
+counted. The next scheduled scan is 24 h after the restart, so the reset discs wait for it.
+
+**Verified live:** Pitch Black forced through `POST /api/files/action?action=convert` at 14:12.
+The same title 11 (6705 s, 12 chapters) was copied and passed this time: `convert_done`, 112 min,
+24 extras in `extras/`, the 96.7 GB image recycled to `/media/.recycle/2026-10-22/`, 6.5 GB saved.
+The new MKV (a 4K UHD rip) reads `incompatible` with `not_in_emby` until Emby scans the folder.
+
+Not fixed here: while the copy ran, the watcher logged `watch_settled` and `arrival_checked` for
+the files in `Pitch Black (2000) BR-DISK.unfuckarr.convert/` and left a `files` row for each — 21
+of them (`own_temp_skipped`, so nothing acted on them). The next scan's `collect` drops every row
+the *arrs do not list, which is why no earlier conversion has any left; until then they are only
+dashboard noise. Also an empty root-owned `The Hunger Games (2012) BR-DISK.unfuckarr.convert/`
+from 08-24 that the service cannot remove at start.
+
+Superseded at 14:49: `abde675` (the Emby playback webhook) was deployed over this at Allan's
+request, from the other session; this entry's fix is in it.
