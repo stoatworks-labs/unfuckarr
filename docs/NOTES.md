@@ -1848,6 +1848,15 @@ what it removed and the bytes that actually went (rmtree can get part-way). A le
 remove is logged as `abandoned_outputs_not_removed`, with the error, on every start until a person
 deletes it.
 
+**Also found afterwards, fixed on main, not deployed:** the hook started each action on a thread
+of its own, and its comment claimed the remediator's slots bounded how many ran. They don't for
+a conversion, which takes no slot. While the other session's nine-disc forced run was going, a
+failed play of any other waiting disc would have started a second MakeMKV rip beside it, and three
+failures in a row (as on the morning of 10-22) would have meant three at once. Now one action
+worker carries out the hook's decisions in order, kept apart from the investigating worker so a
+conversion never delays reading the next transcoder log. Until this is deployed, the live hook can
+still start overlapping conversions (at most 10 actions a day).
+
 **Emby cannot reach `http://unfk:6969`.** `EmbyServer` runs with host networking and the router's
 DNS (`192.168.1.1`), so `unfk` is NXDOMAIN. The host does reach unfk's tailnet address over
 `tailscale1`, so the webhook uses **`http://100.116.31.73:6969/api/emby/webhook`**. That address

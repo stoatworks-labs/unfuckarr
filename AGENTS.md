@@ -34,7 +34,8 @@ Tracker.stop()                 → a suspect: stopped within max_seconds of wher
   ↓                              (queued; one worker)
 investigate()                  → Emby's ffmpeg log → check_file → decode where it stopped
   ↓
-decide() → _not_for_this()     → Remediator.apply(), within max_actions_per_day
+decide() → _not_for_this()     → the action worker, one at a time → Remediator.apply(),
+                                 within max_actions_per_day
 ```
 
 The queue path is separate and touches no library file:
@@ -386,7 +387,10 @@ Break any of these and the failure is quiet and expensive.
     looks there, and would record a fix it had not seen (invariant 9). The transcoder log is read
     **first and at once**: Emby prunes `ffmpeg-*` logs within about a day, which is why this is a
     webhook and not a scan step. And the history lives in the `playback` table, not in findings,
-    which every check replaces wholesale.
+    which every check replaces wholesale. What it decides is carried out by **one** action worker,
+    kept apart from the investigating one. A conversion takes no slot in the remediator (only
+    transcodes and shrinks wait on `transcode.max_concurrent`), so a thread per action, which is
+    how abde675 shipped, would have started a MakeMKV rip for every disc that failed in a row.
 
     What prompted it: 2026-10-22 04:03–04:32, four plays in Chrome lasting 0–2 s, three Blu-ray
     images behind them. Emby's own ffmpeg cannot open a UDF image ("Invalid data found when

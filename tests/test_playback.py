@@ -355,6 +355,46 @@ def test_a_play_that_died_inside_the_first_sample_is_not_decoded_twice(
     assert calls == []
 
 
+def test_the_hook_acts_on_one_file_at_a_time(settings, monkeypatch):
+    """A conversion takes no slot in the remediator, so three discs failing in
+    a row — Jason, Prometheus and Totoro in Chrome, 2026-10-22 — would have
+    been three MakeMKV rips reading the array at once."""
+    rem = Remediator(lambda: settings)
+    started: list[str] = []
+    running, peak = [0], [0]
+    lock = threading.Lock()
+    first_in, release, all_done = (threading.Event(), threading.Event(),
+                                   threading.Event())
+
+    def slow_apply(row, result, info, decision, cancel=None):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+            started.append(row["path"])
+        first_in.set()
+        release.wait(5)
+        with lock:
+            running[0] -= 1
+            if len(started) == 3:
+                all_done.set()
+        return {"action": decision.action, "ok": True}
+
+    monkeypatch.setattr(rem, "apply", slow_apply)
+    watcher = PlaybackWatcher(lambda: settings, rem)
+    discs = [f"/media/{name}.iso" for name in ("Jason", "Prometheus", "Totoro")]
+    for path in discs:
+        watcher._actions.put(({"path": path}, CheckResult(path=path), None,
+                              Decision("convert", "disc image")))
+    watcher._ensure_actor()
+
+    assert first_in.wait(5)
+    time.sleep(0.3)
+    assert started == discs[:1], "the second waits for the first to finish"
+    release.set()
+    assert all_done.wait(5)
+    assert started == discs and peak[0] == 1
+
+
 def test_a_remux_is_never_offered_on_the_stopping_place_alone():
     """`_confirm_fixed` re-checks with the ordinary samples, which never look
     where the play stopped, so a remux would be recorded as a fix nobody saw

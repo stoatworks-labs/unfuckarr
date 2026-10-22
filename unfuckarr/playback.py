@@ -392,9 +392,16 @@ def _not_for_this(decision: Decision, result: CheckResult) -> Decision:
 class PlaybackWatcher:
     """Takes Emby's webhook, keeps the suspects, investigates them one at a time.
 
-    One worker, because an investigation decodes video and asks Emby for its
-    logs, and a viewer working through a broken season sends a suspect a
-    minute.
+    One worker investigates, because an investigation decodes video and asks
+    Emby for its logs, and a viewer working through a broken season sends a
+    suspect a minute. A second worker carries out what the investigations
+    decide, also one at a time, and the two are kept apart. A conversion is
+    tens of minutes, and the next suspect's transcoder log is being pruned
+    while it waits, so acting must not hold up investigating. Acting cannot
+    run in parallel either: a conversion takes no slot in the remediator (only
+    transcodes and shrinks do), so three discs failing in a row, as on
+    2026-10-22, would otherwise mean three MakeMKV rips reading the array at
+    once.
     """
 
     def __init__(self, settings_getter, remediator: Remediator) -> None:
@@ -403,6 +410,9 @@ class PlaybackWatcher:
         self.tracker = Tracker()
         self._queue: queue.Queue[Suspect] = queue.Queue(maxsize=QUEUE_LIMIT)
         self._worker: threading.Thread | None = None
+        # Unbounded, because `max_actions_per_day` already bounds what reaches it.
+        self._actions: queue.Queue[tuple] = queue.Queue()
+        self._actor: threading.Thread | None = None
         self._worker_lock = threading.Lock()
 
     def handle(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -437,6 +447,22 @@ class PlaybackWatcher:
             self._worker = threading.Thread(target=self._work, daemon=True,
                                             name="unfuckarr-playback")
             self._worker.start()
+
+    def _ensure_actor(self) -> None:
+        with self._worker_lock:
+            if self._actor is not None and self._actor.is_alive():
+                return
+            self._actor = threading.Thread(target=self._act, daemon=True,
+                                           name="unfuckarr-playback-act")
+            self._actor.start()
+
+    def _act(self) -> None:
+        while True:
+            item = self._actions.get()
+            try:
+                self._apply(*item)
+            finally:
+                self._actions.task_done()
 
     def _work(self) -> None:
         while True:
@@ -552,11 +578,9 @@ class PlaybackWatcher:
             return self._record(row, "warn")
         row["action"] = decision.action
         written = self._record(row, "warn")
-        # On a thread of its own, as an arrival's action is: a conversion is
-        # tens of minutes, and the next suspect's transcoder log is being
-        # pruned while it waits. The remediator's slots bound how many run.
-        threading.Thread(target=self._apply, args=(record, result, info, decision),
-                         daemon=True, name="unfuckarr-playback-act").start()
+        # To the action worker, one at a time: see the class docstring.
+        self._actions.put((record, result, info, decision))
+        self._ensure_actor()
         return written
 
     def _apply(self, record: dict[str, Any], result: CheckResult,
