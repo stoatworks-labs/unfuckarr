@@ -25,6 +25,18 @@ Remediator.apply()             → transcode.plan() → build_command() → run(
 
 `Scanner._remediate()` sits between decide and apply and holds the safety brakes.
 
+A failed play in Emby arrives by webhook and is investigated before anything decides (invariant 28):
+
+```
+api.emby_webhook → playback.PlaybackWatcher.handle()
+  ↓
+Tracker.stop()                 → a suspect: stopped within max_seconds of where it started
+  ↓                              (queued; one worker)
+investigate()                  → Emby's ffmpeg log → check_file → decode where it stopped
+  ↓
+decide() → _not_for_this()     → Remediator.apply(), within max_actions_per_day
+```
+
 The queue path is separate and touches no library file:
 
 ```
@@ -352,6 +364,31 @@ Break any of these and the failure is quiet and expensive.
     the same *no*, and did it again. ~15 TB rewritten in five days, Blade II 162 times. `_transcode`
     now refuses any non-repair plan that `changes_nothing` and logs `transcode_no_op` as a warning
     — if that event ever appears, `decide` and `plan` have drifted apart again.
+
+28. **A failed play is a reason to look, never a finding.** Emby has no "playback failed" event
+    (live 4.10.2, 2026-10-22: 1,650 activity-log entries over eight months, every one a start,
+    stop, login or plugin update), so `playback.Tracker` calls a play that stopped within
+    `max_seconds` of where it started a *suspect* — and 104 of 719 live plays were that short,
+    mostly browsing. `investigate` then gathers evidence and hands it to the ordinary `decide`:
+    Emby's transcoder log (`read_log` — a log is failed only if ffmpeg never reached its closing
+    summary *and* its last words are an error; a good transcode logs "Could not find codec
+    parameters" for every PGS track), the ordinary re-check, and a decode of the stretch where it
+    stopped (`playback_decode_errors`). The short play itself becomes `emby_playback_failed` at
+    **info** severity, so it can never drive an action — the same asymmetry as invariant 23, for
+    the same reason. Three more rules keep it honest. `_not_for_this` turns a shrink into a flag
+    (size is not why a film will not start) and turns a remux into a flag when the stopping-place
+    decode is its only reason, because `_confirm_fixed` re-checks with the ordinary samples, never
+    looks there, and would record a fix it had not seen (invariant 9). The transcoder log is read
+    **first and at once**: Emby prunes `ffmpeg-*` logs within about a day, which is why this is a
+    webhook and not a scan step. And the history lives in the `playback` table, not in findings,
+    which every check replaces wholesale.
+
+    What prompted it: 2026-10-22 04:03–04:32, four plays in Chrome lasting 0–2 s, three Blu-ray
+    images behind them. Emby's own ffmpeg cannot open a UDF image ("Invalid data found when
+    processing input", three retries in a second), so any client that cannot play an ISO itself
+    fails. unfuckarr had two of the three as `ok`; conversion was the fix and they were waiting
+    at two a night, biggest first. `Scanner._remediate` now converts a disc that failed to play
+    in the last 30 days before any other.
 
 ## Traps found the hard way
 

@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import config, db, intake, quality, recycle, transcode
+from . import config, db, intake, playback, quality, recycle, transcode
 from .clients.arr import ArrClient, ArrError
 from .clients.emby import EmbyClient, EmbyError
 from .config import Settings, WatchFolder
@@ -33,6 +33,7 @@ class Service:
         self.remediator = Remediator(config.get)
         self.scanner = Scanner(config.get, self.remediator)
         self.intake = intake.IntakeWatcher(config.get)
+        self.playback = playback.PlaybackWatcher(config.get, self.remediator)
         self.watcher = WatchManager(config.get, self._on_watch_ready)
         self._scan_lock = threading.Lock()
         self._scan_thread: threading.Thread | None = None

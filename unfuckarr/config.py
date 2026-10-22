@@ -52,8 +52,6 @@ class EmbyConfig(BaseModel):
     # Ask Emby itself whether it would direct play each file, rather than
     # inferring from ffprobe. Costs one request per file but is authoritative.
     use_playback_info: bool = True
-    # Read Emby's activity log for real playback failures.
-    read_activity_log: bool = True
     path_mappings: list[dict[str, str]] = Field(default_factory=list)
 
     @field_validator("url")
@@ -469,6 +467,40 @@ class IntakeConfig(BaseModel):
     never_act_phrases: list[str] = Field(default_factory=list)
 
 
+class PlaybackConfig(BaseModel):
+    """Investigating a file when it fails to play in Emby.
+
+    Driven by Emby's webhook (``playback.start`` and ``playback.stop`` sent to
+    ``/api/emby/webhook``), because Emby has no "playback failed" event and
+    keeps the transcoder log that says why for only about a day. A play that
+    stops before it gets anywhere is a *suspect*, not a verdict: people start
+    the wrong episode, or look at a film and change their mind. So a suspect is
+    investigated — the transcoder's log read, the file re-checked, the place it
+    stopped decoded — and only what the file itself shows decides anything,
+    through the same `decide` as every other path. A short play on its own
+    never deletes, blocklists or re-searches anything.
+    """
+
+    enabled: bool = True
+    # flag – investigate and record, and leave acting to the next scan.
+    # fix  – act on what the investigation found now, as an arrival check does.
+    # The policy above still decides *what* the action is; this only decides
+    # whether it waits for the night.
+    action: Literal["flag", "fix"] = "fix"
+    # A play that got less far than this before stopping, without finishing, is
+    # investigated. Thirty seconds clears the failures seen on the live server
+    # (0–2 s in Chrome, up to 18 s for a run of attempts on an LG TV) and is
+    # short of almost every real decision to stop watching.
+    max_seconds: int = 30
+    # The same file is investigated once in this window. A viewer whose film
+    # will not start tries it again at once — twice within two seconds, live —
+    # and the second attempt can only find what the first did.
+    quiet_minutes: int = 30
+    # The same brake as `Policy.max_actions_per_scan`, per day rather than per
+    # pass: a playback failure arrives one at a time, at any hour.
+    max_actions_per_day: int = 10
+
+
 class ScheduleConfig(BaseModel):
     scan_enabled: bool = True
     scan_interval_hours: int = 24
@@ -501,6 +533,7 @@ class Settings(BaseModel):
     shrink: ShrinkConfig = Field(default_factory=ShrinkConfig)
     makemkv: MakeMKVConfig = Field(default_factory=MakeMKVConfig)
     intake: IntakeConfig = Field(default_factory=IntakeConfig)
+    playback: PlaybackConfig = Field(default_factory=PlaybackConfig)
     policy: Policy = Field(default_factory=Policy)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     watch_folders: list[WatchFolder] = Field(default_factory=list)

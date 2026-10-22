@@ -494,12 +494,22 @@ class Scanner:
         # so the cap walks the backlog instead of circling the same few files.
         # With the shipped cap of 5 a night this ordering is the only thing
         # that decides whether a given file is ever asked about at all.
-        def order(item: tuple) -> tuple[int, float]:
+        #
+        # A disc somebody has just failed to watch goes ahead of every other
+        # disc. At two a night through a backlog of eighty-odd, biggest first,
+        # the four that failed in Chrome on 2026-10-22 had weeks to wait.
+        failed_to_play = {r["path"] for r in db.q(
+            "SELECT DISTINCT path FROM playback WHERE path IS NOT NULL "
+            "AND verdict <> 'repeat' AND ts > ?",
+            (time.time() - 30 * 86400,))}
+
+        def order(item: tuple) -> tuple:
             item_row, _, item_info, item_decision = item
             if item_decision.action == "research":
                 return (1, item_row.get("last_research") or 0.0)
             if item_decision.action == "convert":
-                return (2, -(item_info.size if item_info else 0))
+                return (2, item_row["path"] not in failed_to_play,
+                        -(item_info.size if item_info else 0))
             if item_decision.action != "shrink":
                 return (0, 0.0)
             return (3, -efficiency_checks.priority(item_info, s.efficiency))

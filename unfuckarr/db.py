@@ -172,6 +172,30 @@ CREATE TABLE IF NOT EXISTS intake (
 CREATE INDEX IF NOT EXISTS idx_intake_verdict ON intake(verdict);
 CREATE INDEX IF NOT EXISTS idx_intake_seen ON intake(last_seen DESC);
 
+-- Plays that stopped before they got anywhere, and what investigating each
+-- one found. Its own table rather than a finding, because findings are
+-- replaced wholesale on every check: the next scan would erase the only record
+-- that somebody could not watch this file, and why.
+CREATE TABLE IF NOT EXISTS playback (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL NOT NULL,       -- when the play stopped
+    item_id     TEXT,                -- Emby's
+    path        TEXT,                -- local, after path mapping; NULL if unknown
+    title       TEXT,
+    user        TEXT,
+    device      TEXT,
+    client      TEXT,
+    seconds     REAL,                -- how far it got
+    position    REAL,                -- where it stopped, seconds into the file
+    transcoder  TEXT,                -- the ffmpeg log Emby wrote, if any
+    error       TEXT,                -- the transcoder's last words, if it failed
+    verdict     TEXT,                -- what the investigation concluded
+    action      TEXT,                -- what was done about it
+    detail      TEXT                 -- JSON: the evidence
+);
+CREATE INDEX IF NOT EXISTS idx_playback_ts ON playback(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_playback_path ON playback(path);
+
 CREATE TABLE IF NOT EXISTS recycle (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     original  TEXT NOT NULL,
@@ -340,10 +364,13 @@ def log(event: str, level: str = "info", path: str | None = None,
     )
 
 
-def prune(activity_keep: int = 5000, jobs_keep: int = 2000) -> None:
+def prune(activity_keep: int = 5000, jobs_keep: int = 2000,
+          playback_keep: int = 2000) -> None:
     """Keep the tables bounded — a nightly sweep of a big library writes a lot."""
     ex("DELETE FROM activity WHERE id NOT IN "
        "(SELECT id FROM activity ORDER BY ts DESC LIMIT ?)", (activity_keep,))
+    ex("DELETE FROM playback WHERE id NOT IN "
+       "(SELECT id FROM playback ORDER BY ts DESC LIMIT ?)", (playback_keep,))
     ex("DELETE FROM jobs WHERE state IN ('done','failed','cancelled') AND id NOT IN "
        "(SELECT id FROM jobs WHERE state IN ('done','failed','cancelled') "
        "ORDER BY created DESC LIMIT ?)", (jobs_keep,))

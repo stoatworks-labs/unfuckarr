@@ -1703,3 +1703,62 @@ answered at startup. The code in `/app` is identical to `origin/main`. As uid 99
 **What the restart interrupted:** scan **56** (manual, started 00:24) was closed as "interrupted
 by a restart", and one queued transcode (Back to the Future Part III) failed the same way. That
 counts no attempts. The shrink that was running had finished as `done`.
+
+## 2026-10-22: plays that fail in Emby — a webhook, and the activity-log reader that never ran
+
+Allan asked whether unfuckarr could investigate a file automatically when it fails to play in
+Emby. Everything below was read from the live Emby at `lilnasx` (now **4.10.2.0**, Premiere
+active) through `unfk`'s own client, read-only.
+
+**Emby records no failure.** `System/ActivityLog/Entries` went back to 2026-02-16 and held
+1,650 entries: 833 `playback.stop`, 728 `playback.start`, logins, plugin updates, one failed
+scheduled task. Not one playback error. Pairing starts with stops by user, item and device gave
+719 plays; 104 lasted under 30 s (65 under 10 s), covering 52 files still in the library. 13 of
+those 52 were disc images. Most of the rest were people browsing, which is why a short play is
+a suspect and not a finding (AGENTS invariant 28).
+
+**The evidence is Emby's ffmpeg log, and it lasts about a day.** `GET /System/Logs` lists them
+and `GET /System/Logs/{name}` returns the text. At 10:10 UTC only that morning's 17 `ffmpeg-*`
+logs were left. The four most recent short plays were azlan121 in Chrome on Windows, 04:03–04:32:
+Jason and the Argonauts (twice, 2 s each), Prometheus (1 s), My Neighbor Totoro (0 s). All three
+are `BR-DISK.iso`. Each play left three `ffmpeg-transcode-*` logs a second apart, all ending
+`<path>.iso: Invalid data found when processing input` with no closing summary. unfuckarr had
+Jason as `incompatible` and Prometheus and Totoro as **`ok`**. A successful transcode the same
+morning (Spirited Away) logged `Could not find codec parameters for stream 3 (Subtitle:
+hdmv_pgs_subtitle)` and finished fine, so a log is only read as failed when ffmpeg never
+reached `video:…kB … muxing overhead` and its last words are an error.
+
+**`EmbyClient.playback_failures` and `emby.read_activity_log` were dead.** The setting had a
+switch in the UI and the README advertised the feature, but nothing called the method. If
+anything had, its filter (`severity error` or "failed" in the text) would have reported the
+seven `Failed Login Attempt` entries as playback failures. Both are removed; an old
+`config.json` carrying the key still loads, because pydantic ignores it.
+
+**What was built (`claude/emby-playback-failures`):** `playback.py`, with `POST
+/api/emby/webhook` (JSON or Emby's multipart form; `?apikey=` when a key is set) and `GET
+/api/playback`. A stop within `max_seconds` (30) of where the play started becomes a suspect.
+Investigating one means: the transcoder log, the ordinary re-check, and a decode of the stretch
+where it stopped. That stretch is often a resume point, which the start/middle/end samples never
+reach. The result goes through `decide`, then `_not_for_this` (no shrink, and no remux on the
+stopping-place decode alone, because `_confirm_fixed` cannot see there), then `apply`, at most
+`max_actions_per_day` (10) times a day, never for a file outside the inventory and never while
+paused. Each investigation is a `playback` row, so the next scan's findings rewrite cannot erase
+it. The scan now converts a disc that failed to play in the last 30 days before any other disc.
+`playback.action` ships on `fix`.
+
+**Checked against the live logs** (11:30, read-only: `playback.py` loaded into a throwaway
+process inside `unfk` with the two log calls patched onto the deployed client, no `investigate`).
+`read_log` on all 17 of the day's `ffmpeg-*` logs gave **failed** for the 13 Blu-ray transcodes
+(Jason ×6, Prometheus ×3, Totoro ×3, plus one more Jason) and **not failed** for the three good
+Spirited Away transcodes and the two remuxes of The Hobbit (1966), both of which logged
+`corrupt decoded frame in stream 1` and ran to the end. `find_transcoder`, fed this morning's four
+short plays from the activity log, matched each to its own failed logs. The two Jason attempts,
+five seconds apart, each matched all six because the activity log carries no PlaySessionId; the
+webhook does, which narrows it to the attempt's own three.
+
+**Not done:** Emby has not been pointed at the webhook (Settings → Notifications → Webhooks,
+Playback Start + Playback Stop, `application/json`, `http://unfk:6969/api/emby/webhook`), and
+nothing is deployed. Allan asked for that separately. The payload shape comes from Emby's plugin
+API (`NotificationPlaybackInfo`: `PositionTicks`, `PlayedToCompletion`, `PlaySessionId`,
+`MediaSource`) and a 4.7.2 `playback.stop` posted on the Emby forum. No real 4.10.2 webhook has
+been received yet, so the first one should be checked against `parse`.

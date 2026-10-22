@@ -682,6 +682,21 @@ async function openDrawer(path) {
       f.last_checked ? 'No problems found.' : 'This file has not been checked yet.'));
   }
 
+  const plays = (data.playback || []).filter((p) => p.verdict !== 'repeat');
+  if (plays.length) {
+    body.append(el('h3', { style: 'margin-top:18px' }, 'Failed to play in Emby'));
+    body.append(el('div', { class: 'card', style: 'padding:0' },
+      el('table', {}, el('tbody', {}, plays.map((p) => el('tr', {},
+        el('td', { class: 'muted small', style: 'white-space:nowrap;width:1%' }, ago(p.ts)),
+        el('td', {},
+          el('div', {}, p.verdict),
+          el('div', { class: 'muted small' },
+            `${p.user || 'someone'} on ${p.device || p.client || 'an unknown device'}, `
+            + `stopped after ${Math.round(p.seconds || 0)} s`
+            + (p.action && p.action !== 'none' ? ` — ${p.action}` : '')),
+          p.error ? el('div', { class: 'muted small mono' }, clip(p.error, 160)) : null)))))));
+  }
+
   if (probe.video || probe.audio) {
     body.append(el('h3', { style: 'margin-top:18px' }, 'Streams'));
     const rows = [];
@@ -1213,10 +1228,36 @@ async function viewSettings() {
       { label: 'Ask Emby whether it would direct play each file' }),
     el('div', { class: 'hint', style: 'margin:-6px 0 12px' },
       'Authoritative: Emby answers using its own version and codec support, and says why it would transcode. Costs one request per file.'),
-    settingField('emby.read_activity_log', s.emby.read_activity_log,
-      { label: "Read Emby's activity log for real playback failures" }),
     pathMappingEditor('emby', s.emby.path_mappings),
     el('div', { id: 'test-emby', class: 'small muted', style: 'margin-top:8px' })));
+
+  v.append(el('div', { class: 'card' },
+    el('h3', {}, 'Plays that fail in Emby'),
+    el('div', { class: 'hint', style: 'margin-bottom:12px' },
+      'Emby has no “playback failed” event, so this listens for plays that '
+      + 'stop before they get anywhere. Each one is investigated: Emby’s '
+      + 'transcoder log is read (Emby keeps it for about a day), the file is '
+      + 're-checked, and the stretch where it stopped is decoded. Only what '
+      + 'the file itself shows decides anything, through the policy below. '
+      + 'A short play on its own never deletes, blocklists or re-searches.'),
+    settingField('playback.enabled', s.playback.enabled,
+      { label: 'Investigate plays that fail' }),
+    el('div', { class: 'cols' },
+      settingField('playback.action', s.playback.action, { options: ['flag', 'fix'] }),
+      settingField('playback.max_seconds', s.playback.max_seconds,
+        { label: 'Failed if it stops within (seconds)' }),
+      settingField('playback.quiet_minutes', s.playback.quiet_minutes,
+        { label: 'Once per file in (minutes)' }),
+      settingField('playback.max_actions_per_day', s.playback.max_actions_per_day)),
+    el('div', { class: 'hint', style: 'margin:-4px 0 0' },
+      '“fix” acts on what it finds straight away; “flag” records it and '
+      + 'leaves acting to the next scan, which converts a disc that failed to '
+      + 'play before any other. In Emby, add a webhook under Settings → '
+      + 'Notifications for Playback Start and Playback Stop, sending '
+      + 'application/json to ',
+      el('span', { class: 'mono' }, `${location.origin}/api/emby/webhook`
+        + (s.api_key ? '?apikey=<your API key>' : '')),
+      '.')));
 
   // Watch folders
   v.append(watchFolderCard(s.watch_folders));

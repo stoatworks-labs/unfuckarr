@@ -7,8 +7,12 @@ Two things are worth getting from Emby that ffprobe cannot tell us:
    when it would not. That is authoritative in a way a local codec table never
    is — it accounts for the server's own version, its ffmpeg build and its
    remux rules.
-2. The activity log records real playback failures. A file that ffprobe likes
-   and a user could not play is exactly the case worth surfacing.
+2. Its own ffmpeg's log of a play that failed. Emby records no playback
+   failure anywhere — measured on a live 4.10.2 server, eight months of
+   activity log held only starts, stops and logins — so a failure has to be
+   inferred from a play that stopped as soon as it began (see playback.py),
+   and the transcoder's log is the evidence of what went wrong. Emby keeps
+   those logs for about a day, so they are read as the play stops.
 
 Item lookup is by file path, which means an index of the whole library. Emby
 returns ``Path`` on every item, so one recursive query builds it.
@@ -73,6 +77,15 @@ class EmbyClient:
     # -- plumbing ---------------------------------------------------------
 
     def _request(self, method: str, path: str, **kw: Any) -> Any:
+        resp = self._send(method, path, **kw)
+        if not resp.content:
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            return None
+
+    def _send(self, method: str, path: str, **kw: Any) -> httpx.Response:
         if not self.cfg.url or not self.cfg.api_key:
             raise EmbyError("Emby is not configured")
         url = f"{self.cfg.url}/{path.lstrip('/')}"
@@ -94,12 +107,7 @@ class EmbyClient:
             raise EmbyError("Emby rejected the API key")
         if resp.status_code >= 400:
             raise EmbyError(f"Emby {method} {path} → {resp.status_code}: {resp.text[:200]}")
-        if not resp.content:
-            return None
-        try:
-            return resp.json()
-        except ValueError:
-            return None
+        return resp
 
     def ping(self) -> dict[str, Any]:
         info = self._request("GET", "System/Info")
@@ -270,27 +278,31 @@ class EmbyClient:
         ))
         return True
 
-    # -- activity log -----------------------------------------------------
+    # -- server logs ------------------------------------------------------
 
-    def playback_failures(self, since_hours: int = 168) -> list[dict[str, Any]]:
-        """Entries from Emby's activity log that look like playback failures."""
-        start = time.time() - since_hours * 3600
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
-        data = self._request("GET", "System/ActivityLog/Entries",
-                             params={"minDate": stamp, "Limit": 500}) or {}
-        out = []
-        for e in data.get("Items", []):
-            sev = (e.get("Severity") or "").lower()
-            text = f"{e.get('Name', '')} {e.get('Overview', '')} {e.get('ShortOverview', '')}"
-            if sev in ("error", "fatal") or "failed" in text.lower():
-                out.append({
-                    "date": e.get("Date"),
-                    "name": e.get("Name", ""),
-                    "overview": e.get("Overview") or e.get("ShortOverview") or "",
-                    "item_id": e.get("ItemId"),
-                    "severity": sev or "error",
-                })
-        return out
+    def log_files(self) -> list[dict[str, Any]]:
+        """Emby's log directory: ``Name``, ``DateCreated`` (UTC), ``Size``.
+
+        The transcoder writes one ``ffmpeg-transcode-*`` or ``ffmpeg-remux-*``
+        file per attempt, and Emby prunes them within about a day.
+        """
+        data = self._request("GET", "System/Logs") or []
+        if isinstance(data, dict):
+            data = data.get("Items") or []
+        return [d for d in data if isinstance(d, dict) and d.get("Name")]
+
+    def log_text(self, name: str) -> str:
+        return self._send("GET", f"System/Logs/{name}").text
+
+    def item_path(self, item_id: str, media_source_id: str | None = None) -> str | None:
+        """The local path of one item, for a webhook that did not carry it."""
+        for path, entry in self.build_index().items():
+            if entry["id"] != item_id:
+                continue
+            if not media_source_id or entry.get("media_source_id") in (
+                    None, media_source_id):
+                return path
+        return None
 
     def refresh_item(self, item_id: str) -> None:
         """Re-read metadata after we replaced a file underneath Emby."""

@@ -16,7 +16,7 @@ from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 
-from . import config, db, quality, recycle
+from . import config, db, playback, quality, recycle
 from .clients.arr import ArrClient, ArrError
 from .clients.emby import EmbyClient, EmbyError
 from .config import Settings
@@ -257,6 +257,7 @@ def file_detail(path: str) -> dict[str, Any]:
                       "LIMIT 20", (path,))
     ]
     return {"file": _row(row), "findings": findings, "jobs": jobs,
+            "playback": _playback_rows("WHERE path = ?", (path,), 20),
             "exists": os.path.exists(path)}
 
 
@@ -296,6 +297,43 @@ def shrink_estimate(path: str) -> dict[str, Any]:
     if not service.estimate_shrink(path):
         raise HTTPException(409, "an estimate is already running")
     return {"started": True}
+
+
+# -- plays that failed in Emby --------------------------------------------
+
+def _playback_rows(where: str, params: tuple, limit: int) -> list[dict[str, Any]]:
+    out = []
+    for r in db.q(f"SELECT * FROM playback {where} ORDER BY ts DESC LIMIT ?",
+                  (*params, limit)):
+        d = {k: r[k] for k in r.keys()}
+        try:
+            d["detail"] = json.loads(d["detail"]) if d.get("detail") else None
+        except (TypeError, json.JSONDecodeError):
+            d["detail"] = None
+        out.append(d)
+    return out
+
+
+@api.post("/emby/webhook")
+async def emby_webhook(request: Request) -> dict[str, Any]:
+    """Emby's webhook. Point it here for ``playback.start`` and ``playback.stop``.
+
+    Returns at once: a play that stopped before it got anywhere is queued for
+    investigation, and everything else is answered and forgotten. With an API
+    key set, Emby cannot send a header, so it goes in the URL as ``?apikey=``.
+    """
+    payload = playback.webhook_payload(await request.body(),
+                                       request.headers.get("content-type", ""))
+    if payload is None:
+        raise HTTPException(400, "expected Emby's webhook JSON, sent as "
+                                 "application/json or multipart/form-data")
+    return service.playback.handle(payload)
+
+
+@api.get("/playback")
+def list_playback(limit: int = Query(100, le=1000)) -> list[dict[str, Any]]:
+    """Failed plays and what investigating each one found, newest first."""
+    return _playback_rows("", (), limit)
 
 
 # -- scans ----------------------------------------------------------------

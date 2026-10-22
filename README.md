@@ -125,8 +125,9 @@ is real progress. This is the one check that isn't looking for a fault, and it's
 all the way through: nothing it raises is ever an error, it can never reach a policy that
 deletes, and it's left out of the failure-ratio abort below.
 
-**Emby's activity log.** Real playback failures the server recorded, for files that otherwise
-look fine.
+**Plays that fail in Emby.** A file that passes every check above and still won't play for
+somebody. Emby doesn't record that anywhere, so unfuckarr listens for it through Emby's webhook
+and goes and looks. See [Plays that fail in Emby](#plays-that-fail-in-emby) below.
 
 Every file lists what's wrong with it, worst first:
 
@@ -248,6 +249,9 @@ Unattended deletion needs to be wrong safely, so there are three layers:
   at once, with a floor, because two blocked items out of two is a ratio of 100% that means
   nothing at all. And nothing is removed on the strength of a status message: see the queue
   section below.
+- **Playback brakes.** A failed play is investigated, never believed: see below. What the
+  investigation finds can act at most `max_actions_per_day` times a day (default 10), and never
+  on a file outside the library.
 - **Failure-ratio abort.** If more than half a library fails one pass, the scan stops and changes
   *nothing*. That's what an unmounted array looks like, and it's the failure mode that costs
   people their library. I don't count shrinks here, on purpose: an unmounted array produces
@@ -366,6 +370,50 @@ their own schedule and most blocks clear themselves.
 > sit inside the media mount, e.g. `/downloads` → `/media/downloads/complete`, so you don't need a
 > new volume. Without one, every blocked download reads as "could not tell" and nothing useful
 > happens.
+
+## Plays that fail in Emby
+
+Every check above is unfuckarr's opinion of a file. The only opinion that really counts is
+whether somebody could watch it, and Emby keeps that to itself. It has no "playback failed"
+event: eight months of activity log on my server held 1,650 entries, and every one was a play
+starting, a play stopping, a login or a plugin update. A failure looks like a play that stops a
+few seconds after it starts, and so does someone picking the wrong episode, which is the whole
+difficulty. On that same server 104 of 719 plays lasted under thirty seconds, and most of those
+were people browsing.
+
+So a short play is a reason to look, and nothing more. When one comes in, unfuckarr:
+
+1. **Reads Emby's transcoder log.** If Emby had to convert the file for the device, its ffmpeg
+   wrote down what happened, and Emby throws that log away within about a day. That's why this
+   runs off a webhook rather than the nightly scan.
+2. **Re-checks the file**, the same check every scan runs, Emby's direct-play verdict included.
+3. **Decodes the stretch where it stopped.** The ordinary check samples the start, middle and
+   end; a film that dies when you resume it at forty minutes died somewhere none of those reach.
+4. **Decides as it would for any other file.** A disc image gets converted, a broken file gets
+   repaired or replaced, and a file that turns out to be fine gets a note saying so, with Emby's
+   own error beside it if there was one. A shrink is never the answer to a film that won't start,
+   and nothing is deleted on the strength of a short play alone.
+
+This started with a real one. On 22 October four plays in Chrome failed within half an hour, none
+lasting more than two seconds, and all three films behind them were Blu-ray images. Chrome can't play an ISO,
+so Emby transcodes it, and Emby's own ffmpeg can't open one either: *"Invalid data found when
+processing input"*, three retries, under a second. unfuckarr had two of them down as fine.
+Converting them was already the fix, but they were waiting their turn at two discs a night. A disc
+that has failed to play now goes to the front of that queue, whether or not the webhook is
+allowed to act.
+
+**Setting it up.** In Emby (it needs Emby Premiere), add a webhook under *Settings →
+Notifications* for **Playback Start** and **Playback Stop**, sending `application/json` to
+`http://<unfuckarr>:6969/api/emby/webhook`. If you've set an API key, Emby can't send a header,
+so put it in the URL: `…/api/emby/webhook?apikey=<key>`. The settings page shows the exact
+address. The playback action ships on `fix`, because what it does is exactly what the nightly
+scan would have done anyway, only sooner; set it to `flag` and it investigates, records, and
+leaves acting to the scan. Every failed play and what was found is on the file's page and at
+`/api/playback`.
+
+What it can't see: a client that crashes without telling Emby it stopped sends nothing at all,
+and a device that direct-plays a file and then chokes on it leaves no transcoder log, so the
+answer there is often just "the file is fine".
 
 ## Install
 
