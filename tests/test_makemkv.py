@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import shutil
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -1439,3 +1440,113 @@ def test_a_copy_matching_the_discs_largest_stream_ignores_the_arr_runtime(
     out = convert_with(image, settings, row, 6.0)
 
     assert out["ok"] and out["action"] == "convert", out
+
+
+# -- discs nothing could open ----------------------------------------------
+# libudfread refuses some images outright. They have no probe, no Emby verdict
+# and nothing found wrong, so they read "ok" — and a scan re-checks an
+# unchanged "ok" file only every `recheck_after_days`.
+
+def checked_yesterday(path: Path, status: str = "ok", **extra) -> dict:
+    """A row as a scan leaves it: checked a day ago, unchanged since."""
+    st = path.stat()
+    return insert(path, status=status, last_checked=time.time() - 86400,
+                  checked_signature=f"{st.st_size}:{st.st_mtime}", **extra)
+
+
+def conversions_on(settings) -> None:
+    settings.policy.disc_action = "convert"
+    settings.makemkv.enabled = True
+    settings.makemkv.command = "makemkvcon"
+
+
+def unreadable_image(tmp_path: Path, name: str = "Prometheus (2012).iso") -> Path:
+    """No Volume Recognition Sequence at all: nothing will open it."""
+    image = tmp_path / name
+    image.write_bytes(b"\0" * (128 * 2048))
+    return image
+
+
+def test_a_disc_waiting_to_convert_is_checked_on_every_pass(settings, tmp_path):
+    """Prometheus and My Neighbor Totoro, live on 2026-10-22: two of eleven
+    images libudfread refuses, both "ok", both failing in Emby that morning,
+    and neither ever reaching `decide` — which converts any disc image. An
+    ordinary "ok" file beside them still waits its 90 days."""
+    from unfuckarr.scanner import needs_check
+    conversions_on(settings)
+    film = tmp_path / "Film (2011).mkv"
+    film.write_bytes(b"\0" * 4096)
+
+    assert needs_check(checked_yesterday(unreadable_image(tmp_path)), settings)
+    assert not needs_check(checked_yesterday(film), settings)
+
+
+@pytest.mark.parametrize("why", ["failed once", "left alone", "MakeMKV off",
+                                 "flag only"])
+def test_a_disc_no_pass_could_convert_waits_like_any_other_ok_file(
+        settings, tmp_path, why):
+    """`convert_refused` turns a written-off disc away and `convert_blocked`
+    turns every disc away; re-checking one of those nightly is a probe for
+    nothing."""
+    from unfuckarr.scanner import needs_check
+    conversions_on(settings)
+    extra: dict = {}
+    if why == "failed once":
+        extra = {"convert_attempts": 1}
+    elif why == "left alone":
+        extra = {"convert_skipped": "no title near the runtime"}
+    elif why == "MakeMKV off":
+        settings.makemkv.enabled = False
+    else:
+        settings.policy.disc_action = "flag"
+
+    row = checked_yesterday(unreadable_image(tmp_path), **extra)
+
+    assert not needs_check(row, settings)
+
+
+@needs_ffmpeg
+def test_a_scan_converts_a_disc_nothing_could_open(settings, tmp_path,
+                                                    monkeypatch):
+    """The whole path, from a row that reads "ok" to the conversion being
+    asked for: re-checked, still nothing found wrong, and converted anyway,
+    because "we could not open it" is a reason to try MakeMKV (invariant 17)."""
+    from unfuckarr.scanner import Scanner
+    conversions_on(settings)
+    image = unreadable_image(tmp_path)
+    checked_yesterday(image)
+    applied: list[tuple[str, str]] = []
+    rem = Remediator(lambda: settings)
+    monkeypatch.setattr(rem, "apply", lambda row, result, info, decision, **k:
+                        applied.append((row["path"], decision.action))
+                        or {"ok": True})
+
+    Scanner(lambda: settings, rem).run("manual", paths=[str(image)])
+
+    assert applied == [(str(image), "convert")]
+    assert db.q1("SELECT status FROM files WHERE path=?",
+                 (str(image),))["status"] == "ok"
+
+
+def test_a_disc_nothing_could_open_takes_its_turn_by_size(settings,
+                                                          monkeypatch):
+    """Biggest first, and an image with no probe has a size all the same — on
+    the row. Read as 0, all eleven of them queued behind every readable disc
+    in the library, at two a night."""
+    from unfuckarr.checks import CheckResult
+    from unfuckarr.probe import MediaInfo
+    scanner, applied = _scan_harness(settings, monkeypatch)
+    settings.policy.max_conversions_per_scan = 1
+
+    readable = "/media/Readable (2011).iso"
+    unreadable = "/media/Prometheus (2012).iso"
+    pending = [
+        ({"path": readable, "size": 40_958_099_456}, CheckResult(path=readable),
+         MediaInfo(path=readable, disc_kind="bluray", size=40_958_099_456),
+         Decision("convert", "disc image")),
+        ({"path": unreadable, "size": 49_339_957_248},
+         CheckResult(path=unreadable), None, Decision("convert", "disc image")),
+    ]
+    scanner._remediate(settings, pending, population=50)
+
+    assert applied == [unreadable]

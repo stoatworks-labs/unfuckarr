@@ -195,6 +195,11 @@ Break any of these and the failure is quiet and expensive.
     delete-and-re-search, and three 42 GB images are recoverable only because the recycle bin
     caught them. Any new "cannot open" path must land on the info finding, not the error one.
 
+    The other half: an info finding leaves the file "ok", and `needs_check` skips an unchanged
+    "ok" file for `recheck_after_days`. So a disc image a pass could still convert is re-checked
+    on every pass whatever its status, or it never reaches `decide`, which converts it. Live, 11
+    unreadable images sat at "ok" unconverted until 2026-10-22, two of them failing in Emby.
+
 18. **The tailnet-only stance is policy, not decoration.** The README warning (private
     network/tailnet only, never the public internet, no independent human security review) stays,
     because the service deletes media unattended and has no auth until a key is set. In the same

@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import db, recycle, transcode
+from . import db, disc, recycle, transcode
 from .checks import CheckResult, Finding
 from .checks import compat as compat_checks
 from .checks import efficiency as efficiency_checks
@@ -30,7 +30,7 @@ from .clients.arr import ArrClient, ArrError
 from .clients.emby import EmbyClient, EmbyError
 from .config import VIDEO_EXTENSIONS, Settings
 from .probe import MediaInfo, ProbeError, probe
-from .remediation import Decision, Remediator, decide
+from .remediation import Decision, Remediator, convert_blocked, decide
 from .state import ScanProgress, bus, clear_task, publish_scan, set_task, state
 
 log = logging.getLogger(__name__)
@@ -229,6 +229,20 @@ def needs_check(row: Any, s: Settings) -> bool:
         return True                      # gone or unreadable — worth reporting
     signature = f"{stat.st_size}:{stat.st_mtime}"
     if row["checked_signature"] != signature:
+        return True
+    # A disc image a pass could still convert is re-checked on every pass,
+    # whatever its status says, because only a re-check reaches `decide`, and
+    # `decide` is what converts it. The images libudfread refuses — the
+    # `disc_not_inspectable` ones — have no probe, no Emby verdict and nothing
+    # found wrong, so they read "ok", and an unchanged "ok" file waits
+    # `recheck_after_days` before anything looks at it again. Live on
+    # 2026-10-22 that was 11 of the 96 images waiting, Prometheus and My
+    # Neighbor Totoro among them, both failing in Emby that morning: never
+    # converted, and invisible to the failed-to-play ordering in `_remediate`
+    # as well. The readable images are "incompatible" and re-checked every
+    # pass already, so this costs one failed open each for the rest.
+    if (disc.is_disc_image(row["path"]) and convert_blocked(s) is None
+            and Remediator.convert_refused(dict(row)) is None):
         return True
     # "unmeasured" belongs with "ok" here, not with the faults. Nothing is
     # wrong with the file; it is waiting for a quality search that the
@@ -503,13 +517,15 @@ class Scanner:
             "AND verdict <> 'repeat' AND ts > ?",
             (time.time() - 30 * 86400,))}
 
+        # An image nothing could open has no probe, so its size is the row's;
+        # reading it as 0 put all eleven of them behind every readable disc.
         def order(item: tuple) -> tuple:
             item_row, _, item_info, item_decision = item
             if item_decision.action == "research":
                 return (1, item_row.get("last_research") or 0.0)
             if item_decision.action == "convert":
-                return (2, item_row["path"] not in failed_to_play,
-                        -(item_info.size if item_info else 0))
+                size = item_info.size if item_info else item_row.get("size") or 0
+                return (2, item_row["path"] not in failed_to_play, -size)
             if item_decision.action != "shrink":
                 return (0, 0.0)
             return (3, -efficiency_checks.priority(item_info, s.efficiency))

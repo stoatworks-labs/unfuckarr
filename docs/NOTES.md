@@ -1875,3 +1875,32 @@ The live hook wrote `playback` row 1: 2.0 s; Emby's transcoder log found and rea
 (its last words were `[hevc] Skipping NAL unit 63`, a NAL type ffmpeg does not decode and skips); the
 file re-checked as `hygiene` (image-only subtitles, HDR); verdict "nothing wrong found — most
 likely the viewer stopped"; action `flag`. Nothing was done to the file, which is right.
+
+
+## 2026-10-22: eleven disc images nothing could open were never going to be converted
+
+Prometheus and My Neighbor Totoro failed in Emby this morning, and were then converted by hand
+(`POST /api/files/action?action=convert`, both fine: 124 min with 3 extras, 86 min with 5). Their
+rows said `ok`, which is why no scan had ever touched them. They are two of the **11** waiting
+images libudfread refuses: `disc_not_inspectable` is an info finding (invariant 17), so with no
+probe, no Emby verdict and nothing found wrong the status is `ok`, and `needs_check` skips an
+unchanged `ok` file for `recheck_after_days` (90). Only a re-check reaches `decide`, and `decide`
+converts any disc image, unreadable or not (`_is_disc` reads the extension for exactly these). The
+other nine, live, at the time: The Lego Movie 2, Rogue One, Independence Day: Resurgence, Jurassic
+World Dominion, Hotel Transylvania 1 and 2, The Hunger Games: Mockingjay Part 2, John Wick:
+Chapter 4, Blade: Trinity.
+
+A second gap behind the first: the convert order is biggest first by the probe's size, and an
+image with no probe counted as 0, so even re-checked they would all have queued behind every
+readable disc — about 85 of them at two a night.
+
+Fix: `needs_check` re-checks a disc image on every pass while it can still be converted
+(`convert_blocked` says the settings allow it and `convert_refused` says the row does); a
+written-off disc, or one with conversion switched off, waits like any other `ok` file. The order
+falls back to the row's size. That also puts these discs in front of the failed-to-play ordering
+`abde675` added, which only sees files that reach `pending`. Cost: one failed open per unreadable
+image per pass. Seven tests; the three that exercise the change fail on the old scanner. AGENTS.md
+invariant 17 has the rule.
+
+**Not deployed** (Allan: not until he says). Until it is, these nine wait for a forced conversion
+or for a play to fail and the webhook to convert them.
