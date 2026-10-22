@@ -1843,6 +1843,10 @@ removed, MKV untouched. The other session's recheck ran it again (201215, done 1
 **After a conversion, wait out the watch folder's settle before recreating.** Also:
 `abandoned_outputs_removed` lists every leftover it found, including those it failed to delete.
 The root-owned Hunger Games `.unfuckarr.convert/` from 08-24 is in its `paths` and is still there.
+Fixed on main straight after, and **not deployed**: `Service._sweep_leftovers` now reports only
+what it removed and the bytes that actually went (rmtree can get part-way). A leftover it cannot
+remove is logged as `abandoned_outputs_not_removed`, with the error, on every start until a person
+deletes it.
 
 **Emby cannot reach `http://unfk:6969`.** `EmbyServer` runs with host networking and the router's
 DNS (`192.168.1.1`), so `unfk` is NXDOMAIN. The host does reach unfk's tailnet address over

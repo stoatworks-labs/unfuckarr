@@ -315,6 +315,83 @@ def test_interrupted_scans_are_closed_at_startup(settings):
     assert state.last_scan_finished >= before
 
 
+def _film_with_leftovers(tmp_path):
+    film = tmp_path / "The Hunger Games (2012)"
+    film.mkdir()
+    real = film / "The Hunger Games (2012) BR-DISK.mkv"
+    real.write_bytes(b"film")
+    db.ex("INSERT INTO files (path, status) VALUES (?, 'ok')", (str(real),))
+    output = film / "The Hunger Games (2012) BR-DISK.unfuckarr.mkv"
+    output.write_bytes(b"x" * 100)
+    workdir = film / "The Hunger Games (2012) BR-DISK.unfuckarr.convert"
+    workdir.mkdir()
+    (workdir / "title_t00.mkv").write_bytes(b"y" * 50)
+    (workdir / "title_t01.mkv").write_bytes(b"z" * 30)
+    return output, workdir
+
+
+def _logged(event: str):
+    import json
+    row = db.q1("SELECT detail FROM activity WHERE event=?", (event,))
+    return json.loads(row["detail"]) if row else None
+
+
+def test_a_leftover_that_cannot_be_removed_is_not_reported_removed(
+        settings, tmp_path, monkeypatch):
+    """Live 2026-10-22: a root-owned `.unfuckarr.convert/` from 08-24 was
+    listed under `abandoned_outputs_removed` on every start, bytes and all,
+    while it sat there untouched — the service runs as uid 99."""
+    from unfuckarr import service as service_mod
+    from unfuckarr.service import Service
+
+    output, workdir = _film_with_leftovers(tmp_path)
+
+    def refuse(path, *a, **kw):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(service_mod.shutil, "rmtree", refuse)
+    out = Service._sweep_leftovers()
+
+    assert out["removed"] == [str(output)] and not output.exists()
+    assert workdir.exists()
+    assert out["failed"][0]["path"] == str(workdir)
+    assert "Permission denied" in out["failed"][0]["error"]
+    assert out["bytes"] == 100, "nothing of the work dir went"
+    assert _logged("abandoned_outputs_removed") == {
+        "count": 1, "bytes": 100, "paths": [str(output)]}
+    refused = _logged("abandoned_outputs_not_removed")
+    assert refused["count"] == 1
+    assert refused["leftovers"][0]["path"] == str(workdir)
+
+
+def test_a_leftover_removed_part_way_counts_only_what_went(
+        settings, tmp_path, monkeypatch):
+    from unfuckarr import service as service_mod
+    from unfuckarr.service import Service
+
+    output, workdir = _film_with_leftovers(tmp_path)
+
+    def halfway(path, *a, **kw):
+        (workdir / "title_t00.mkv").unlink()
+        raise PermissionError(13, "Permission denied", str(workdir / "title_t01.mkv"))
+
+    monkeypatch.setattr(service_mod.shutil, "rmtree", halfway)
+    out = Service._sweep_leftovers()
+    assert out["bytes"] == 100 + 50
+    assert [f["path"] for f in out["failed"]] == [str(workdir)]
+
+
+def test_a_clean_library_logs_neither(settings, tmp_path):
+    from unfuckarr.service import Service
+
+    real = tmp_path / "Film.mkv"
+    real.write_bytes(b"film")
+    db.ex("INSERT INTO files (path, status) VALUES (?, 'ok')", (str(real),))
+    assert Service._sweep_leftovers() == {"removed": [], "failed": [], "bytes": 0}
+    assert _logged("abandoned_outputs_removed") is None
+    assert _logged("abandoned_outputs_not_removed") is None
+
+
 def test_stop_and_restart_over_the_api(client, monkeypatch):
     """Stop with nothing running says so; restart with nothing running is a
     start; restart while running queues a start behind the stop."""

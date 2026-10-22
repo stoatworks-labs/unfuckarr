@@ -28,6 +28,27 @@ from .watcher import WatchManager
 log = logging.getLogger(__name__)
 
 
+def _size_on_disk(path: str) -> int:
+    """Bytes under ``path``, a file or a directory; 0 once it has gone.
+
+    Whatever cannot be read counts as nothing, before a removal and after
+    it alike, so the difference between the two is what actually went.
+    """
+    if os.path.isdir(path):
+        total = 0
+        for folder, _, names in os.walk(path):
+            for name in names:
+                try:
+                    total += os.lstat(os.path.join(folder, name)).st_size
+                except OSError:
+                    pass
+        return total
+    try:
+        return os.lstat(path).st_size
+    except OSError:
+        return 0
+
+
 class Service:
     def __init__(self) -> None:
         self.remediator = Remediator(config.get)
@@ -120,36 +141,57 @@ class Service:
             db.log("scans_reconciled", "warn",
                    detail={"interrupted": [r["id"] for r in open_scans]})
 
-        def sweep() -> None:
-            paths = [r["path"] for r in db.q("SELECT path FROM files")]
-            leftovers = transcode.abandoned_outputs(paths)
-            freed = 0
-            for path in leftovers:
-                try:
-                    # A conversion killed part-way leaves a *directory* — the
-                    # work dir MakeMKV was ripping into — and it is the same
-                    # trap as the abandoned transcode output, at the same size:
-                    # invisible to everything that enumerates media, and full
-                    # of a partial copy of a Blu-ray.
-                    if os.path.isdir(path):
-                        freed += sum(f.stat().st_size for f in
-                                     Path(path).rglob("*") if f.is_file())
-                        shutil.rmtree(path)
-                    else:
-                        freed += os.path.getsize(path)
-                        os.unlink(path)
-                except OSError as exc:
-                    log.warning("could not remove leftover %s: %s", path, exc)
-            if leftovers:
-                db.log("abandoned_outputs_removed", "warn", detail={
-                    "count": len(leftovers), "bytes": freed,
-                    "paths": leftovers[:10],
-                })
-
         # On a background thread: it is a listdir per media directory, and a
         # slow array must not hold up the web server coming back.
-        threading.Thread(target=sweep, daemon=True,
+        threading.Thread(target=self._sweep_leftovers, daemon=True,
                          name="unfuckarr-leftovers").start()
+
+    @staticmethod
+    def _sweep_leftovers() -> dict[str, Any]:
+        """Remove our leftovers beside known media, and say which went.
+
+        Only what actually went is reported as removed, with the bytes that
+        actually went. This used to list everything it *found* under
+        `abandoned_outputs_removed`, and count a directory's size before trying
+        to delete it. So a leftover it could not delete was logged as removed
+        on every start: live 2026-10-22, a root-owned Hunger Games
+        `.unfuckarr.convert/` from 08-24, which the service, running as uid 99,
+        cannot touch. One it cannot remove is logged on its own, with the
+        reason, because only a person can fix that.
+        """
+        paths = [r["path"] for r in db.q("SELECT path FROM files")]
+        removed: list[str] = []
+        failed: list[dict[str, str]] = []
+        freed = 0
+        for path in transcode.abandoned_outputs(paths):
+            # A conversion killed part-way leaves a *directory* — the work dir
+            # MakeMKV was ripping into — and it is the same trap as the
+            # abandoned transcode output, at the same size: invisible to
+            # everything that enumerates media, and full of a partial copy of
+            # a Blu-ray.
+            before = _size_on_disk(path)
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
+            except OSError as exc:
+                log.warning("could not remove leftover %s: %s", path, exc)
+                failed.append({"path": path, "error": str(exc)})
+                # rmtree can get part-way, so count what did go.
+                freed += max(0, before - _size_on_disk(path))
+                continue
+            removed.append(path)
+            freed += before
+        if removed:
+            db.log("abandoned_outputs_removed", "warn", detail={
+                "count": len(removed), "bytes": freed, "paths": removed[:10],
+            })
+        if failed:
+            db.log("abandoned_outputs_not_removed", "warn", detail={
+                "count": len(failed), "leftovers": failed[:10],
+            })
+        return {"removed": removed, "failed": failed, "bytes": freed}
 
     # -- continuous shrinking ---------------------------------------------
 
