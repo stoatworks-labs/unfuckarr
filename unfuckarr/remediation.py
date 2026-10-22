@@ -1509,7 +1509,7 @@ class Remediator:
                 "attempts": self._count_convert_attempt(path, file_row)})
             return {"action": "convert", "ok": False, "message": reason}
 
-        bad = self._verify_conversion(produced, info, reference, main.seconds,
+        bad = self._verify_conversion(produced, info, expected, main.seconds,
                                       s, cfg)
         if bad is not None:
             Path(produced).unlink(missing_ok=True)
@@ -1599,7 +1599,7 @@ class Remediator:
                 "message": summary}
 
     def _verify_conversion(self, dst: str, info: MediaInfo | None,
-                           reference: float, promised: float, s: Settings,
+                           expected: float, promised: float, s: Settings,
                            cfg: Any) -> str | None:
         """Returns a failure reason, or None when the conversion is good.
 
@@ -1607,14 +1607,29 @@ class Remediator:
         source, and for the five images libudfread refuses there is no such
         thing — those are exactly the discs worth handing to MakeMKV.
 
-        So there are two references, and the important one is free.
+        So there are three references, and the important one is free.
         ``promised`` is the length MakeMKV said the title was, moments before
         it wrote the file, and comparing the two needs nothing to have been
         readable: a copy that stops early is a file that does not match what
-        the tool that made it said it would be. ``reference`` — the disc's own
-        measured duration, or the *arr's nominal runtime — is the second, and
-        it gets the wide tolerance when it is the nominal one, because a
-        nominal runtime includes ad breaks the file never had.
+        the tool that made it said it would be.
+
+        The disc's own measured duration is the second, and it is the length
+        of its largest stream — a floor for the feature, not its length. The
+        feature is the longest title, and no stream on the disc is longer
+        than that, so a copy shorter than the largest stream is the wrong
+        title or a damaged image. A copy that matches it is the best
+        cross-check there is. A copy *longer* than it is a disc that builds
+        the feature out of segments, where the largest stream is a piece of
+        the film: Pitch Black (2000), live on 2026-10-21, measured 56 min,
+        and the 112-minute director's cut MakeMKV copied was thrown away as
+        the wrong title — for good, one attempt being all a disc gets.
+        Riddick (2013) the same, 127 min against 95; ten more discs in the
+        library measured as little as a seventh of their film.
+
+        So past the floor, ``expected`` — the *arr's nominal runtime — is the
+        third, with the wide tolerance, because a nominal runtime includes ad
+        breaks the file never had. With neither, ``promised`` stands alone,
+        as it does for a disc nothing could measure.
         """
         try:
             out = probe(dst, s.ffprobe_path)
@@ -1630,14 +1645,20 @@ class Remediator:
                 return (f"the converted file is {out.duration / 60:.0f} min "
                         f"against an expected {promised / 60:.0f} min — "
                         "the copy stopped early")
-        if reference > 0:
-            measured = info is not None and info.duration > 0
-            tolerance = (cfg.output_tolerance_pct if measured
-                         else cfg.duration_tolerance_pct) / 100
-            drift = abs(out.duration - reference) / reference
-            if drift > tolerance:
+        floor = info.duration if info is not None and info.duration > 0 else 0.0
+        if floor > 0:
+            tolerance = cfg.output_tolerance_pct / 100
+            if out.duration < floor * (1 - tolerance):
+                return (f"the converted file is {out.duration / 60:.0f} min, "
+                        f"shorter than the {floor / 60:.0f} min longest stream "
+                        "on the disc — the wrong title, or a damaged image")
+            if out.duration <= floor * (1 + tolerance):
+                return None
+        if expected > 0:
+            drift = abs(out.duration - expected) / expected
+            if drift > cfg.duration_tolerance_pct / 100:
                 return (f"the converted file is {out.duration / 60:.0f} min "
-                        f"against an expected {reference / 60:.0f} min — "
+                        f"against an expected {expected / 60:.0f} min — "
                         "the wrong title")
         return None
 

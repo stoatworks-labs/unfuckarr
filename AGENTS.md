@@ -422,6 +422,9 @@ Break any of these and the failure is quiet and expensive.
   expected runtime raises `duration_below_expected` (info) and never `duration_mismatch` — on an
   ordinary file that shortfall means truncation, on a disc it almost always means the heuristic
   picked a segment. Reading `BDMV/PLAYLIST/*.mpls` for the longest playlist is the real fix.
+  The same goes for checking a conversion: `_verify_conversion` treats the measured length as a
+  floor, and a copy longer than it is judged on the *arr's runtime instead. Compared both ways it
+  threw away good copies for good — Pitch Black's 112-minute cut against a 56-minute stream.
 - **Never fall back to the ISO9660 bridge to find a Blu-ray's streams.** It is tempting when
   libudfread cannot read the UDF (4 of 104 images), and it is wrong: ISO9660 cannot describe a
   file over 4 GB in one extent, so the bridge lists the main feature in fragments. On a real 96 GB

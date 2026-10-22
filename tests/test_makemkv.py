@@ -1350,3 +1350,92 @@ def test_a_copy_that_failed_on_a_replaced_disc_is_not_counted_against_it(
     assert convert_state(image) == UNTOUCHED
     assert db.q1("SELECT COUNT(*) n FROM activity "
                  "WHERE event='convert_failed'")["n"] == 0
+
+
+# -- checking what came out -----------------------------------------------
+# A disc's measured duration is its largest single stream. On a disc that
+# builds the feature out of segments — seamless branching, two cuts sharing
+# most of their frames — that stream is a piece of the film, not the film.
+
+def measured_as(image: Path, seconds: float):
+    from unfuckarr.probe import MediaInfo
+    st = image.stat()
+    return MediaInfo(path=str(image), disc_kind="bluray", container="bluray",
+                     duration=seconds, size=st.st_size, mtime=st.st_mtime)
+
+
+def convert_with(image: Path, settings, row: dict, seconds: float) -> dict:
+    from unfuckarr.checks import CheckResult
+    return Remediator(lambda: settings).apply(
+        row, CheckResult(path=str(image)), measured_as(image, seconds),
+        Decision("convert", "disc image"))
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("runtime", [None, 6])
+def test_a_feature_longer_than_the_discs_largest_stream_is_kept(
+        fake_makemkv, video_factory, settings, tmp_path, runtime):
+    """Pitch Black (2000), live on 2026-10-21: the largest stream measured
+    56 min, MakeMKV copied the 112-minute director's cut it is part of, and
+    the copy was thrown away as "the wrong title" — permanently. Riddick
+    (2013) had no *arr runtime either; with one that agrees, the copy is
+    just as good."""
+    image = convertible_disc(fake_makemkv, video_factory, settings, tmp_path)
+    row = insert(image, expected_runtime=runtime)
+
+    out = convert_with(image, settings, row, 3.0)
+
+    assert out["ok"] and out["action"] == "convert", out
+    assert db.q1("SELECT COUNT(*) n FROM activity "
+                 "WHERE event='convert_output_bad'")["n"] == 0
+
+
+@needs_ffmpeg
+def test_a_copy_shorter_than_the_discs_largest_stream_is_still_refused(
+        fake_makemkv, video_factory, settings, tmp_path):
+    """The floor holds, at the tight tolerance. The feature is the longest
+    title, and no stream on a disc is longer than that, so a copy that comes
+    out short of the largest one is wrong whatever MakeMKV promised."""
+    short = video_factory("src-short.mkv", seconds=5)
+    image = convertible_disc(
+        fake_makemkv, video_factory, settings, tmp_path,
+        titles=[{"index": 0, "duration": "0:00:05", "file": str(short),
+                 "segments": "1"}])
+    row = insert(image)
+
+    out = convert_with(image, settings, row, 6.0)
+
+    assert not out["ok"], out
+    assert "shorter than" in out["message"]
+    assert convert_state(image)["convert_attempts"] == 1
+
+
+@needs_ffmpeg
+def test_past_the_floor_the_arr_runtime_still_catches_the_wrong_title(
+        fake_makemkv, video_factory, settings, tmp_path):
+    """With the largest stream only a floor, the *arr's runtime is what
+    stops a copy far from the film's length — a play-all, a trailer — at
+    its wide tolerance, as it does for a disc nothing could measure."""
+    image = convertible_disc(fake_makemkv, video_factory, settings, tmp_path)
+    row = insert(image, expected_runtime=20)
+
+    out = convert_with(image, settings, row, 3.0)
+
+    assert not out["ok"], out
+    assert "the wrong title" in out["message"]
+    assert convert_state(image)["convert_attempts"] == 1
+
+
+@needs_ffmpeg
+def test_a_copy_matching_the_discs_largest_stream_ignores_the_arr_runtime(
+        fake_makemkv, video_factory, settings, tmp_path):
+    """When the largest stream is the whole feature, the copy matching it is
+    the best cross-check there is, and a nominal runtime that disagrees —
+    an extended cut, a wrong entry — does not overrule it. Unchanged from
+    before the floor: this is the case the measurement was built for."""
+    image = convertible_disc(fake_makemkv, video_factory, settings, tmp_path)
+    row = insert(image, expected_runtime=20)
+
+    out = convert_with(image, settings, row, 6.0)
+
+    assert out["ok"] and out["action"] == "convert", out
