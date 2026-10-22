@@ -406,7 +406,8 @@ allowed to act.
 Notifications* for **Playback Start** and **Playback Stop**, sending `application/json` to
 `http://<unfuckarr>:6969/api/emby/webhook`. If you've set an API key, Emby can't send a header,
 so put it in the URL: `…/api/emby/webhook?apikey=<key>`. The settings page shows the exact
-address. The playback action ships on `fix`, because what it does is exactly what the nightly
+address, and Emby has to be able to resolve it: if unfuckarr is tailnet-only and Emby uses your
+router's DNS, the name won't resolve, so use unfuckarr's tailnet IP. The playback action ships on `fix`, because what it does is exactly what the nightly
 scan would have done anyway, only sooner; set it to `flag` and it investigates, records, and
 leaves acting to the scan. Every failed play and what was found is on the file's page and at
 `/api/playback`.

@@ -1756,12 +1756,10 @@ short plays from the activity log, matched each to its own failed logs. The two 
 five seconds apart, each matched all six because the activity log carries no PlaySessionId; the
 webhook does, which narrows it to the attempt's own three.
 
-**Not done:** Emby has not been pointed at the webhook (Settings → Notifications → Webhooks,
-Playback Start + Playback Stop, `application/json`, `http://unfk:6969/api/emby/webhook`), and
-nothing is deployed. Allan asked for that separately. The payload shape comes from Emby's plugin
-API (`NotificationPlaybackInfo`: `PositionTicks`, `PlayedToCompletion`, `PlaySessionId`,
-`MediaSource`) and a 4.7.2 `playback.stop` posted on the Emby forum. No real 4.10.2 webhook has
-been received yet, so the first one should be checked against `parse`.
+**At merge, not yet done:** Emby pointed at the webhook, the deploy, and a check of a real 4.10.2
+payload. The payload shape came from Emby's plugin API (`NotificationPlaybackInfo`) and a 4.7.2
+`playback.stop` posted on the Emby forum. All three were done the same afternoon; see "deployed
+`abde675`" below.
 
 
 ## 2026-10-22: good conversions thrown away as "the wrong title"
@@ -1824,3 +1822,52 @@ from 08-24 that the service cannot remove at start.
 
 Superseded at 14:49: `abde675` (the Emby playback webhook) was deployed over this at Allan's
 request, from the other session; this entry's fix is in it.
+
+### 2026-10-22 14:50: deployed `abde675`, Emby pointed at it, and the first real payload
+
+`unfk` runs **`0e4e69e9`** = `docker/makemkv/Dockerfile` (`MAKEMKV_EULA=accepted`, MakeMKV
+1.18.4) on `ghcr.io/stoatworks-labs/unfuckarr:edge` at `abde675` (CI-built, label checked). All 32
+files under `/app/unfuckarr` and `/app/web` have the same git blob hashes as the commit. Rollback
+tag **`unfuckarr-makemkv:rollback-2026-10-22-3f9b8b4`** = `67e9fd0a8439`; plain
+`rollback-2026-10-22` was already the image before that. Backup at
+`/mnt/user/appdata/.unfk-backups/pre-playback-webhook-2026-10-22/`: an online `.backup()` as uid
+99 taken once Pitch Black's conversion had finished, `integrity_check ok`, 18,907 files, plus
+`config.json`, inspect and the recreate script. Healthy about 75 s after `recreate-unfk.sh`, and
+Sonarr 4.0.20, Radarr 6.4.4 and Emby 4.10.2 all answered.
+
+**What the restart interrupted, and the trap behind it:** the in-flight check at 14:48 found
+nothing running. But Pitch Black's new MKV had landed in the watch folder, and at 14:48:50,
+60 s after `convert_done`, its arrival check started transcode **201213** (add an AC3 5.1
+default). The stop at 14:49:08 cut it off: `jobs_reconciled`, `fix_attempts` 0, partial output
+removed, MKV untouched. The other session's recheck ran it again (201215, done 15:10).
+**After a conversion, wait out the watch folder's settle before recreating.** Also:
+`abandoned_outputs_removed` lists every leftover it found, including those it failed to delete.
+The root-owned Hunger Games `.unfuckarr.convert/` from 08-24 is in its `paths` and is still there.
+
+**Emby cannot reach `http://unfk:6969`.** `EmbyServer` runs with host networking and the router's
+DNS (`192.168.1.1`), so `unfk` is NXDOMAIN. The host does reach unfk's tailnet address over
+`tailscale1`, so the webhook uses **`http://100.116.31.73:6969/api/emby/webhook`**. That address
+is unfk's tailscale identity, which lives in `/config` and survives a recreate. unfuckarr has no
+API key set, so the URL needs no `?apikey=`.
+
+**The webhook, made over the API the way Emby's own settings page makes it**
+(`settings/notificationeditor.js`, `webhookeditorjs`). `GET
+Notifications/Services/Defaults?UserId=<admin>&NotifierKey=webhooknotifications` returns a blank
+entry, whose default is multipart. Set `FriendlyName`, `EventIds` [`playback.start`,
+`playback.stop`], `Options.Url`, and `Options.EnableMultipartFormData` "false". `POST
+Notifications/Services/Configured` returns a **500 null reference unless `UserId` is set**; with it,
+204. It is stored as id `43a91e06fba74601bb62828cd0849796` with `UserId` "1", and `DELETE
+Notifications/Services/Configured?Id=…&UserId=1` removes it. None of this is in Emby's
+`/openapi.json`. `POST Notifications/Services/Test` delivered `system.notificationtest` to unfk as
+`application/json`, from the host's tailnet address; the hook ignores it, as it should.
+
+**The first real payload** (15:14, captured passively off unfk's `tailscale0` with an AF_PACKET
+reader, since the host has no tcpdump): azlan121 played the new Pitch Black MKV in Chrome on
+macOS and stopped it at 2 s. The real 4.10.2 bodies carry everything `parse` reads: `Item.Path` and
+`Id`, `Session.DeviceName`/`Client`/`Id`, `User.Name`, and `PlaybackInfo.PositionTicks`,
+`PlaySessionId` and `MediaSource` (`Path`, `Id`), plus `PlayedToCompletion` on the stop. `playback.start` also
+carries `TranscodingInfo`. Start and stop share the PlaySessionId, so the tracker paired them.
+The live hook wrote `playback` row 1: 2.0 s; Emby's transcoder log found and read as not failed
+(its last words were `[hevc] Skipping NAL unit 63`, a NAL type ffmpeg does not decode and skips); the
+file re-checked as `hygiene` (image-only subtitles, HDR); verdict "nothing wrong found — most
+likely the viewer stopped"; action `flag`. Nothing was done to the file, which is right.
