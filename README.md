@@ -402,6 +402,14 @@ Converting them was already the fix, but they were waiting their turn at two dis
 that has failed to play now goes to the front of that queue, whether or not the webhook is
 allowed to act.
 
+Two days later it missed two more, for a reason Emby doesn't advertise. Emby can't read a disc
+image, so it doesn't know how long the film is, and it marks a film with no length as watched
+the moment it stops: "played to completion", at position 0. The web player also starts a new
+play session for each retry, so the stop didn't match the start it belonged to. unfuckarr now
+matches a stop to the last start of the same film on the same device. It doesn't believe a
+completion at position 0, so it times the play by the clock instead. Emby will still have
+marked the film as watched. That's Emby's doing, so untick it in Emby.
+
 **Setting it up.** In Emby (it needs Emby Premiere), add a webhook under *Settings →
 Notifications* for **Playback Start** and **Playback Stop**, sending `application/json` to
 `http://<unfuckarr>:6969/api/emby/webhook`. If you've set an API key, Emby can't send a header,

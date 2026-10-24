@@ -399,6 +399,15 @@ Break any of these and the failure is quiet and expensive.
     at two a night, biggest first. `Scanner._remediate` now converts a disc that failed to play
     in the last 30 days before any other.
 
+    Emby's "completed" is no more evidence than its silence. An item with no runtime, which is
+    every disc image its ffmpeg cannot open, is marked watched on any stop: `PlayedToCompletion`
+    true, position 0. And Emby Web takes a new PlaySessionId for every retry, so the stop does
+    not carry the start's. Live 2026-10-24, both Sinbad discs failed in a second that way and
+    `Tracker.stop` discarded them on the completed flag before measuring anything. So a stop
+    falls back to the latest start of the same item on the same device (`Play.device_key`),
+    and a completion is believed only with a position past 0; without one, the wall clock
+    measures the play. Keep both: either alone still loses that play.
+
 ## Traps found the hard way
 
 - **The recycle bin's size is what is on disk, not `SUM(size)` from the table.** The two disagree,

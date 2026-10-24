@@ -1913,3 +1913,28 @@ invariant 17 has the rule.
 
 **Not deployed** (Allan: not until he says). Until it is, these nine wait for a forced conversion
 or for a play to fail and the webhook to convert them.
+
+## 2026-10-24: two discs failed in Chrome and the webhook never looked
+
+00:43–00:44 UTC, Chrome on macOS: King Solomon's Mines (1937), The Golden Voyage of Sinbad and
+Sinbad and the Eye of the Tiger. The webhook recorded the first (a resume at 14:07 that played
+2.3 s and stopped, a plain H.264/AAC direct play; "nothing wrong" was right) and nothing for the
+other two, both BR-DISK images that died with "Invalid data found when processing input". Emby's
+log shows it posted both stops to unfk and got a 200.
+
+Two things in Emby's stop event, and either one alone loses the play once the other is fixed:
+
+- **`PlayedToCompletion` was true.** Emby cannot probe an ISO, so the item has no `RunTimeTicks`,
+  and a stop on an item with no runtime is taken as fully watched: `Played` true, `PlayCount` 1,
+  position 0. Both Sinbads now show as watched in Emby. `Tracker.stop` returned on `completed`
+  before anything else.
+- **The stop's PlaySessionId was not the start's.** Emby Web retried each film twice (direct play,
+  `DirectPlayError`, then transcodes), each attempt with a new PlaySessionId (Golden Voyage:
+  start `a13cecbf…`, stop `65974ea4…`). So the start was never found and there was no wall clock
+  to fall back on.
+
+Fix: `Play.device_key` (session id plus item id) finds the latest start of the same item on the
+same device when the PlaySessionId has changed, and a completion with no position past 0 is not
+believed: the wall clock measures the play instead, so a client that really played the image
+for an hour is still not a suspect. Four tests; the two that reproduce the live sequence fail on
+the old tracker. AGENTS.md invariant 28 has the rule.

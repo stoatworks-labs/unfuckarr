@@ -89,7 +89,21 @@ class Play:
     @property
     def key(self) -> str:
         """What ties a stop to its start: one play of one item on one device."""
-        return self.play_session_id or f"{self.session_id}:{self.item_id}"
+        return self.play_session_id or self.device_key
+
+    @property
+    def device_key(self) -> str:
+        """The same play when Emby has given it a new PlaySessionId since.
+
+        Emby Web retries a play that fails, direct play and then a transcode
+        twice, and takes a new PlaySessionId for each attempt, while the start
+        went out under the first. Live, 2026-10-24: both Sinbad discs started
+        under one id and stopped under the third. Empty when Emby sent no
+        session or no item, because ":" would tie unrelated plays together.
+        """
+        if not (self.session_id and self.item_id):
+            return ""
+        return f"{self.session_id}:{self.item_id}"
 
 
 def webhook_payload(body: bytes, content_type: str = "") -> dict[str, Any] | None:
@@ -184,7 +198,8 @@ class Tracker:
     """
 
     def __init__(self, clock=time.time) -> None:
-        self._open: dict[str, tuple[float, float]] = {}
+        # key -> (when it started, where it started, Play.device_key)
+        self._open: dict[str, tuple[float, float, str]] = {}
         self._lock = threading.Lock()
         self._clock = clock
 
@@ -193,22 +208,44 @@ class Tracker:
         with self._lock:
             # Bounded by age: a stop Emby never sent must not hold memory for
             # the life of the process.
-            for key in [k for k, (t, _) in self._open.items()
+            for key in [k for k, (t, _, _) in self._open.items()
                         if now - t > 86400]:
                 del self._open[key]
-            self._open[play.key] = (now, play.position or 0.0)
+            self._open[play.key] = (now, play.position or 0.0, play.device_key)
+
+    def _opened(self, play: Play) -> tuple[float, float] | None:
+        """The start this stop ends: by its PlaySessionId, or else the latest
+        start of the same item on the same device (`Play.device_key`)."""
+        with self._lock:
+            opened = self._open.pop(play.key, None)
+            if opened is None and play.device_key:
+                same = [k for k, v in self._open.items()
+                        if v[2] == play.device_key]
+                if same:
+                    opened = self._open.pop(max(same,
+                                                key=lambda k: self._open[k][0]))
+        return (opened[0], opened[1]) if opened else None
 
     def stop(self, play: Play, max_seconds: float) -> Suspect | None:
         now = self._clock()
-        with self._lock:
-            opened = self._open.pop(play.key, None)
-        if play.completed:
+        opened = self._opened(play)
+        # Emby calls a play complete in two cases: it reached the end, or Emby
+        # never knew where the end was. An item with no runtime, which is
+        # every disc image its ffmpeg cannot open, is marked watched on any
+        # stop and reported at position 0. Only the first is a reason to stop
+        # looking. Live, 2026-10-24: two Blu-ray images that died in a second
+        # each arrived as completed and were never investigated.
+        no_end = play.completed and not play.position
+        if play.completed and not no_end:
             return None
         wall = now - opened[0] if opened else None
         if wall is not None and wall > ABANDONED_SECONDS:
             return None
-        if play.position is not None:
-            reached = max(0.0, play.position - (opened[1] if opened else 0.0))
+        # That 0 is Emby's, not the player's, so it says nothing about how far
+        # the play got. The wall clock does.
+        position = None if no_end else play.position
+        if position is not None:
+            reached = max(0.0, position - (opened[1] if opened else 0.0))
         elif wall is not None:
             reached = wall
         else:

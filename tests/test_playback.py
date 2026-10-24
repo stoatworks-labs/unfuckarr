@@ -242,6 +242,54 @@ def test_a_stop_without_its_start_is_measured_from_the_top_of_the_file():
     assert tracker.stop(play("playback.stop", ticks=None), 30) is None
 
 
+# Live, 2026-10-24: The Golden Voyage of Sinbad started under one
+# PlaySessionId and stopped under the third, 2.4 s later, "played to
+# completion" at position 0, because Emby had no runtime for the image.
+RETRY_SESSION = "65974ea4fcf74ba9b49e21e2427187f1"
+
+
+def test_a_disc_emby_cannot_read_is_a_suspect_though_emby_calls_it_watched():
+    for ticks in (0, None):              # 0 as sent live; None if Emby drops it
+        tracker, now = _tracker()
+        tracker.start(play("playback.start"))
+        now[0] += 2.4
+        suspect = tracker.stop(play("playback.stop", ticks=ticks, done=True,
+                                    session=RETRY_SESSION), 30)
+        assert suspect is not None
+        assert suspect.started == 1000.0 and suspect.seconds == pytest.approx(2.4)
+
+
+def test_an_image_that_really_played_is_measured_by_the_clock():
+    """A client that plays the image itself gets the same position 0 at the
+    end, and it is not a failed play."""
+    tracker, now = _tracker()
+    tracker.start(play("playback.start"))
+    now[0] += 300
+    assert tracker.stop(play("playback.stop", ticks=0, done=True), 30) is None
+
+
+def test_a_retried_resume_is_measured_from_where_it_resumed():
+    """Without the start, 40:02 reads as forty minutes watched."""
+    tracker, now = _tracker()
+    tracker.start(play("playback.start", ticks=2400 * 10**7))
+    now[0] += 2
+    suspect = tracker.stop(play("playback.stop", ticks=2402 * 10**7,
+                                session=RETRY_SESSION), 30)
+    assert suspect is not None and suspect.seconds == 2
+
+
+def test_a_new_session_id_only_finds_a_start_of_the_same_item():
+    tracker, now = _tracker()
+    tracker.start(play("playback.start", ticks=2400 * 10**7, item_id="other"))
+    now[0] += 2
+    assert tracker.stop(play("playback.stop", ticks=2402 * 10**7,
+                             session=RETRY_SESSION), 30) is None
+    # The other item's start is still there for its own stop.
+    suspect = tracker.stop(play("playback.stop", ticks=2401 * 10**7,
+                                item_id="other"), 30)
+    assert suspect is not None and suspect.seconds == 1
+
+
 # -- Emby's transcoder log ------------------------------------------------
 
 def test_a_transcoder_that_could_not_open_the_file_is_read_as_failed():
