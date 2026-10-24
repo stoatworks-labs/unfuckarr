@@ -1953,3 +1953,26 @@ Space, checked before running it: conversions write beside the image under `/mnt
 The media share is cache "yes" with a share floor of about 781 GB, and the cache pool had 716 GB
 free (91%), so new media files already go to the array. Recent conversion and shrink output was on
 `/mnt/disk2` and `/mnt/disk4`. The array had 34 TB free.
+
+### 2026-10-24 01:22: deployed `1e5aae9`, and the sweep started
+
+CI's test job hung in "Install ffmpeg" until its 10-minute timeout (the apt mirror again; 08bcff7's
+run failed the same way), so the image job was skipped and `edge` was still abde675. A re-run of the
+failed jobs passed, and the pulled `edge` carried revision `1e5aae9`. Built on lilnasx under its own
+tag first, `/app` checked against the build clone (32 files, identical), MakeMKV 1.18.4 answering,
+then retagged `edge` and recreated. Image `61ac5ec8`; rollback tag
+`unfuckarr-makemkv:rollback-2026-10-24-abde675` (the old `0e4e69e9`); backup
+`.unfk-backups/pre-disc-sweep-2026-10-24` (db with its WAL, integrity ok, 18,916 files). This also
+deployed b5e4d36, 08bcff7 and d59dc1c, which had been waiting since 10-22.
+
+The restart closed scan 58 as interrupted, 2,222 of 3,393 repairs in (mostly default-audio
+transcodes, Vikings). The next scheduled scan takes up the rest. It also interrupted one transcode
+and one shrink search, and the start-up sweep removed 88 `*.unfuckarr-*.jpg/png` files, which were
+Emby's artwork for a temporary name.
+
+The two Sinbads were unmarked as watched in Emby (`DELETE /Users/{id}/PlayedItems/{item}`).
+
+`POST /api/scan/discs` at 01:23:40 became scan 59: 87 disc rows checked in about two minutes, all 87
+pending. F9 went first (biggest, 98.7 GB). It converted in 38 minutes, copying at about
+38 MB/s: 150 min, 20 chapters, 22 extras, 83.2 GB, ISO recycled. The Blues Brothers was selected
+seven seconds later. At that rate the whole sweep is a day or two of copying.
