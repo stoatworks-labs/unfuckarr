@@ -280,7 +280,16 @@ class Scanner:
             state.scan.stopping = True
             publish_scan()
 
-    def run(self, trigger: str = "manual", paths: list[str] | None = None) -> dict[str, Any]:
+    def run(self, trigger: str = "manual", paths: list[str] | None = None,
+            discs: bool = False) -> dict[str, Any]:
+        """One pass over the library, or over ``paths``.
+
+        ``discs`` makes it the one-off disc sweep: every disc image the
+        library holds, converted one after another with no per-scan cap, and
+        nothing else acted on. It exists because `max_conversions_per_scan`
+        drains a backlog at two discs a night, and every disc still waiting
+        is a film Emby cannot play (invariant 28).
+        """
         s = self._settings()
         self._stop = False
         self._applying = None
@@ -293,7 +302,7 @@ class Scanner:
         db.log("scan_started", "info", detail={"trigger": trigger})
 
         try:
-            return self._run_inner(s, scan_id, paths)
+            return self._run_inner(s, scan_id, paths, discs)
         finally:
             state.scan.running = False
             state.scan.stopping = False
@@ -309,7 +318,7 @@ class Scanner:
             db.prune()
 
     def _run_inner(self, s: Settings, scan_id: int,
-                   paths: list[str] | None) -> dict[str, Any]:
+                   paths: list[str] | None, discs: bool = False) -> dict[str, Any]:
         if paths is None:
             set_task("scan", kind="scanning", detail="enumerating libraries",
                      progress=-1, started=time.time())
@@ -328,6 +337,10 @@ class Scanner:
             placeholders = ",".join("?" for _ in paths)
             candidates = db.q(
                 f"SELECT * FROM files WHERE path IN ({placeholders})", paths)
+        if discs:
+            # After the enumeration, not instead of it, so a disc that arrived
+            # since the last scan has a row and is swept with the rest.
+            candidates = [r for r in candidates if disc.is_disc_image(r["path"])]
 
         todo = [r for r in candidates if needs_check(r, s)]
         state.scan.total = len(todo)
@@ -378,6 +391,11 @@ class Scanner:
                 publish_scan()
 
                 decision = decide(result, s)
+                # The sweep converts and does nothing else. Whatever else a
+                # check finds on a disc is the ordinary scan's to act on,
+                # under the ordinary scan's caps.
+                if discs and decision.action != "convert":
+                    continue
                 if decision.action not in ("none",):
                     pending.append((row, result, info, decision))
         finally:
@@ -389,7 +407,8 @@ class Scanner:
         if state.scan.aborted:
             return {"aborted": state.scan.aborted}
 
-        return self._remediate(s, pending, population)
+        return self._remediate(s, pending, population,
+                               max_conversions=len(pending) if discs else None)
 
     def _stopped(self) -> None:
         """Record a user stop, once, with where the scan had got to."""
@@ -440,7 +459,8 @@ class Scanner:
     def _remediate(self, s: Settings,
                    pending: list[tuple[dict[str, Any], CheckResult,
                                        MediaInfo | None, Decision]],
-                   population: int = 0) -> dict[str, Any]:
+                   population: int = 0,
+                   max_conversions: int | None = None) -> dict[str, Any]:
         # The brake asks "has most of the *library* just broken?", so the
         # denominator is every file whose state this pass knows — the ones it
         # re-probed plus the ones `needs_check` skipped because they were
@@ -476,6 +496,8 @@ class Scanner:
             publish_scan()
             return {"aborted": state.scan.aborted, "flagged": len(pending)}
 
+        conversion_cap = (s.policy.max_conversions_per_scan
+                          if max_conversions is None else max_conversions)
         applied = 0
         shrinks = 0
         conversions = 0
@@ -593,10 +615,10 @@ class Scanner:
                 if self.remediator.convert_refused(
                         row, force=decision.force) is not None:
                     continue
-                if conversions >= s.policy.max_conversions_per_scan:
+                if conversions >= conversion_cap:
                     if not capped_conversions:
                         db.log("convert_cap_reached", "info", row["path"],
-                               {"cap": s.policy.max_conversions_per_scan})
+                               {"cap": conversion_cap})
                         capped_conversions = True
                     continue
             elif decision.action != "flag" and applied >= s.policy.max_actions_per_scan:

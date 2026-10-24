@@ -402,7 +402,7 @@ def test_stop_and_restart_over_the_api(client, monkeypatch):
 
     # Restart with nothing running: an ordinary start.
     launched: list[str] = []
-    monkeypatch.setattr(service, "_launch", lambda trigger, paths: (
+    monkeypatch.setattr(service, "_launch", lambda trigger, paths, discs=False: (
         launched.append(trigger), service._scan_lock.release()))
     r = client.post("/api/scan/restart").json()
     assert r == {"restarting": False, "started": True}

@@ -452,6 +452,16 @@ def scan_start(library: str | None = None) -> dict[str, Any]:
     return {"started": True}
 
 
+@api.post("/scan/discs")
+def scan_discs() -> dict[str, Any]:
+    """Sweep the library once and convert every disc image in it, one after
+    another, with no per-scan cap and nothing else acted on. A scan like any
+    other: it shows as one, and `/scan/stop` stops it."""
+    if not service.start_scan("discs", discs=True):
+        raise HTTPException(409, "a scan is already running")
+    return {"started": True}
+
+
 @api.post("/scan/stop")
 def scan_stop() -> dict[str, Any]:
     """Stop the running scan. Not instant: the probe in flight finishes, or

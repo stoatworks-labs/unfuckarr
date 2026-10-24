@@ -675,6 +675,15 @@ Break any of these and the failure is quiet and expensive.
 
 ### Disc conversion
 
+- **The per-scan cap paces the backlog; it is not a judgement on it.** Two discs a scan keeps
+  one scan from becoming two days of MakeMKV, but every disc still waiting is a film Emby
+  cannot play in a browser. `POST /api/scan/discs` is the one-off answer: a scan (same lock,
+  same stop, a `scans` row with trigger `discs`) that enumerates the library, keeps only disc
+  images, and converts every one the row does not refuse, in the usual order, with no cap. It
+  acts on nothing but conversions, so whatever else a check finds on a disc waits for the
+  ordinary scan and its caps. It runs on the scan thread rather than beside it because
+  conversions take no remediator slot: a second converter running beside a scan would
+  double the I/O and race it for the same discs.
 - **Menus cannot come across, and nothing in this stack ever played them.** No
   Matroska file has ever held a DVD VM program or a BD-J title; MakeMKV does not
   preserve them and never has. Emby picks a title and plays it, from an image

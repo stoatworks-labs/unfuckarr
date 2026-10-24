@@ -1938,3 +1938,18 @@ same device when the PlaySessionId has changed, and a completion with no positio
 believed: the wall clock measures the play instead, so a client that really played the image
 for an hour is still not a suspect. Four tests; the two that reproduce the live sequence fail on
 the old tracker. AGENTS.md invariant 28 has the rule.
+
+## 2026-10-24: the disc sweep
+
+Allan asked for one pass that converts every disc instead of two a night. 84 images were still
+on disk, 86 of 87 at `convert_attempts` 0. `POST /api/scan/discs` runs `Scanner.run(discs=True)`:
+the ordinary enumeration (so a disc that arrived since the last scan has a row), then only disc
+images, then only `convert` decisions, with the conversion cap set to the number pending. Written-
+off discs are still refused by `convert_refused`. It holds the scan lock, so it never runs beside
+a scan, and the scheduler skips its turn while it runs. Its end counts as the last scan finished,
+so the next scheduled scan is 24 h after it. AGENTS.md "Disc conversion" has the reasoning.
+
+Space, checked before running it: conversions write beside the image under `/mnt/user/media`.
+The media share is cache "yes" with a share floor of about 781 GB, and the cache pool had 716 GB
+free (91%), so new media files already go to the array. Recent conversion and shrink output was on
+`/mnt/disk2` and `/mnt/disk4`. The array had 34 TB free.

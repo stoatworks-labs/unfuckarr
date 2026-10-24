@@ -1084,6 +1084,95 @@ def test_a_forced_conversion_reopens_a_failed_disc_but_never_a_converted_one(
     assert applied == ["/media/F9.iso", "/media/Odd.iso"]
 
 
+def _sweep_library(settings, monkeypatch, tmp_path, listed: list[Path],
+                   known: dict[Path, dict]):
+    """A library the *arrs list as ``listed``, of which the database already
+    has the ``known`` rows; every check finds nothing, except that a file
+    named Broken is corrupt."""
+    from unfuckarr import scanner as scanner_mod
+    from unfuckarr.checks import CheckResult, Finding
+    from unfuckarr.scanner import Scanner
+
+    conversions_on(settings)
+    settings.policy.max_conversions_per_scan = 2
+    for path in listed:
+        path.write_bytes(b"\0" * 2048)
+    for path, extra in known.items():
+        insert(path, **extra)
+    monkeypatch.setattr(scanner_mod, "collect_library", lambda s: (
+        [{"path": str(p), "library": "Movies", "source": "radarr",
+          "title": p.stem} for p in listed], []))
+
+    def check(self, row, s, emby):
+        result = CheckResult(path=row["path"])
+        if "Broken" in row["path"]:
+            result.add(Finding("integrity", "zero_length", "error", ""))
+        return {k: row[k] for k in row.keys()}, result, None
+    monkeypatch.setattr(Scanner, "_check_one", check)
+
+    applied: list[tuple[str, str]] = []
+    rem = Remediator(lambda: settings)
+    monkeypatch.setattr(rem, "apply", lambda row, result, info, decision, **k:
+                        applied.append((Path(row["path"]).name, decision.action))
+                        or {"ok": True})
+    return Scanner(lambda: settings, rem), applied
+
+
+def test_the_disc_sweep_converts_every_disc_and_nothing_else(
+        settings, monkeypatch, tmp_path):
+    """At two a night, the 84 discs Emby could not play on 2026-10-24 were six
+    weeks from all being playable. The sweep converts every one in a single
+    pass, still refuses the written-off ones, and leaves every other finding
+    to the ordinary scan."""
+    discs = [tmp_path / f"Film {i}.iso" for i in range(5)]
+    failed = tmp_path / "Failed Once.iso"
+    broken = tmp_path / "Broken.mkv"
+    arrived = tmp_path / "Arrived Since.iso"
+    scanner, applied = _sweep_library(
+        settings, monkeypatch, tmp_path, discs + [failed, broken, arrived],
+        {**{p: {} for p in discs + [broken]}, failed: {"convert_attempts": 1}})
+
+    out = scanner.run("discs", discs=True)
+
+    assert sorted(applied) == sorted(
+        (p.name, "convert") for p in discs + [arrived])
+    assert out["conversions"] == 6 and out["actions"] == 0
+    assert db.q1("SELECT trigger FROM scans ORDER BY id DESC LIMIT 1")[
+        "trigger"] == "discs"
+
+
+def test_an_ordinary_scan_keeps_its_conversion_cap(settings, monkeypatch,
+                                                   tmp_path):
+    discs = [tmp_path / f"Film {i}.iso" for i in range(5)]
+    broken = tmp_path / "Broken.mkv"
+    scanner, applied = _sweep_library(settings, monkeypatch, tmp_path,
+                                      discs + [broken],
+                                      {p: {} for p in discs + [broken]})
+
+    scanner.run("manual")
+
+    assert len([a for a in applied if a[1] == "convert"]) == 2
+    assert [a for a in applied if a[0] == "Broken.mkv"] == [
+        ("Broken.mkv", "redownload")]
+
+
+def test_the_disc_sweep_is_a_scan_and_waits_for_one(settings, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from unfuckarr import api as api_mod
+    from unfuckarr.service import service
+    monkeypatch.setattr(service, "start", lambda: None)
+    monkeypatch.setattr(service, "stop", lambda: None)
+    calls: list[tuple] = []
+    answers = iter([True, False])
+    monkeypatch.setattr(service, "start_scan", lambda *a, **k:
+                        calls.append((a, k)) or next(answers))
+    with TestClient(api_mod.app) as client:
+        assert client.post("/api/scan/discs").json() == {"started": True}
+        assert client.post("/api/scan/discs").status_code == 409
+    assert calls[0] == (("discs",), {"discs": True})
+
+
 def test_the_remediator_still_refuses_a_written_off_disc(settings, tmp_path):
     """The scan's check is a filter, not the enforcement: the watch folder and
     the UI reach `apply` without passing through it."""

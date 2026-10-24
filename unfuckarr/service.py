@@ -395,19 +395,22 @@ class Service:
         return state.scan.running
 
     def start_scan(self, trigger: str = "manual",
-                   paths: list[str] | None = None) -> bool:
-        """Returns False when a scan is already running."""
+                   paths: list[str] | None = None, discs: bool = False) -> bool:
+        """Returns False when a scan is already running. ``discs`` is the
+        one-off disc sweep (`Scanner.run`), which holds the same lock: it is
+        a scan, and two passes converting at once would race for the disk."""
         if not self._scan_lock.acquire(blocking=False):
             return False
-        self._launch(trigger, paths)
+        self._launch(trigger, paths, discs)
         return True
 
-    def _launch(self, trigger: str, paths: list[str] | None) -> None:
+    def _launch(self, trigger: str, paths: list[str] | None,
+                discs: bool = False) -> None:
         """Run a scan on its own thread. The caller holds `_scan_lock`; the
         scan thread releases it when it is done, whatever way it ends."""
         def run() -> None:
             try:
-                self.scanner.run(trigger=trigger, paths=paths)
+                self.scanner.run(trigger=trigger, paths=paths, discs=discs)
             except Exception:  # noqa: BLE001
                 log.exception("scan crashed")
                 db.log("scan_crashed", "error")

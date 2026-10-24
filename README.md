@@ -91,6 +91,15 @@ beside it where Emby looks for them, and recycle the image once the result verif
 re-encoded. If you also want it smaller, the ordinary shrink path takes it from there, measured
 at both ends like anything else.
 
+**Converting the whole backlog in one go.** A scan converts at most `max_conversions_per_scan`
+discs (two by default), because each one is tens of minutes of solid disk I/O. Two a night
+through eighty-odd images is six weeks of films that won't play in a browser. `POST
+/api/scan/discs` is the one-off alternative. It goes through the library like any scan,
+re-checks every disc image, and converts them all one after another: discs that recently
+failed to play first, then the biggest. It doesn't act on anything else, discs that were
+written off stay written off, and it runs as an ordinary scan, so it shows up as one and the
+Stop button stops it. There's no button to start it; it's meant to be run once.
+
 **The menus don't survive, and nothing you use ever played them.** No Matroska file can hold a
 DVD or Blu-ray menu (MakeMKV doesn't keep them either), so a conversion trades the navigation
 for a file Emby can index. Emby has never rendered a disc menu; hand it an image and it picks a
