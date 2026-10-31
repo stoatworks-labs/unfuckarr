@@ -1976,3 +1976,35 @@ The two Sinbads were unmarked as watched in Emby (`DELETE /Users/{id}/PlayedItem
 pending. F9 went first (biggest, 98.7 GB). It converted in 38 minutes, copying at about
 38 MB/s: 150 min, 20 chapters, 22 extras, 83.2 GB, ISO recycled. The Blues Brothers was selected
 seven seconds later. At that rate the whole sweep is a day or two of copying.
+
+## 2026-10-31: the sweep stuck on two discs for seven days
+
+Allan asked why the disc repairs were so slow. Scan 59 had done 11 of 87 discs in 187 hours.
+The first eight took 35 to 90 minutes each. Monty Python and the Holy Grail then ran from 10-24
+08:37 to 10-28 21:41 UTC and failed "no output for 1800s". Star Trek: The Motion Picture started
+at 22:03 that evening and was still going three days later. In both, the copy had finished:
+Monty Python's settled in the watcher at 11:38 on 10-24, and Star Trek's 83 GB MKV was finalised
+at 02:25 on 10-29 (ffprobe 8,203 s, the title's own length). After that, makemkvcon 1.18.4 had
+one thread spinning at 100% in user space. It read nothing, wrote nothing to its output and did
+not exit. The rip thread sat in `anon_pipe_read`. There is no strace on lilnasx;
+`/proc/<pid>/task/<tid>/{io,stat,wchan}` showed all of it.
+
+`rip()` looked at its stall timeout, its eight-hour cap and `cancel` only when `readline()` came
+back, and that happens only at EOF. Monty Python reached the stall kill only because its
+makemkvcon eventually closed its output without exiting. The sweep holds the scan lock, so no
+scheduled scan had run since 10-24 either. Fixed in `06c2936`: the output goes through a queue
+and the clock is read every second, as `transcode.run` has done for ffmpeg. A copy MakeMKV
+reported at 100% before it hung is kept for `_convert`'s verification instead of being deleted.
+
+### 2026-10-31 21:27: deployed `06c2936`, and the sweep restarted
+
+Edge carried revision `06c2936`. Built on lilnasx as `unfuckarr-makemkv:new-06c2936`. `/app`
+matched the build clone (28 `.py` files), MakeMKV 1.18.4 answered, and the version is 1.5.0.
+Then it was retagged `edge` and recreated, and was healthy after about 90 s. Image `4f6514e6`;
+rollback tag `unfuckarr-makemkv:rollback-2026-10-31-1e5aae9` (the old `61ac5ec8`); backup
+`.unfk-backups/pre-makemkv-hang-2026-10-31` (db with its WAL, 18,981 files, integrity ok). While
+it was stopped, Monty Python's `convert_attempts` went back from 1 to 0, because this hang spent
+it. The restart ended Star Trek's makemkvcon, and the start-up sweep removed its work folder, so
+Star Trek copies again.
+
+`POST /api/scan/discs` at 21:28:33 became scan 60: 75 pending, and Monty Python first.
