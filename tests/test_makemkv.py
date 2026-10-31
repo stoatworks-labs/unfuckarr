@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import shutil
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -475,6 +476,100 @@ def test_more_than_one_file_for_one_title_is_refused(fake_makemkv,
     assert list(work.iterdir()) == [], "the strays should have been cleaned up"
 
 
+# -- a makemkvcon that hangs ------------------------------------------------
+#
+# Live, 2026-10-24 to 10-31: 1.18.4 hung with its output open, and a rip that
+# only looked at the clock when readline() came back sat on Monty Python and
+# the Holy Grail for four and a half days and Star Trek: The Motion Picture
+# for three — with Stop doing nothing — while 76 discs waited behind them.
+
+QUICK = {"stall_timeout": 1, "poll_interval": 0.05}
+
+
+def _hung(fake_makemkv, tmp_path, hang: str) -> tuple[str, str, Path]:
+    image = tmp_path / "film.iso"
+    image.write_bytes(b"x")
+    source = tmp_path / "feature.mkv"
+    source.write_bytes(b"the whole film")
+    command = fake_makemkv({"hang": hang, "titles": [
+        {"index": 0, "duration": "0:00:03", "file": str(source)}]})
+    return str(image), command, tmp_path / "work"
+
+
+def _rip_within(seconds: float, *args, **kwargs) -> dict:
+    """Run a rip on a thread, and fail rather than hang the suite if it has
+    not come back in time — a rip that never returns is the bug."""
+    got: dict = {}
+
+    def go() -> None:
+        try:
+            got["out"] = makemkv.rip(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            got["error"] = exc
+
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(seconds)
+    assert not t.is_alive(), f"rip() still blocked after {seconds}s"
+    return got
+
+
+def test_a_makemkv_that_goes_quiet_mid_copy_is_killed(fake_makemkv, tmp_path):
+    image, command, work = _hung(fake_makemkv, tmp_path, "mid_copy")
+    got = _rip_within(15, image, Title(index=0), str(work), command, **QUICK)
+
+    assert isinstance(got.get("error"), makemkv.MakeMKVError)
+    assert str(got["error"]) == "no output for 1s"
+    assert list(work.iterdir()) == [], "half a film is not kept"
+
+
+def test_a_copy_finished_before_makemkv_hung_is_kept(fake_makemkv, tmp_path):
+    """Star Trek's 83 GB copy was the whole film, finalised hours before
+    makemkvcon stopped answering. Deleting it means ripping it again into the
+    same hang; `_convert` verifies it like any other copy."""
+    image, command, work = _hung(fake_makemkv, tmp_path, "after_copy")
+    got = _rip_within(15, image, Title(index=0), str(work), command, **QUICK)
+
+    assert "error" not in got, got.get("error")
+    assert Path(got["out"]).read_bytes() == b"the whole film"
+
+
+def test_a_makemkv_that_closes_its_output_but_never_exits_is_killed(
+        fake_makemkv, tmp_path):
+    """Monty Python's run ended "no output for 1800s", which the old loop
+    could only say once the output had closed: EOF with the process still
+    there. Waiting on it after EOF is the same hang one step later."""
+    image, command, work = _hung(fake_makemkv, tmp_path, "after_close")
+    got = _rip_within(15, image, Title(index=0), str(work), command, **QUICK)
+
+    assert "error" not in got, got.get("error")
+    assert Path(got["out"]).read_bytes() == b"the whole film"
+
+
+def test_stop_reaches_a_hung_makemkv(fake_makemkv, tmp_path):
+    """The sweep's Stop button sets this event. It used to be read only when
+    a line arrived, so a hung copy could not be stopped either."""
+    image, command, work = _hung(fake_makemkv, tmp_path, "after_copy")
+    cancel = threading.Event()
+    threading.Timer(0.5, cancel.set).start()
+    got = _rip_within(15, image, Title(index=0), str(work), command,
+                      cancel=cancel, stall_timeout=60, poll_interval=0.05)
+
+    assert str(got.get("error")) == "cancelled"
+    assert list(work.iterdir()) == [], "a cancelled copy is not kept"
+
+
+def test_the_overall_cap_holds_against_a_makemkv_that_keeps_talking(
+        fake_makemkv, tmp_path):
+    """A frozen counter is output, so the stall timeout never fires on it;
+    the cap is what is left, and it was only ever read in silence."""
+    image, command, work = _hung(fake_makemkv, tmp_path, "chatter")
+    got = _rip_within(15, image, Title(index=0), str(work), command,
+                      timeout=1, stall_timeout=60, poll_interval=0.05)
+
+    assert str(got.get("error")) == "still running after 1s"
+
+
 # -- what the rest of the application does with it ------------------------
 
 def test_a_conversion_can_never_delete():
@@ -916,7 +1011,7 @@ def insert(path: Path, **extra) -> dict:
 FAKE = textwrap.dedent('''\
     #!/usr/bin/env python3
     """A stand-in for makemkvcon: same robot protocol, real files out."""
-    import json, os, shutil, signal, sys
+    import json, os, shutil, signal, sys, time
     from pathlib import Path
 
     plan = json.loads(Path(os.environ["FAKE_MAKEMKV_PLAN"]).read_text())
@@ -962,11 +1057,31 @@ FAKE = textwrap.dedent('''\
     if wanted is None or not wanted.get("file"):
         print('MSG:5010,0,1,"no such title","%1",""')
         sys.exit(1)
+
+    # The ways 1.18.4 has been seen to hang, output still open, plus one that
+    # keeps talking. Each sleeps far longer than any test waits.
+    hang = plan.get("hang")
+    if hang == "mid_copy":
+        print("PRGV:0,0,65536", flush=True)
+        Path(out_dir, "title_t%02d_0.mkv" % index).write_bytes(b"half a film")
+        time.sleep(60)
+    if hang == "chatter":
+        for _ in range(1200):
+            print("PRGV:100,100,65536", flush=True)
+            time.sleep(0.05)
+
     for step in (0, 32768, 65536):
         print("PRGV:%d,%d,65536" % (step, step))
     for n in range(wanted.get("copies", 1)):
         shutil.copy(wanted["file"],
                     os.path.join(out_dir, "title_t%02d_%d.mkv" % (index, n)))
+    if hang == "after_copy":
+        sys.stdout.flush()
+        time.sleep(60)
+    if hang == "after_close":
+        sys.stdout.flush()
+        os.close(1)
+        time.sleep(60)
     print('MSG:5036,0,1,"Copy complete.","%1",""')
 ''')
 

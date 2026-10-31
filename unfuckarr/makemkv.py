@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import re
 import shlex
 import signal
@@ -583,7 +584,7 @@ def rip(path: str, title: Title, out_dir: str, command: str,
         min_seconds: int = 120, timeout: int = 8 * 3600,
         on_progress: Callable[[float], None] | None = None,
         cancel: threading.Event | None = None,
-        stall_timeout: int = 1800) -> str:
+        stall_timeout: int = 1800, poll_interval: float = 1.0) -> str:
     """Copy one title out of the image into ``out_dir``, and return its path.
 
     Stream copy — MakeMKV does not re-encode. The result is the same video and
@@ -593,6 +594,19 @@ def rip(path: str, title: Title, out_dir: str, command: str,
     ``out_dir`` must be empty: the returned path is whatever `.mkv` appears in
     it, rather than the name MakeMKV said it would use, because the two differ
     whenever the volume name contains something the filesystem will not take.
+
+    The stall timeout, ``timeout`` and ``cancel`` are checked on a timer, not
+    on MakeMKV's output, for the reason `transcode.run` gives: a blocking
+    ``readline()`` returns only at EOF, so a makemkvcon that hangs with its
+    output open could never be caught. Live, 1.18.4 did exactly that after
+    finishing a copy — one thread spinning, nothing said, no exit — and the
+    disc sweep sat on Monty Python and the Holy Grail for four and a half days
+    and on Star Trek: The Motion Picture for three, with Stop doing nothing.
+
+    A copy MakeMKV reported finished before it hung is kept and returned
+    rather than deleted: it is the whole film, as it was for Star Trek, and
+    `_convert` verifies a feature however MakeMKV finished. Throwing it away
+    would only rip it again into the same hang, every attempt the disc gets.
     """
     argv = base_command(command) + [
         "-r", "--progress=-same", "--cache=1", f"--minlength={int(min_seconds)}",
@@ -618,48 +632,81 @@ def rip(path: str, title: Title, out_dir: str, command: str,
     err_thread = threading.Thread(target=drain_stderr, daemon=True)
     err_thread.start()
 
+    # MakeMKV's lines arrive through a queue so the loop below wakes every
+    # poll_interval whether or not MakeMKV said anything. None marks EOF.
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def drain_stdout() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.put(line)
+        lines.put(None)
+
+    out_thread = threading.Thread(target=drain_stdout, daemon=True)
+    out_thread.start()
+
     started = time.time()
     last_output = started
-    assert proc.stdout is not None
+    copied = False
+    eof = False
     while True:
-        line = proc.stdout.readline()
-        if not line:
+        if eof:
+            # Output closed is not the same as exited: Monty Python's
+            # makemkvcon closed its output and never did exit.
             if proc.poll() is not None:
                 break
-            # A ripping MakeMKV is silent for minutes at a time on a scratched
-            # disc image; only a total silence past the stall timeout is a hang.
-            if time.time() - last_output > stall_timeout:
-                killed = f"no output for {stall_timeout}s"
-                proc.kill()
-                break
-            if time.time() - started > timeout:
-                killed = f"still running after {timeout}s"
-                proc.kill()
-                break
-            time.sleep(0.5)
-            continue
+            time.sleep(poll_interval)
+            line = ""
+        else:
+            try:
+                line = lines.get(timeout=poll_interval)
+            except queue.Empty:
+                line = ""
+            if line is None:
+                eof = True
+                continue
 
-        last_output = time.time()
-        line = line.strip()
-        tail.append(line)
-        del tail[:-30]
-        if line.startswith("PRGV:") and on_progress is not None:
-            fields = _split(line[5:])
-            if len(fields) >= 3 and fields[1].isdigit() and fields[2].isdigit():
-                total, maximum = int(fields[1]), int(fields[2])
-                if maximum:
-                    on_progress(min(1.0, total / maximum))
+        now = time.time()
         if cancel is not None and cancel.is_set():
             killed = "cancelled"
             proc.kill()
             break
+        if line:
+            last_output = now
+            line = line.strip()
+            tail.append(line)
+            del tail[:-30]
+            if line.startswith("PRGV:"):
+                fields = _split(line[5:])
+                if len(fields) >= 3 and fields[1].isdigit() and fields[2].isdigit():
+                    total, maximum = int(fields[1]), int(fields[2])
+                    if maximum:
+                        copied = total >= maximum
+                        if on_progress is not None:
+                            on_progress(min(1.0, total / maximum))
+        # A ripping MakeMKV is silent for minutes at a time on a scratched
+        # disc image; only a total silence past the stall timeout is a hang.
+        if now - last_output > stall_timeout:
+            killed = f"no output for {stall_timeout}s"
+            proc.kill()
+            break
+        if now - started > timeout:
+            killed = f"still running after {timeout}s"
+            proc.kill()
+            break
 
     proc.wait()
+    out_thread.join(timeout=2)
     err_thread.join(timeout=2)
     _check_messages(tail)
 
     produced = sorted(p for p in Path(out_dir).iterdir()
                       if p.name not in before and p.suffix.lower() == ".mkv")
+    if killed and killed != "cancelled" and copied and len(produced) == 1:
+        log.warning("makemkv: title %d of %s hung after the copy finished "
+                    "(%s); keeping %s for verification", title.index, path,
+                    killed, produced[0].name)
+        return str(produced[0])
     if killed:
         for stray in produced:
             stray.unlink(missing_ok=True)
