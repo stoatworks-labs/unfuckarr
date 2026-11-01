@@ -2008,3 +2008,20 @@ it. The restart ended Star Trek's makemkvcon, and the start-up sweep removed its
 Star Trek copies again.
 
 `POST /api/scan/discs` at 21:28:33 became scan 60: 75 pending, and Monty Python first.
+
+### 2026-11-01: both discs converted, and Star Trek hung again
+
+Monty Python converted from 21:30 to 22:08 UTC. MakeMKV copied it in 37 minutes (three hours last
+time) and exited normally. There was no hang, so the new code had nothing to catch. The copy is a
+71.8 GB MKV with 3 extras, and the 90.8 GB ISO was recycled.
+
+Star Trek was selected at 22:08:52. Its copy finished in about 95 minutes, and then makemkvcon
+hung the same way as before. At 00:13:37 the log said `hung after the copy finished (no output
+for 1800s); keeping STAR TREK- THE MOTION PICTURE …`. The kept copy passed `_convert`'s
+verification at 8,203 s, title 1 was ripped as its one extra, and it was `convert_done` at
+00:13:50. The default-audio transcode then ran over it, finishing at 01:12. The whole disc took
+2 h 5 min, where the last attempt was still going after three days. No makemkvcon was left
+behind, and the sweep moved on to Underworld.
+
+So the hang is not certain on a given disc: Monty Python hung once and not again, and Star Trek
+hung twice. A hang now costs 30 minutes.
