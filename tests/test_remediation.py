@@ -644,14 +644,15 @@ def test_a_plan_that_changes_nothing_is_refused_and_not_counted(settings,
     info = _tracks(("ac3", 6, True), ("dts", 6, False))
     db.ex("INSERT INTO files (path, title) VALUES (?,?)", (info.path, "X"))
     result = CheckResult(path=info.path)
-    result.add(Finding("emby", "no_direct_play", "error", "", {"reasons": []}))
-    result.add(Finding("compat", "mixed_audio_support", "info", ""))
+    # Not an Emby refusal: one of those is re-encoded when its plan comes out
+    # empty (test_a_refusal_already_fixed_as_far_as_the_file_goes_is_reencoded).
+    result.add(Finding("hygiene", "image_subtitles_only", "warning", ""))
     row = {"path": info.path, "source": "folder", "title": "X",
            "arr_id": None, "arr_parent_id": None, "fix_attempts": 0}
 
     out = Remediator(lambda: settings).apply(
-        row, result, info, Decision("transcode", "Emby cannot direct play this",
-                                    ["no_direct_play"]))
+        row, result, info, Decision("transcode", "stream metadata needs tidying",
+                                    ["image_subtitles_only"]))
 
     assert out["action"] == "flag" and out["ok"]
     assert not ran

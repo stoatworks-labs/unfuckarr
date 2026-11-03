@@ -2025,3 +2025,44 @@ behind, and the sweep moved on to Underworld.
 
 So the hang is not certain on a given disc: Monty Python hung once and not again, and Star Trek
 hung twice. A hang now costs 30 minutes.
+
+## 2026-11-03: Emby's silent refusals, and the tidying that never stuck
+
+Allan asked for the files Emby refuses "but won't say why" to be re-encoded, and for the ones
+flagged "needs tidying" to be fixed. 328 files were `incompatible`, every one on an empty
+`TranscodeReasons` (Emby 4.10.2 now; 4.9.5 did the same). Asking Emby again with one part of
+our device profile relaxed at a time turned 323 of them into direct play: 226 on the audio, 88
+on the container (MPEG-TS recordings), 8 on the subtitles (Dark Angel's default forced DVD
+subtitle) and 1 on the video. The other five were an AVI and four disc rips, each failing on
+two parts at once.
+
+Most of the audio ones were not faults at all. Westworld S04E04 had had its AC-3 default added
+at 04:42 that morning; at 18:26 Emby still listed one DTS track and 12,099,700,816 bytes against
+12,369,013,883 on disk. A dry run of the new code over all 328 found **197** with Emby's recorded
+size out of date. Emby's "Scan media library" had last completed on 10-26 and was sitting at 90%
+with no ffprobe running, so nothing replaced since then had been re-read. Neither an item
+refresh (default or full) nor `Library/Media/Updated` changed Westworld's record in the half
+hour it was watched: the log says it "will be refreshed", queued behind that scan. That one is on
+Emby's side.
+
+The rest of the fixes had been failing quietly:
+
+- The Sky at Night and the other HDTV `.ts` captures: every remux to Matroska died on "Can't
+  write packet with unknown timestamp" — video, audio or DVB subtitle, whichever came first —
+  and `+genpts`, `+igndts` and `-avoid_negative_ts make_zero` all failed the same way. A full
+  decode and encode wrote a clean file (120 s in 13 s on the CPU), DVB subtitle included. A copy
+  into MP4 also worked, which was not taken: it drops the subtitles.
+- MP4 to MKV with a `mov_text` track (The Sandman S02, nine episodes; The Sky at Night 2009):
+  Matroska has no `mov_text`, and it was listed as one Matroska could carry.
+- Goldfinger: the isolated score is tagged `zxx`, ISO for "no linguistic content". The check
+  called that untagged; the fixer, rightly, did not retag it, so the finding came back twice.
+- Deep Space Nine S03E21: two default tracks, pl-PL and en-US. The tie-break was channels then
+  stream order, so the Polish dub would have won.
+- Blazing Saddles and the DTS-only Orphan Black episodes: today's plan works on each (15-second
+  dry runs). Their two failures are older than the history that survives, so the counters go
+  back to 0 at deploy.
+
+Of the 1,970 "needs tidying" files, 1,538 are `very_low_bitrate` alone and 410
+`image_subtitles_only` alone, neither of which a rewrite can change; 16 had something fixable.
+The low-bitrate ones are a separate change (a managed replacement through Sonarr).
+

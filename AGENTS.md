@@ -408,6 +408,41 @@ Break any of these and the failure is quiet and expensive.
     and a completion is believed only with a position past 0; without one, the wall clock
     measures the play. Keep both: either alone still loses that play.
 
+29. **Emby's silent "no" is asked again before anything acts on it, and is re-encoded at most
+    once.** Emby 4.9.5 and 4.10.2 give no `TranscodeReasons` at all, and on 2026-11-03 all 328
+    files it refused sat flagged "nothing in the file looks wrong". Three rules came out of
+    measuring them, and each one is load-bearing.
+
+    *A verdict about a file Emby has not re-read is not a verdict.* `EmbyClient._stale` compares
+    Emby's recorded `Size` with the file on disk, and a mismatch sets the answer aside as
+    `emby_stale` (info), asks Emby to re-read it, and lets the local table speak until it has;
+    `needs_check` asks again next pass. **197 of the 328 were this**: unfuckarr had already fixed
+    them, and Emby, whose library scan had sat at 90% since about 10-26, was still describing the
+    old files. Every replacement now sends `Library/Media/Updated` (`Remediator._notify_emby`),
+    and a stale verdict asks for an item refresh as well. Neither had been seen to work when this
+    was written — Emby queued both behind the stuck scan — which is why the size comparison, not
+    the request, is what decides: whatever Emby does with the request, its answer counts only
+    once its record matches the file.
+
+    *The reason is found by asking, not guessed.* `EmbyClient.diagnose` relaxes the four parts of
+    our own device profile — container, video, audio, subtitles — checks that relaxing all four
+    plays, then puts each back alone; the parts that turn it back to "no" become Emby-named
+    reasons marked `inferred`, which `transcode.plan` reads like any other. Putting parts *back*,
+    not taking them away, is what names both halves of a two-part fault (an AVI). The local table
+    still runs beside an inferred reason (`_verdict_without_reasons`): the reason names a part,
+    the table names the track.
+
+    *The re-encode is last, and once.* `transcode._reencode` encodes the video and keeps the
+    original audio behind a playable default where the container timestamps every packet, and
+    decodes all of it where it does not (MPEG-TS: every Matroska remux of a broadcast capture
+    died on "Can't write packet with unknown timestamp", whatever the flags). It runs when the
+    diagnosis names nothing, when the smaller fix has had its go, or when the smaller fix is
+    already in the file and Emby still says no. A fix for an Emby refusal is counted in
+    `fix_attempts` *even when the re-check passes*, because that re-check never asks Emby — leave
+    it uncounted and a fix Emby does not accept is redone every pass, which is invariant 27's
+    Blade II again. A re-encode sets the counter to the cap and `shrink_skipped`: a second encode
+    would be a second generation of loss.
+
 ## Traps found the hard way
 
 - **The recycle bin's size is what is on disk, not `SUM(size)` from the table.** The two disagree,

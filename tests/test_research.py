@@ -61,9 +61,12 @@ def test_unfixable_findings_are_researched_when_asked(settings):
     assert decide(image_subs(), settings).action == "research"
 
 
-def test_a_reasonless_emby_refusal_is_researched_too(settings):
+def test_a_reasonless_emby_refusal_is_reencoded_before_it_is_researched(settings):
+    """A re-encode answers a refusal for certain and costs no bandwidth; a
+    re-search may answer it and costs both. The cheaper certain thing first."""
     settings.policy.unfixable_action = "research"
-    assert decide(refused_without_reasons(), settings).action == "research"
+    d = decide(refused_without_reasons(), settings)
+    assert d.action == "transcode" and d.reencode
 
 
 def test_a_fixable_finding_is_still_transcoded(settings):

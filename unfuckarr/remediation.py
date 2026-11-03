@@ -26,6 +26,7 @@ from .checks import CheckResult
 from .checks.compat import resolve as resolve_profile
 from .checks.integrity import looks_repairable
 from .clients.arr import ArrClient, ArrError
+from .clients.emby import EmbyClient, EmbyError
 from .config import Settings
 from .probe import MediaInfo, ProbeError, probe
 from .state import bus, clear_task, set_task
@@ -66,6 +67,9 @@ class Decision:
     # since — but it never overrides the "already shrunk once" refusal, which
     # is about generation loss and does not become untrue.
     force: bool = False
+    # Re-encode everything rather than plan the smallest change: Emby refused
+    # the file and nothing smaller explains why (`transcode._reencode`).
+    reencode: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {"action": self.action, "reason": self.reason,
@@ -141,12 +145,20 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
     if compat:
         action = policy.incompatible_action
         if action == "transcode" and not transcode.plan_has_work(result.findings):
-            # Emby refused the file and would not say why, and the local codec
-            # table — which `scanner.check_file` runs precisely for this case —
-            # found nothing wrong either. There is no named defect to build a
-            # plan around, so the plan would be a stream copy that cannot clear
-            # the verdict, run twice, for every file in this state. Invariant
-            # 22: an action is only offered when there is a fix behind it.
+            # Emby refused the file and would not say why, asking it again
+            # part by part (`EmbyClient.diagnose`) found no part to blame, and
+            # the local codec table — which `scanner.check_file` runs
+            # precisely for this case — found nothing wrong either. There is
+            # no named defect to build a plan around, and a plan built anyway
+            # would be a stream copy that cannot clear the verdict (invariant
+            # 22). What is left that can is a re-encode into the profile: the
+            # one file Emby is sure to take is one our ffmpeg wrote for it.
+            if "no_direct_play" in codes:
+                return Decision("transcode",
+                                "Emby will not direct play this, would not say "
+                                "why, and no single change explains it — "
+                                "re-encoding it to the target profile",
+                                codes, reencode=True)
             if policy.unfixable_action == "research":
                 return Decision("research",
                                 "Emby will not direct play this and did not "
@@ -566,7 +578,22 @@ class Remediator:
                 return self._redownload_row(file_row, f"unprobeable: {exc}")
 
         repair = decision.action == "repair"
-        plan = transcode.plan(info, result, s.transcode, s.emby_compat, repair=repair)
+        # A refusal from Emby whose smaller fix has already had its go is
+        # re-encoded on the second: the remux that failed (a broadcast
+        # MPEG-TS that will not mux without decoding), or the one that ran
+        # and left Emby saying no. Hygiene is never escalated — a language
+        # tag does not need the picture re-encoded.
+        refused = any(f.code == "no_direct_play" for f in result.findings)
+        reencode = not repair and (decision.reencode or (refused and attempts >= 1))
+        plan = transcode.plan(info, result, s.transcode, s.emby_compat,
+                              repair=repair, reencode=reencode)
+        if not repair and refused and transcode.changes_nothing(plan, info):
+            # The smaller fix for what Emby named is already in the file —
+            # the default audio is playable, the flags are clear — and Emby
+            # still says no, having re-read it (a verdict on a file Emby has
+            # not re-read is set aside as `emby_stale` before it gets here).
+            plan = transcode.plan(info, result, s.transcode, s.emby_compat,
+                                  reencode=True)
         if not repair and transcode.changes_nothing(plan, info):
             # `decide` thought there was work here and the planner found none.
             # Nothing ran, so nothing is counted — but it is logged as a
@@ -697,7 +724,21 @@ class Remediator:
                         "attempts": self._count_attempt(path, file_row)})
                 return {"action": "flag", "ok": False, "message": msg}
             self._move_db_row(path, final)
+            if plan.reencode:
+                # Once, ever. A re-encode is the last thing this tool can do
+                # for a refused file, and if Emby still says no to our own
+                # encode, a second would only be a second generation of loss
+                # — the cap is what stops it, so the counter goes to the cap.
+                # Nor is it ever shrunk: that would be the same loss again
+                # for a fraction of the saving (invariant 11).
+                file_row["fix_attempts"] = MAX_FIX_ATTEMPTS
+                db.ex("UPDATE files SET fix_attempts=?, shrink_skipped=? "
+                      "WHERE path=?",
+                      (MAX_FIX_ATTEMPTS,
+                       "re-encoded for Emby; another encode would be a "
+                       "second generation of loss", final))
             self._notify_arr_rescan(file_row)
+            self._notify_emby(path, final)
             self._confirm_fixed(path, final, file_row, decision)
 
         self._set_job(job_id, "done", 1.0, f"{plan.describe} → {Path(final).name}")
@@ -846,6 +887,19 @@ class Remediator:
             # the counter is here and not beside the ffmpeg call: a run that
             # exits 0 and leaves the finding in place has fixed nothing.
             db.bump("files_fixed")
+            if "no_direct_play" in decision.findings:
+                # Except that this re-check never asks Emby, so for a file
+                # Emby refused it cannot see the one verdict that matters.
+                # Counted all the same, which is what bounds it: Emby still
+                # saying no once it has re-read the file sends the next go to
+                # `_reencode`, and that is the last (invariant 29). Left
+                # uncounted, a fix Emby does not accept is redone every pass
+                # for ever — Blade II, 162 times, was this exact shape.
+                attempts = self._count_attempt(final, file_row)
+                db.log("transcode_awaits_emby", "info", final, {
+                    "was": old, "attempts": attempts,
+                    "note": "fixed as far as the file shows; Emby's verdict "
+                            "decides once it has re-read it"})
             return
 
         attempts = self._count_attempt(final, file_row)
@@ -890,6 +944,17 @@ class Remediator:
             client.rescan(int(parent))
         except ArrError as exc:
             db.log("arr_rescan_failed", "warn", file_row["path"], str(exc))
+
+    def _notify_emby(self, old: str, new: str) -> None:
+        """Emby still describes the old file until it is told, or its own
+        scan gets there — and until then it judges the file we replaced."""
+        s = self._settings()
+        if not (s.emby.enabled and s.emby.url):
+            return
+        try:
+            EmbyClient(s.emby).media_replaced(old, new)
+        except EmbyError as exc:
+            db.log("emby_notify_failed", "warn", new, str(exc))
 
     # -- shrink -----------------------------------------------------------
 
@@ -1213,6 +1278,7 @@ class Remediator:
               "shrink_metric=?, shrink_skipped=NULL WHERE path=?",
               (time.time(), info.size, mean, metric.name, final))
         self._notify_arr_rescan(file_row)
+        self._notify_emby(path, final)
         self._recheck_after_shrink(final, file_row)
 
         saved = info.size - new_size
@@ -1557,6 +1623,7 @@ class Remediator:
         db.ex("UPDATE files SET converted=?, converted_from=?, "
               "convert_skipped=NULL WHERE path=?", (time.time(), path, final))
         self._notify_arr_rescan(file_row)
+        self._notify_emby(path, final)
         # The result is an ordinary Matroska file now, so re-checking it is
         # what puts it in front of the compat and shrink paths on their own
         # terms — including, for most discs, a shrink to HEVC that could not

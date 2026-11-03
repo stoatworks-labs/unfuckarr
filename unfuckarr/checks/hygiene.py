@@ -16,7 +16,15 @@ from ..probe import MediaInfo
 from . import CheckResult, Finding
 
 # ffprobe leaves these in place of a real ISO 639 tag.
-UNKNOWN_LANGS = {"", "und", "unknown", "none", "zxx"}
+#
+# `zxx` is not one of them, and was until 2026-11-03. It is ISO 639-2 for "no
+# linguistic content" — an isolated score, an effects track — and it is the
+# right tag for one: there is no language to give it, so the transcoder (which
+# tags with English) had nothing to fix, left it alone, and the finding came
+# back. Goldfinger's isolated score was remuxed twice for it and written off.
+# Shared with `transcode`, so what the check calls untagged is what the fix
+# tags.
+UNKNOWN_LANGS = {"", "und", "unknown", "none"}
 
 # Text subtitle files that live beside the media rather than inside it. Emby
 # serves these as a separate stream, so they cost nothing — which is the whole

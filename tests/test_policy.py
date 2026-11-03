@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from unfuckarr import config, db
+from unfuckarr import config, db, transcode
 from unfuckarr.checks import CheckResult, Finding
 from unfuckarr.config import apply_path_mappings
 from unfuckarr.remediation import decide
@@ -85,16 +85,19 @@ def test_one_fixable_warning_still_earns_the_transcode(settings):
     assert decide(r, settings).action == "transcode"
 
 
-def test_emby_no_for_no_stated_reason_and_nothing_else_is_flagged(settings):
-    """Emby 4.9.5.0 returns `TranscodeReasons: None` on every refusal. The
-    planner reads the reasons and nothing else, so with none of them and a
-    clean local codec table there is no change to make — and a transcode would
-    be a stream copy run twice against every incompatible file in the library."""
+def test_emby_no_for_no_reason_anyone_can_find_is_reencoded(settings):
+    """Emby 4.9.5.0 and 4.10.2 return `TranscodeReasons: None` on every
+    refusal. When asking again part by part names nothing either, and the
+    local codec table is clean, there is no small change to plan — but a plan
+    with no change in it is a stream copy run twice against every such file
+    (invariant 22). What can clear the verdict is a re-encode into the target
+    profile, and the decision says so rather than flagging the file for ever."""
     r = CheckResult(path="/media/x.mkv")
     r.add(Finding("emby", "no_direct_play", "error",
                   "Emby would transcode this: Emby did not say why",
-                  {"reasons": []}))
-    assert decide(r, settings).action == "flag"
+                  {"reasons": [], "inferred": True}))
+    d = decide(r, settings)
+    assert d.action == "transcode" and d.reencode
 
 
 def test_emby_no_with_the_local_table_naming_the_defect_still_transcodes(settings):
@@ -131,7 +134,11 @@ def test_mixed_audio_support_is_not_work(settings):
     r = CheckResult(path="/media/x.mkv")
     r.add(Finding("emby", "no_direct_play", "error", "", {"reasons": []}))
     r.add(Finding("compat", "mixed_audio_support", "info", ""))
-    assert decide(r, settings).action == "flag"
+    assert not transcode.plan_has_work(r.findings)
+    # What is left for a refusal with no work behind it is the re-encode —
+    # never the stream copy this used to be.
+    d = decide(r, settings)
+    assert d.action == "transcode" and d.reencode
 
 
 def test_an_unplayable_default_track_earns_the_transcode(settings):

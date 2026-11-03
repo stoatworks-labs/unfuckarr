@@ -26,6 +26,7 @@ from typing import Any, Callable
 from . import governor as governor_mod
 from .checks import CheckResult
 from .checks.compat import default_audio, resolve as resolve_profile
+from .checks.hygiene import UNKNOWN_LANGS
 from .config import EmbyCompatConfig, TranscodeConfig
 from .probe import MediaInfo, Stream
 
@@ -119,13 +120,43 @@ def abandoned_outputs(media_paths) -> list[str]:
     return found
 
 
-# Subtitle codecs each container will accept. Copying a PGS track into MP4
-# fails the whole job, so those get dropped instead.
+# Subtitle codecs each container will carry as they are. Copying a PGS track
+# into MP4 fails the whole job, so those get dropped instead.
+#
+# `mov_text` is not in the Matroska set, and was until 2026-11-03: ffmpeg's
+# Matroska muxer has no `mov_text` ("Subtitle codec mov_text is not
+# supported"), so every MP4 with a text track that went to MKV died writing
+# the header. Nine episodes of The Sandman sat at `fix_attempts` 2 for a
+# language tag that way. A text track is converted instead (below).
 CONTAINER_SUBTITLES = {
-    "mkv": {"subrip", "srt", "ass", "ssa", "mov_text", "hdmv_pgs_subtitle",
+    "mkv": {"subrip", "srt", "ass", "ssa", "hdmv_pgs_subtitle",
             "dvd_subtitle", "dvb_subtitle"},
     "mp4": {"mov_text"},
 }
+
+# Text subtitles each container can take once converted, and what to. A text
+# track is a few kilobytes of words and timings, so converting one loses
+# nothing a viewer would notice, where dropping it loses the subtitles.
+SUBTITLE_CONVERSIONS = {
+    "mkv": {"mov_text": "srt", "webvtt": "srt"},
+    "mp4": {"subrip": "mov_text", "srt": "mov_text", "ass": "mov_text",
+            "ssa": "mov_text", "webvtt": "mov_text"},
+}
+
+# Containers that store a timestamp on every packet. A broadcast MPEG-TS
+# capture does not reliably: live, 2026-11-03, The Sky at Night S2018E01
+# failed every remux to Matroska with "Can't write packet with unknown
+# timestamp" — video, audio or the DVB subtitle, whichever came first — and
+# `+genpts`, `+igndts` and `-avoid_negative_ts` changed nothing. Decoding is
+# what gives such a packet a time, so a re-encode of one of these decodes
+# the audio too, where for these containers it keeps the originals.
+TIMESTAMPED_CONTAINERS = {"mkv", "mp4", "m4v", "mov", "webm"}
+
+# The language an untagged track is given, and the one preferred when a file
+# must have one default audio track chosen for it. `build_command` has always
+# tagged with English; this is that choice made once.
+DEFAULT_LANGUAGE = "eng"
+LANGUAGE_ALIASES = {"eng": {"eng", "en"}}
 
 
 @dataclass
@@ -172,8 +203,19 @@ class TranscodePlan:
     # when this is set.
     add_audio: AddedAudio | None = None
     clear_forced_subtitles: bool = False
+    # Source subtitle indices whose default and forced flags are cleared,
+    # leaving the track itself in place. For an image track that would make
+    # Emby burn it in on every play (`SubtitleCodecNotSupported`).
+    clear_subtitle_flags: list[int] = field(default_factory=list)
     faststart: bool = False
     is_remux: bool = False
+    # Everything re-encoded to the target profile: the answer to a refusal
+    # that no smaller change explains, or that a smaller change did not
+    # clear. See `_reencode`.
+    reencode: bool = False
+    # With `audio_action` "encode" and `reencode`: every track to this codec
+    # at its channel count's bitrate, rather than the configured AAC stereo.
+    audio_codec: str | None = None
     # Set by the shrink path: the codec and CRF the quality search settled on,
     # which are deliberately not the global transcode defaults.
     codec: str | None = None
@@ -187,9 +229,11 @@ class TranscodePlan:
         if self.is_shrink:
             bits.append(f"shrink to {self.codec or 'hevc'} "
                         f"at CRF {self.crf}")
+        elif self.reencode:
+            bits.append("re-encode to the target profile")
         elif self.video_action == "encode":
             bits.append("re-encode video")
-        if self.audio_action == "encode":
+        if self.audio_action == "encode" and not self.reencode:
             bits.append("re-encode audio")
         if self.add_audio is not None:
             bits.append(self.add_audio.describe)
@@ -203,20 +247,30 @@ class TranscodePlan:
             bits.append("set default audio")
         if self.clear_forced_subtitles:
             bits.append("clear forced subtitles")
+        elif self.clear_subtitle_flags:
+            bits.append("stop image subtitles showing by default")
         if self.faststart:
             bits.append("faststart")
         return ", ".join(bits) or "no change"
 
 
 def plan(info: MediaInfo, result: CheckResult, tcfg: TranscodeConfig,
-         ccfg: EmbyCompatConfig, repair: bool = False) -> TranscodePlan:
-    """Decide the cheapest ffmpeg job that clears the findings."""
+         ccfg: EmbyCompatConfig, repair: bool = False,
+         reencode: bool = False) -> TranscodePlan:
+    """Decide the cheapest ffmpeg job that clears the findings.
+
+    ``reencode`` asks for the most expensive one instead, on purpose: see
+    `_reencode`.
+    """
     profile = resolve_profile(ccfg)
     codes = {f.code for f in result.findings}
     container = tcfg.container
 
     p = TranscodePlan(reason="repair" if repair else "compatibility",
                       container=container)
+
+    if reencode and not repair:
+        return _reencode(p, info, profile, tcfg)
 
     if repair:
         # Container damage: rebuild the container, keep the streams. If that
@@ -243,8 +297,22 @@ def plan(info: MediaInfo, result: CheckResult, tcfg: TranscodeConfig,
             if re.search(r"Audio(Codec|Profile|Channels|SampleRate|BitDepth|Bitrate)",
                          reasons):
                 codes.add("bad_audio_codec")
+            if "AudioCodecNotSupported" in reasons:
+                # Emby judges the track it would open on, which is the
+                # default (invariant 27). Asked as `default_audio_unplayable`
+                # so a file with a playable track beside its DTS gets that
+                # track promoted rather than nothing.
+                codes.add("default_audio_unplayable")
             if "ContainerNotSupported" in reasons:
                 p.is_remux = True
+            if "SubtitleCodecNotSupported" in reasons:
+                # A track Emby would show unasked and cannot hand the client
+                # as it is: an image track flagged default or forced. Live,
+                # eight Dark Angel episodes, each with one DVD subtitle
+                # flagged both. The track stays; only its flags go.
+                p.clear_subtitle_flags = [
+                    i for i, s in enumerate(info.subtitles)
+                    if s.is_image_subtitle and (s.is_default or s.is_forced)]
 
     if needs_video and tcfg.video_codec != "copy" and v is not None:
         p.video_action = "encode"
@@ -320,9 +388,59 @@ def _fix_default_audio(p: TranscodePlan, info: MediaInfo, profile: Any,
     p.set_default_audio = None
 
 
+def _reencode(p: TranscodePlan, info: MediaInfo, profile: Any,
+              tcfg: TranscodeConfig) -> TranscodePlan:
+    """Re-encode the file to the target profile, keeping what can be kept.
+
+    The answer to an Emby refusal that nothing smaller explains, or that a
+    smaller change did not clear: Emby gives no reasons (4.9.5 and 4.10.2),
+    the diagnosis can only name a part of the profile, and the fix for that
+    part did not take. A file encoded by our own ffmpeg into the profile's
+    codec, container and audio is the one file this tool can be sure Emby will
+    take. It costs a generation of loss, which is why it comes second and why
+    `Remediator._transcode` allows it once (see invariant 29).
+
+    Video is always encoded. Audio keeps its originals where the container
+    timestamps every packet, with a playable default added if it lacks one —
+    the hybrid Allan chose for default audio (2026-10-12) — and is decoded
+    and encoded track by track where it does not, because copying is what
+    fails there (`TIMESTAMPED_CONTAINERS`). Every subtitle track the target
+    container can carry is kept, converted if it is text.
+    """
+    p.reencode = True
+    p.reason = "reencode"
+    p.faststart = p.container == "mp4"
+    p.drop_subtitles = _subtitles_to_drop(info, p.container)
+    if info.video is not None and tcfg.video_codec != "copy":
+        p.video_action = "encode"
+    else:
+        p.is_remux = True
+    if not info.audio or tcfg.audio_codec == "copy":
+        return p
+    if (info.container or "").lower() in TIMESTAMPED_CONTAINERS:
+        if default_audio(info.audio).codec_name not in profile.audio:
+            _fix_default_audio(p, info, profile, tcfg)
+        return p
+    p.audio_action = "encode"
+    p.audio_codec = next((c for c in ADDED_AUDIO_BITRATE if c in profile.audio),
+                         None)
+    return p
+
+
 def _language(stream: Stream) -> str:
     lang = (stream.language or "").lower()
-    return "" if lang in ("und", "unknown") else lang
+    return "" if lang in UNKNOWN_LANGS else lang
+
+
+def _speaks_default_language(stream: Stream) -> bool:
+    """Whether the track is in `DEFAULT_LANGUAGE`, however it is spelt.
+
+    Tags come as ISO 639-2 (`eng`), 639-1 (`en`) and BCP 47 (`en-US`), the
+    last from web releases: live, Star Trek: Deep Space Nine S03E21 carries
+    `pl-PL` and `en-US` and flags both default.
+    """
+    lang = _language(stream).split("-")[0]
+    return lang in LANGUAGE_ALIASES.get(DEFAULT_LANGUAGE, {DEFAULT_LANGUAGE})
 
 
 def _is_secondary(stream: Stream) -> bool:
@@ -350,7 +468,8 @@ def changes_nothing(p: TranscodePlan, info: MediaInfo) -> bool:
             and p.add_audio is None and not p.drop_subtitles
             and not p.fix_language_tags and p.set_default_audio is None
             and not p.clear_forced_subtitles and not p.faststart
-            and not p.is_shrink
+            and not p.clear_subtitle_flags
+            and not p.is_shrink and not p.reencode
             and (info.container or "").lower() == p.container)
 
 
@@ -423,9 +542,10 @@ def apply_hygiene_fixes(p: TranscodePlan, info: MediaInfo,
 
     if info.audio:
         if "no_default_audio" in codes:
-            # Pick the track most likely to be the main one: highest channel
-            # count, tie-broken by stream order.
-            best = max(info.audio, key=lambda a: (a.channels, -a.index))
+            # Pick the track most likely to be the main one: in the default
+            # language, then the highest channel count, tie-broken by stream
+            # order.
+            best = max(info.audio, key=_main_track_key)
             p.set_default_audio = info.audio.index(best)
         elif "multiple_default_audio" in codes:
             # Several tracks claim to be default, so the client picks one at
@@ -433,9 +553,14 @@ def apply_hygiene_fixes(p: TranscodePlan, info: MediaInfo,
             # already carry the flag rather than promoting one that does not:
             # the file is telling us which tracks were meant to be playable,
             # and only the ambiguity needs settling.
+            #
+            # Language first, and it decides more than channels do: Star
+            # Trek: Deep Space Nine S03E21 flags a Polish and an English
+            # track, both E-AC-3 5.1, and on channels and stream order alone
+            # the Polish dub won.
             defaults = [a for a in info.audio if a.is_default]
             if defaults:
-                best = max(defaults, key=lambda a: (a.channels, -a.index))
+                best = max(defaults, key=_main_track_key)
                 p.set_default_audio = info.audio.index(best)
 
     if "all_subtitles_forced" in codes and info.subtitles:
@@ -447,9 +572,21 @@ def apply_hygiene_fixes(p: TranscodePlan, info: MediaInfo,
     return p
 
 
+def _main_track_key(a: Stream) -> tuple[bool, int, int]:
+    return (_speaks_default_language(a), a.channels, -a.index)
+
+
 def _subtitles_to_drop(info: MediaInfo, container: str) -> list[int]:
+    """Tracks the container can neither carry nor be given by conversion."""
     allowed = CONTAINER_SUBTITLES.get(container, set())
-    return [i for i, s in enumerate(info.subtitles) if s.codec_name not in allowed]
+    convertible = SUBTITLE_CONVERSIONS.get(container, {})
+    return [i for i, s in enumerate(info.subtitles)
+            if s.codec_name not in allowed and s.codec_name not in convertible]
+
+
+def subtitle_codec(stream: Stream, container: str) -> str:
+    """What one kept subtitle track is written as: itself, or its conversion."""
+    return SUBTITLE_CONVERSIONS.get(container, {}).get(stream.codec_name, "copy")
 
 
 def video_encode_args(codec: str, hw: str, crf: int, preset: str,
@@ -498,7 +635,7 @@ def video_encode_args(codec: str, hw: str, crf: int, preset: str,
 
 def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
                   tcfg: TranscodeConfig, ffmpeg: str = "ffmpeg",
-                  default_language: str = "eng") -> list[str]:
+                  default_language: str = DEFAULT_LANGUAGE) -> list[str]:
     """Assemble the ffmpeg invocation for a plan."""
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-v", "error",
            "-progress", "pipe:1", "-stats_period", "2"]
@@ -549,7 +686,16 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
     else:
         cmd += ["-c:v", "copy"]
 
-    if p.audio_action == "encode":
+    if p.audio_action == "encode" and p.audio_codec in ADDED_AUDIO_BITRATE:
+        # Track by track, each at the bitrate its channel count deserves —
+        # the same table an added default track uses, for the same reason.
+        surround, stereo = ADDED_AUDIO_BITRATE[p.audio_codec]
+        cmd += ["-c:a", p.audio_codec]
+        for i, a in enumerate(info.audio):
+            channels = min(a.channels or 2, 6)
+            cmd += [f"-b:a:{i}", surround if channels > 2 else stereo,
+                    f"-ac:a:{i}", str(channels)]
+    elif p.audio_action == "encode":
         cmd += ["-c:a", tcfg.audio_codec, "-b:a", tcfg.audio_bitrate]
         # 7.1 downmixed by ffmpeg's default matrix is quiet and muddy; cap at
         # 5.1 and let the client do the rest.
@@ -568,17 +714,27 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
                     f"title={added.codec.upper()} {added.layout}"]
 
     if tcfg.keep_subtitles and info.subtitles:
-        cmd += ["-c:s", "copy" if p.container == "mkv" else "mov_text"]
+        # Per output track: copied where the container takes the codec as it
+        # is, converted where it is text the container cannot hold as it is.
+        out_i = 0
+        for i, s in enumerate(info.subtitles):
+            if i in p.drop_subtitles:
+                continue
+            cmd += [f"-c:s:{out_i}", subtitle_codec(s, p.container)]
+            out_i += 1
 
     if p.fix_language_tags:
+        # The same set the hygiene check reads, so a tag it calls missing is
+        # one this writes. Two lists drifted once: `none` was flagged and
+        # never fixed.
         for i, a in enumerate(info.audio):
-            if not a.language or a.language in ("und", "unknown"):
+            if (a.language or "") in UNKNOWN_LANGS:
                 cmd += [f"-metadata:s:a:{i + shift}", f"language={default_language}"]
         out_i = 0
         for i, s in enumerate(info.subtitles):
             if i in p.drop_subtitles:
                 continue
-            if not s.language or s.language in ("und", "unknown"):
+            if (s.language or "") in UNKNOWN_LANGS:
                 cmd += [f"-metadata:s:s:{out_i}", f"language={default_language}"]
             out_i += 1
 
@@ -591,14 +747,15 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
             flag = "default" if i == p.set_default_audio else "0"
             cmd += [f"-disposition:a:{i}", flag]
 
-    if p.clear_forced_subtitles:
+    if p.clear_forced_subtitles or p.clear_subtitle_flags:
         # Output-stream indices, so the dropped tracks are skipped the same way
         # the language tagging above skips them.
         out_i = 0
         for i in range(len(info.subtitles)):
             if i in p.drop_subtitles:
                 continue
-            cmd += [f"-disposition:s:{out_i}", "0"]
+            if p.clear_forced_subtitles or i in p.clear_subtitle_flags:
+                cmd += [f"-disposition:s:{out_i}", "0"]
             out_i += 1
 
     if p.faststart and p.container == "mp4":

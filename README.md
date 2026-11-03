@@ -153,7 +153,7 @@ hand:
 |---|---|
 | Container damage only (index, atom order, bad timestamps) | Remux — seconds, lossless. Falls through to re-download if the remux fails or its output does not verify. |
 | Genuinely corrupt | Delete, blocklist the release, trigger a new search |
-| Intact but Emby would transcode | Transcode, copying every stream that already passes |
+| Intact but Emby would transcode | Transcode, copying every stream that already passes. Emby gives no reason, so unfuckarr asks it again with each part of the profile relaxed to find one; when nothing smaller will do, or the smaller fix did not take, it re-encodes the file to the target profile, once |
 | Hygiene | Flag only |
 | Not yet measured for a saving | Measure it, and re-encode only if the result is smaller *and* still scores at the quality target |
 | A disc image nothing can open | Report it, and do nothing |

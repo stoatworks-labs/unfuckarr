@@ -139,8 +139,15 @@ def sync_inventory(rows: list[dict[str, Any]]) -> tuple[int, int]:
 # -- per-file check -------------------------------------------------------
 
 def _verdict_without_reasons(result: CheckResult) -> bool:
-    """Emby refused the file but would not say why."""
-    return any(f.code == "no_direct_play" and not (f.data or {}).get("reasons")
+    """Emby refused the file but would not say why.
+
+    A reason `EmbyClient.diagnose` worked out still counts as Emby not having
+    said: it names the part of the profile, not the track or the flag, and
+    the local table is what says which track that is.
+    """
+    return any(f.code == "no_direct_play"
+               and (not (f.data or {}).get("reasons")
+                    or (f.data or {}).get("inferred"))
                for f in result.findings)
 
 
@@ -243,6 +250,14 @@ def needs_check(row: Any, s: Settings) -> bool:
     # pass already, so this costs one failed open each for the rest.
     if (disc.is_disc_image(row["path"]) and convert_blocked(s) is None
             and Remediator.convert_refused(dict(row)) is None):
+        return True
+    # Emby's verdict was set aside last pass because Emby had not re-read the
+    # file (`emby_stale`), so the file was judged on the local table alone and
+    # most likely reads "ok". Waiting `recheck_after_days` before asking Emby
+    # again would leave a file Emby still refuses looking fixed for a month.
+    # A substring, not a parse: it is our own code in our own JSON, and this
+    # runs for every file in the library on every pass.
+    if '"emby_stale"' in (row["last_result"] or ""):
         return True
     # "unmeasured" belongs with "ok" here, not with the faults. Nothing is
     # wrong with the file; it is waiting for a quality search that the

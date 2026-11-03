@@ -21,6 +21,7 @@ returns ``Path`` on every item, so one recursive query builds it.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -133,6 +134,27 @@ class EmbyClient:
     def local_path(self, remote: str) -> str:
         return apply_path_mappings(remote, self.cfg.path_mappings)
 
+    def remote_path(self, local: str) -> str:
+        """The path Emby knows a local file by: the mappings run backwards."""
+        reverse = [{"from": m.get("to", ""), "to": m.get("from", "")}
+                   for m in self.cfg.path_mappings]
+        return apply_path_mappings(local, reverse)
+
+    def media_replaced(self, old: str, new: str) -> None:
+        """Tell Emby a file it knows was rewritten, or replaced by another.
+
+        Without it Emby goes on describing the old file until its own library
+        scan reaches the folder, and every verdict asked of it meanwhile is
+        about a file that has gone (`_stale`). Sent as Sonarr's own Emby
+        connection sends it, so it costs one request and no library index.
+        """
+        if old == new:
+            updates = [{"Path": self.remote_path(new), "UpdateType": "Modified"}]
+        else:
+            updates = [{"Path": self.remote_path(old), "UpdateType": "Deleted"},
+                       {"Path": self.remote_path(new), "UpdateType": "Created"}]
+        self._send("POST", "Library/Media/Updated", json={"Updates": updates})
+
     # -- library index ----------------------------------------------------
 
     def build_index(self, max_age: float = 600.0) -> dict[str, dict[str, Any]]:
@@ -238,7 +260,8 @@ class EmbyClient:
         """Ask Emby whether it would direct play this file.
 
         Returns True when Emby answered (so the local codec model can be
-        skipped), False when the file is unknown to Emby or the call failed.
+        skipped), False when the file is unknown to Emby, the call failed, or
+        Emby's answer is about a file that is no longer the one on disk.
         """
         index = self.build_index()
         entry = index.get(path)
@@ -263,20 +286,154 @@ class EmbyClient:
                                "Emby knows the item but reports no playable media source"))
             return True
 
+        stale = self._stale(path, source)
+        if stale is not None:
+            # Emby is answering about a file that has since been replaced, so
+            # its "no" is about the old one. Live, 2026-11-03: Westworld
+            # S04E04 had its AC-3 default added at 04:42, and at 18:26 Emby
+            # still listed one DTS track and the old 12,099,700,816 bytes
+            # against 12,369,013,883 on disk — refused, and with nothing left
+            # for the local table to find, flagged as "nothing in the file
+            # looks wrong". 226 of the 328 silent refusals that day were the
+            # default audio track, and the stale ones among them had been
+            # fixed already. Ask it to look again, and let the local table
+            # speak for the file until it has.
+            try:
+                self.refresh_item(entry["id"], self._remote_path(source))
+            except EmbyError as exc:
+                log.debug("could not ask Emby to re-read %s: %s", path, exc)
+            result.add(Finding(
+                "emby", "emby_stale", "info",
+                f"Emby has not re-read this file since it changed ({stale}) "
+                "— asked it to; its verdict counts again once it has",
+            ))
+            return False
+
         if source.get("SupportsDirectPlay") or source.get("SupportsDirectStream"):
             return True
 
         reasons = source.get("TranscodeReasons") or []
         if isinstance(reasons, str):
             reasons = [r.strip() for r in reasons.split(",") if r.strip()]
-        readable = [TRANSCODE_REASONS.get(r, r) for r in reasons] or \
-                   ["Emby did not say why"]
-        result.add(Finding(
-            "emby", "no_direct_play", "error",
-            "Emby would transcode this: " + "; ".join(readable),
-            {"reasons": reasons},
-        ))
+        data: dict[str, Any] = {"reasons": reasons}
+        if reasons:
+            readable = [TRANSCODE_REASONS.get(r, r) for r in reasons]
+            detail = "Emby would transcode this: " + "; ".join(readable)
+        else:
+            found = self.diagnose(entry, cfg)
+            if found:
+                data = {"reasons": found, "inferred": True}
+                detail = ("Emby would transcode this: "
+                          + "; ".join(TRANSCODE_REASONS.get(r, r) for r in found)
+                          + " (Emby did not say; found by asking again with "
+                            "the rest of the profile relaxed)")
+            else:
+                data = {"reasons": [], "inferred": True}
+                # Kept word for word: it is the phrase the UI and the notes
+                # have always used for this verdict.
+                detail = "Emby would transcode this: Emby did not say why"
+        result.add(Finding("emby", "no_direct_play", "error", detail, data))
         return True
+
+    # -- finding out why --------------------------------------------------
+
+    # The four parts of the device profile a direct-play verdict can turn on,
+    # each with the reason Emby would have given had it given one. The names
+    # are Emby's own, so `transcode.plan` reads an inferred reason exactly as
+    # it reads one Emby supplied.
+    DIAGNOSABLE = (
+        ("container", "ContainerNotSupported"),
+        ("video", "VideoCodecNotSupported"),
+        ("audio", "AudioCodecNotSupported"),
+        ("subtitles", "SubtitleCodecNotSupported"),
+    )
+
+    # Every subtitle format Emby names, embedded. A client claiming to render
+    # all of them is a client that never needs one burned in.
+    ALL_SUBTITLES = ("srt", "subrip", "ass", "ssa", "vtt", "pgssub", "dvdsub",
+                     "dvbsub", "vobsub", "sub", "teletext", "mov_text", "smi")
+
+    def diagnose(self, entry: dict[str, Any], cfg: EmbyCompatConfig) -> list[str]:
+        """Why Emby refused a file it would not explain, asked of Emby itself.
+
+        Emby 4.9.5 and 4.10.2 answer every refusal with an empty
+        `TranscodeReasons` (2026-08-27, 63 of 63; 2026-11-03, 328 of 328), and
+        a verdict with no reason has no plan behind it. But the profile is
+        ours, so the question can be put again: relax all four parts, which
+        should play, then put each part back on its own. A part that turns
+        the answer back to "no" is a reason, and a file with two problems —
+        an AVI is both the container and the codec — names both, where
+        relaxing one part at a time would find neither.
+
+        Measured on the live library, 2026-11-03, relaxing one part at a time:
+        323 of the 328 refusals came down to a single part (226 the default
+        audio track, 88 an MPEG-TS container, 8 a default forced DVD subtitle,
+        1 video). The other five were an AVI and four disc rips, which is why
+        this puts parts back rather than taking them away. Five calls, and only for a file Emby has already refused. An empty
+        list means even the fully relaxed profile was refused, or Emby
+        stopped answering part-way, and the caller says so rather than guess.
+        """
+        base = self.device_profile(cfg)
+        parts = [name for name, _ in self.DIAGNOSABLE]
+        try:
+            if not self._plays(entry, self._relaxed(base, parts)):
+                return []
+            found = []
+            for name, reason in self.DIAGNOSABLE:
+                others = [p for p in parts if p != name]
+                if not self._plays(entry, self._relaxed(base, others)):
+                    found.append(reason)
+            return found
+        except EmbyError as exc:
+            log.debug("diagnosing %s stopped: %s", entry.get("name"), exc)
+            return []
+
+    def _plays(self, entry: dict[str, Any], profile: dict[str, Any]) -> bool:
+        source = self.playback_info(entry["id"], profile,
+                                    entry.get("media_source_id"))
+        return bool(source and (source.get("SupportsDirectPlay")
+                                or source.get("SupportsDirectStream")))
+
+    @classmethod
+    def _relaxed(cls, base: dict[str, Any], parts: list[str]) -> dict[str, Any]:
+        """The device profile with the named parts accepting anything."""
+        profile = {**base,
+                   "DirectPlayProfiles": [dict(p) for p in base["DirectPlayProfiles"]],
+                   "CodecProfiles": list(base["CodecProfiles"]),
+                   "SubtitleProfiles": list(base["SubtitleProfiles"])}
+        direct = profile["DirectPlayProfiles"][0]
+        if "container" in parts:
+            direct["Container"] = ""
+        if "video" in parts:
+            direct["VideoCodec"] = ""
+            profile["CodecProfiles"] = []
+        if "audio" in parts:
+            direct["AudioCodec"] = ""
+        if "subtitles" in parts:
+            profile["SubtitleProfiles"] = [{"Format": f, "Method": "Embed"}
+                                           for f in cls.ALL_SUBTITLES]
+        return profile
+
+    @staticmethod
+    def _stale(path: str, source: dict[str, Any]) -> str | None:
+        """How Emby's record of this file differs from the file, or None.
+
+        The size, because it is the one thing Emby records that any rewrite
+        changes and that costs a `stat` to compare. A remux that only flips a
+        flag moves it by a few bytes, which is still a different number.
+        """
+        recorded = source.get("Size")
+        try:
+            actual = os.path.getsize(path)
+        except OSError:
+            return None
+        if not recorded or int(recorded) == actual:
+            return None
+        return f"Emby has {int(recorded):,} bytes on record, the file is {actual:,}"
+
+    @staticmethod
+    def _remote_path(source: dict[str, Any]) -> str | None:
+        return source.get("Path") or None
 
     # -- server logs ------------------------------------------------------
 
@@ -304,8 +461,22 @@ class EmbyClient:
                 return path
         return None
 
-    def refresh_item(self, item_id: str) -> None:
-        """Re-read metadata after we replaced a file underneath Emby."""
+    def refresh_item(self, item_id: str, remote_path: str | None = None) -> None:
+        """Ask Emby to re-read a file we replaced underneath it.
+
+        Both ways in: the media-updated notice, which is what Sonarr's own
+        Emby connection sends, and an item refresh. Neither has been seen to
+        work yet. On 2026-11-03 Emby queued both ("will be refreshed") behind a
+        library scan that had sat at 90% for days, and Westworld S04E04's
+        record had not changed half an hour later, with a full refresh tried
+        as well. So the refresh is the default mode, not a full one — this is
+        sent for every stale file on every pass, and a full refresh is a
+        metadata lookup online each time — and `check_direct_play` measures
+        the staleness rather than assuming it has gone.
+        """
+        if remote_path:
+            self._send("POST", "Library/Media/Updated", json={
+                "Updates": [{"Path": remote_path, "UpdateType": "Modified"}]})
         self._request("POST", f"Items/{item_id}/Refresh", params={
             "MetadataRefreshMode": "Default",
             "ImageRefreshMode": "Default",
