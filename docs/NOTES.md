@@ -2197,3 +2197,24 @@ expired. `replace.held` now counts an `importPending` download whose messages ca
 `UPGRADE_REFUSALS`. It does not count "No files found are eligible for import": that means the
 *arr cannot reach the file at all, and an empty candidate list would be misread as an empty
 download.
+
+### 2026-11-03 20:03: deployed `7e89aed`, and the first replacement landed
+
+Built as `unfuckarr-makemkv:new-7e89aed` (`a3d428db`), `/app` matching the clone. Rollback tag
+`unfuckarr-makemkv:rollback-2026-11-03-93f4d08`. Healthy at 19:52.
+
+The first pass after start-up (19:53:28) found BattleBots S06E02 held under `replace.held`, and
+the manual-import list for the download alone held the one file. `judge` passed it: 1080p HEVC at
+3.13 Mbps (6.26 H.264-equivalent against 1.98), 5,010.97 s, the same as the old file. The
+ManualImport came back "Manually imported 1 files". Sonarr put the new file in `Season 6/` as
+`…HDTV-1080p.mkv`, 1.96 GB, and removed the old 720p from the series root. The next pass
+(20:03:28) found the download gone from the queue and `downloadFolderImported` in its history.
+It marked the row `imported`, bumped `files_replaced` to 1, and discarded the hard-linked copy
+("its replacement arrived and passed").
+
+So every step is now verified live: search, choice, link, grab, `find_grab`, held state,
+candidates, `judge`, ManualImport, history, and letting go of the copy. One thing remains
+unverified: an *arr importing a grab by itself, which leads to `imported_worse`.
+
+Cleanuparr had struck the download once, at 19:30, over the old "No files found" warning. The
+import came two strikes before it would have removed it.
