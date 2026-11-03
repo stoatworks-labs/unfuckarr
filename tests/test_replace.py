@@ -740,3 +740,31 @@ def test_candidates_are_asked_for_by_download_alone(monkeypatch):
                         lambda method, path, **kw: sent.append(kw["params"]) or [])
     client.manual_import_candidates("dl-1")
     assert sent == [{"downloadId": "dl-1", "filterExistingFiles": False}]
+
+
+def test_a_download_left_pending_as_no_upgrade_is_held(settings, row, monkeypatch):
+    """Sonarr 4.0.20, live: BattleBots S06E02 stayed `importPending` with the
+    refusal as a warning, and never became `importBlocked`."""
+    arr = FakeArr([release("HIGNFY.S49E07.1080p.WEB.h264", 1.2)])
+    _grabbed(settings, row, arr)
+    arr.queue_records = [_queued(
+        "importPending", "Not an upgrade for existing episode file(s). Existing "
+                         "quality: WEBDL-720p. New Quality HDTV-1080p.")]
+    arr.candidates = [_candidate(f"{DL}/ep.mkv")]
+    seen = _judge(monkeypatch, True)
+    replace.advance(settings, lambda source: arr)
+    assert seen == [f"{DL}/ep.mkv"] and len(arr.imported) == 1
+
+
+def test_a_pending_download_the_arr_cannot_see_is_not_judged(
+        settings, row, monkeypatch):
+    """Its manual-import list is empty because the *arr cannot reach the
+    file, not because the download is: throwing it back would be wrong."""
+    arr = FakeArr([release("HIGNFY.S49E07.1080p.WEB.h264", 1.2)])
+    _grabbed(settings, row, arr)
+    arr.queue_records = [_queued(
+        "importPending", f"No files found are eligible for import in {DL}")]
+    seen = _judge(monkeypatch, True)
+    replace.advance(settings, lambda source: arr)
+    assert seen == [] and arr.removed == []
+    assert db.q1("SELECT state FROM replacements")["state"] == "grabbed"

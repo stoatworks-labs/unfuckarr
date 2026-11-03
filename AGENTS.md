@@ -485,8 +485,9 @@ Break any of these and the failure is quiet and expensive.
     for a link. The copy is let go only when the replacement was checked before it was imported, or
     the original is still there unchanged. Whatever the *arr imported that `judge` then refuses
     is `imported_worse`, and the copy stays for `recycle_bin_days`, restorable from the bin page.
-    The usual path is the *arr holding the download as `importBlocked` "Not an upgrade". There
-    `advance` opens it and asks for a ManualImport only if it passes. Otherwise it removes and
+    The usual path is the *arr holding the download. Sonarr 4.0.20 leaves it `importPending`
+    with a "Not an upgrade" warning, not `importBlocked`, which it keeps for its own parsing
+    trouble (`replace.held`). There `advance` opens it and asks for a ManualImport only if it passes. Otherwise it removes and
     blocklists it with `skip_redownload`, because the next attempt is unfuckarr's to choose, and
     the original never moved. **Only files inside the download's own output path are ever judged
     or imported**: ask `manualimport` by `downloadId` alone, because given a `seriesId` too Sonarr
@@ -501,7 +502,7 @@ Break any of these and the failure is quiet and expensive.
     hour on is thrown back rather than left open. And Cleanuparr runs beside it on the
     live box (queue cleaner every 30 minutes, 3 failed-import strikes, qBittorrent its only
     client, `failed_import_skip_if_not_found_in_client` on). So a usenet grab is never struck,
-    and a torrent held as `importBlocked` could be removed after 60–90 minutes. The 10-minute
+    and a torrent held with a warning could be removed after 60–90 minutes. The 10-minute
     `advance` gets there first. If unfuckarr is paused that long, the worst case is one
     blocklisted release, recorded as `failed` or `vanished`, with the original still in place.
 

@@ -25,7 +25,8 @@ Then nothing happens to the old file until something better has arrived:
    check, so the *arr may import the download and remove the old file the
    minute it finishes. The copy is what makes that safe.
 2. When the *arr holds the download instead ("Not an upgrade for existing
-   episode file(s)"), `advance` opens it, checks it the way every other file
+   episode file(s)", which Sonarr 4.0.20 leaves `importPending` with a
+   warning, not `importBlocked` — `held`), `advance` opens it, checks it the way every other file
    is checked, and only if it is genuinely better asks the *arr to import it
    (Manual Import), which replaces the old file the *arr's own way round.
    A download that fails the check is removed and blocklisted, and the
@@ -605,8 +606,7 @@ def _step(rec: dict[str, Any], client: ArrClient,
     # A held download needs its own path: it is what tells the download's
     # files from the library's (`_held_by_arr`). Without one it waits out
     # the expiry rather than being judged on anything else.
-    if (item.blocked and item.state not in ("failed", "failedPending")
-            and item.local_path):
+    if held(item) and item.local_path:
         return _held_by_arr(rec, client, item, s)
 
     if now - rec["grabbed"] > EXPIRE_DAYS * 86400:
@@ -618,6 +618,28 @@ def _step(rec: dict[str, Any], client: ArrClient,
         _finish(rec, "expired", f"still not finished after {EXPIRE_DAYS} days")
         return "expired"
     return "downloading"
+
+
+def held(item: intake.QueueItem) -> bool:
+    """Whether the *arr has finished with a download and will not import it.
+
+    `importBlocked` is not the only way it says so, nor the usual one for
+    ours. Sonarr 4.0.20 keeps `importBlocked` for its own trouble with a
+    release (matched by id, an unknown series). A download it refuses to
+    import over a file of equal or better quality stays `importPending` with
+    a warning, retried every minute and refused every time. Live,
+    2026-11-03, BattleBots S06E02: "Not an upgrade for existing episode
+    file(s). Existing quality: WEBDL-720p. New Quality HDTV-1080p." So that
+    counts too, but only for an upgrade refusal: "No files found are
+    eligible for import" is the *arr not seeing the file at all, which a
+    check from here could only misread as an empty download.
+    """
+    if item.state in ("failed", "failedPending"):
+        return False
+    if item.blocked:
+        return True
+    return (item.state == "importPending"
+            and any(m in item.all_text for m in UPGRADE_REFUSALS))
 
 
 def _held_by_arr(rec: dict[str, Any], client: ArrClient,

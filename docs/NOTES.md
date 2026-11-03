@@ -2180,3 +2180,20 @@ dropped. 1,748.76 s long, the same as the `.ts`. 727 MB in, 790 MB out. The `.ts
 `/media/.recycle/2026-11-03/`. The row is at `fix_attempts` 3 with `shrink_skipped` set, and
 `transcode_awaits_emby` is logged, because Emby's stuck scan has not seen the new file yet. It
 now shows only `image_subtitles_only`.
+
+### 2026-11-03 19:50: the *arrs' qBittorrent mapping fixed, and what Sonarr does with our grab
+
+On Allan's go-ahead, remote path mapping 1 in Sonarr and in Radarr went from host
+`qbt.tail745ddc.ts.net` to `192.168.1.2`, the host both download clients use. `/data/` →
+`/downloads/` stays as it was, and both containers mount `downloads/complete` at `/downloads`.
+After one `RefreshMonitoredDownloads`, Sonarr read the BattleBots download at
+`/downloads/tv-sonarr/…` and refused it as expected: "Not an upgrade for existing episode
+file(s). Existing quality: WEBDL-720p. New Quality HDTV-1080p."
+
+The state stayed `importPending` with that warning, and two refreshes did not move it to
+`importBlocked`, which Sonarr 4.0.20 keeps for its own parsing trouble (invariant 24's "matched
+by ID"). `replace` waited for `importBlocked` only, so the grab would have sat until it
+expired. `replace.held` now counts an `importPending` download whose messages carry one of the
+`UPGRADE_REFUSALS`. It does not count "No files found are eligible for import": that means the
+*arr cannot reach the file at all, and an empty candidate list would be misread as an empty
+download.
