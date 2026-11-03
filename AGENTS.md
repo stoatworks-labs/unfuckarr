@@ -488,7 +488,9 @@ Break any of these and the failure is quiet and expensive.
     The usual path is the *arr holding the download as `importBlocked` "Not an upgrade". There
     `advance` opens it and asks for a ManualImport only if it passes. Otherwise it removes and
     blocklists it with `skip_redownload`, because the next attempt is unfuckarr's to choose, and
-    the original never moved.
+    the original never moved. **Only files inside the download's own output path are ever judged
+    or imported**: ask `manualimport` by `downloadId` alone, because given a `seriesId` too Sonarr
+    4.0.20 lists the series folder instead, the file being replaced included.
 
     Three more rules. `intake` must never act on our grab, so `replace.owns` turns its verdict to
     `manual` whatever the message says. Its `bad_release` path would remove the grab and let the

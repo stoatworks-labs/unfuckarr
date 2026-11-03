@@ -228,7 +228,7 @@ class FakeArr:
     def history_for_download(self, download_id):
         return self.history.get(download_id, [])
 
-    def manual_import_candidates(self, download_id, entity_id):
+    def manual_import_candidates(self, download_id):
         return self.candidates
 
     def manual_import(self, item, entity_id, episode_ids, download_id):
@@ -374,9 +374,14 @@ def _grabbed(settings, row, arr):
     return dict(db.q1("SELECT * FROM replacements"))
 
 
+# Where the download landed, as the queue reports it.
+DL = "/downloads/HIGNFY.S49E07.1080p.WEB.h264"
+
+
 def _queued(state: str = "importBlocked", message: str =
-            "Not an upgrade for existing episode file(s)"):
+            "Not an upgrade for existing episode file(s)", output: str = DL):
     return {"id": 5, "downloadId": "dl-1", "title": "HIGNFY.S49E07.1080p.WEB.h264",
+            "outputPath": output,
             "trackedDownloadState": state, "trackedDownloadStatus": "warning",
             "status": "completed", "seriesId": 1014, "episodeId": 67221,
             "statusMessages": [{"messages": [message]}]}
@@ -403,11 +408,11 @@ def test_a_held_download_that_passes_is_imported_and_the_copy_goes(
     arr = FakeArr([release("HIGNFY.S49E07.1080p.WEB.h264", 1.2)])
     _grabbed(settings, row, arr)
     arr.queue_records = [_queued()]
-    arr.candidates = [_candidate(str(tmp_path / "dl" / "ep.mkv"))]
+    arr.candidates = [_candidate(f"{DL}/ep.mkv")]
     seen = _judge(monkeypatch, True)
 
     replace.advance(settings, lambda source: arr)
-    assert seen == [str(tmp_path / "dl" / "ep.mkv")]
+    assert seen == [f"{DL}/ep.mkv"]
     assert len(arr.imported) == 1 and arr.removed == []
     assert db.q1("SELECT state FROM replacements")["state"] == "importing"
     assert len(_bin_files(settings)) == 1          # not until it has landed
@@ -429,7 +434,7 @@ def test_a_held_download_that_fails_is_thrown_back_and_nothing_changes(
     arr = FakeArr([release("HIGNFY.S49E07.1080p.WEB.h264", 1.2)])
     _grabbed(settings, row, arr)
     arr.queue_records = [_queued()]
-    arr.candidates = [_candidate(str(tmp_path / "dl" / "ep.mkv"))]
+    arr.candidates = [_candidate(f"{DL}/ep.mkv")]
     _judge(monkeypatch, False, "it is heavily re-encoded too")
 
     replace.advance(settings, lambda source: arr)
@@ -450,7 +455,7 @@ def test_a_sample_alone_is_not_the_episode(settings, row, monkeypatch, tmp_path)
     arr = FakeArr([release("HIGNFY.S49E07.1080p.WEB.h264", 1.2)])
     _grabbed(settings, row, arr)
     arr.queue_records = [_queued()]
-    sample = _candidate(str(tmp_path / "dl" / "sample.mkv"))
+    sample = _candidate(f"{DL}/sample.mkv")
     sample["rejections"] = [{"reason": "Sample"}]
     arr.candidates = [sample]
     _judge(monkeypatch, True)
@@ -539,7 +544,7 @@ def test_a_failed_manual_import_is_recorded(settings, row, monkeypatch, tmp_path
     arr = FakeArr([release("HIGNFY.S49E07.1080p.WEB.h264", 1.2)])
     _grabbed(settings, row, arr)
     arr.queue_records = [_queued()]
-    arr.candidates = [_candidate(str(tmp_path / "dl" / "ep.mkv"))]
+    arr.candidates = [_candidate(f"{DL}/ep.mkv")]
     _judge(monkeypatch, True)
     replace.advance(settings, lambda source: arr)
     arr.command = {"status": "failed", "message": "Destination already exists"}
@@ -675,7 +680,7 @@ def test_a_manual_import_that_never_takes_is_thrown_back(
     arr = FakeArr([release("HIGNFY.S49E07.1080p.WEB.h264", 1.2)])
     _grabbed(settings, row, arr)
     arr.queue_records = [_queued()]
-    arr.candidates = [_candidate(str(tmp_path / "dl" / "ep.mkv"))]
+    arr.candidates = [_candidate(f"{DL}/ep.mkv")]
     _judge(monkeypatch, True)
     replace.advance(settings, lambda source: arr)
     arr.command = {"status": "completed"}
@@ -689,3 +694,49 @@ def test_a_manual_import_that_never_takes_is_thrown_back(
     assert rec["state"] == "rejected" and "did not take" in rec["message"]
     assert arr.removed and os.path.exists(row["path"])
     assert _bin_files(settings) == []               # original still in place
+
+
+def test_the_librarys_own_file_is_never_taken_for_the_download(
+        settings, row, monkeypatch):
+    """Live, 2026-11-03: asked with a series id, Sonarr listed the series'
+    folder, and the file being replaced was in it with the right episode."""
+    arr = FakeArr([release("HIGNFY.S49E07.1080p.WEB.h264", 1.2)])
+    _grabbed(settings, row, arr)
+    arr.queue_records = [_queued()]
+    arr.candidates = [_candidate(row["path"]), _candidate(f"{DL}/ep.mkv")]
+    seen = _judge(monkeypatch, True)
+    replace.advance(settings, lambda source: arr)
+    assert seen == [f"{DL}/ep.mkv"]
+    assert arr.imported[0]["path"] == f"{DL}/ep.mkv"
+
+    db.ex("DELETE FROM replacements")
+    _grabbed(settings, {**row, "last_research": None}, arr)
+    arr.candidates = [_candidate(row["path"])]     # nothing from the download
+    arr.imported.clear()
+    seen.clear()
+    replace.advance(settings, lambda source: arr)
+    assert seen == [] and arr.imported == []
+    assert db.q1("SELECT state FROM replacements")["state"] == "rejected"
+
+
+def test_a_held_download_with_no_path_waits(settings, row, monkeypatch):
+    """Nothing to tell its files from the library's by, so it is not judged."""
+    arr = FakeArr([release("HIGNFY.S49E07.1080p.WEB.h264", 1.2)])
+    _grabbed(settings, row, arr)
+    arr.queue_records = [_queued(output="")]
+    arr.candidates = [_candidate(f"{DL}/ep.mkv")]
+    seen = _judge(monkeypatch, True)
+    replace.advance(settings, lambda source: arr)
+    assert seen == [] and arr.removed == []
+    assert db.q1("SELECT state FROM replacements")["state"] == "grabbed"
+
+
+def test_candidates_are_asked_for_by_download_alone(monkeypatch):
+    from unfuckarr.clients.arr import ArrClient
+    from unfuckarr.config import ArrConfig
+    sent = []
+    client = ArrClient(ArrConfig(url="http://sonarr", api_key="k"), "sonarr")
+    monkeypatch.setattr(client, "_request",
+                        lambda method, path, **kw: sent.append(kw["params"]) or [])
+    client.manual_import_candidates("dl-1")
+    assert sent == [{"downloadId": "dl-1", "filterExistingFiles": False}]

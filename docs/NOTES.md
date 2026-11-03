@@ -2148,3 +2148,22 @@ headers that claim 43 to 85 minutes.
 They show as `incompatible` or `hygiene` with `very_low_bitrate`, not as corrupt, so the
 integrity check is not catching a file that is almost all missing. Left alone; it is a
 separate question.
+
+### 2026-11-03 19:35: the first replacement's download, and two things it showed
+
+The BattleBots download finished a minute after the grab. Sonarr left it `importPending` with
+"No files found are eligible for import in /data/tv-sonarr/…", and its manual-import list for
+the download was empty, though the file was in `downloads/complete/tv-sonarr/` as it should be.
+The cause is in the *arrs' setup, not here. Both Sonarr's and Radarr's qBittorrent client is set
+to host `192.168.1.2`, while their remote path mapping (`/data/` → `/downloads/`) is for host
+`qbt.tail745ddc.ts.net`. The mapping never applies, so the *arr looks for `/data/…`, which its
+container does not have. None of Sonarr's last 200 imports came from qBittorrent; they were all
+SABnzbd. A torrent grab, ours or anyone's, sits in the queue until something removes it.
+Reported to Allan, not changed: it is the *arrs' configuration.
+
+Asking for that download's files with the `seriesId` too, as `manual_import_candidates` did,
+brought back the whole series folder, every library episode of it, S06E02's own file among them, with
+the right episode id. Had the download been held, `_held_by_arr` would have judged the library's
+file and thrown the good download back. Now the candidates are asked for by `downloadId` alone,
+and only files under the queue item's own output path are considered. A held download with no
+output path waits out the expiry.

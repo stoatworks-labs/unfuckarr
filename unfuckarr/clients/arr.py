@@ -391,20 +391,22 @@ class ArrClient:
                 return str(r["downloadId"])
         return None
 
-    def manual_import_candidates(self, download_id: str,
-                                 entity_id: int) -> list[dict[str, Any]]:
+    def manual_import_candidates(self, download_id: str) -> list[dict[str, Any]]:
         """What the *arr would import from a finished download, file by file.
 
         The same list its Manual Import dialog shows, with each file's parsed
         episode or movie, quality, languages and the reasons the automatic
         import refused it. `filterExistingFiles` off, because "a file is
         already there" is exactly the case this is for.
+
+        By download id **alone**. Given a `seriesId` as well, Sonarr 4.0.20
+        lists the series' own folder and ignores the download: live,
+        2026-11-03, it answered with every BattleBots episode in the
+        library, the very file being replaced among them, so the check would
+        have judged that file and thrown the download back for it.
         """
-        params: dict[str, Any] = {"downloadId": download_id,
-                                  "filterExistingFiles": False}
-        params["movieId" if self.flavour == "radarr" else "seriesId"] = entity_id
-        return self._request("GET", "manualimport", timeout=120.0,
-                             params=params) or []
+        return self._request("GET", "manualimport", timeout=120.0, params={
+            "downloadId": download_id, "filterExistingFiles": False}) or []
 
     def manual_import(self, item: dict[str, Any], entity_id: int,
                       episode_ids: list[int] | None,

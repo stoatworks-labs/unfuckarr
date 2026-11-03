@@ -602,7 +602,11 @@ def _step(rec: dict[str, Any], client: ArrClient,
                            "the download was still in the queue an hour later")
         return "importing"
 
-    if item.blocked and item.state not in ("failed", "failedPending"):
+    # A held download needs its own path: it is what tells the download's
+    # files from the library's (`_held_by_arr`). Without one it waits out
+    # the expiry rather than being judged on anything else.
+    if (item.blocked and item.state not in ("failed", "failedPending")
+            and item.local_path):
         return _held_by_arr(rec, client, item, s)
 
     if now - rec["grabbed"] > EXPIRE_DAYS * 86400:
@@ -621,10 +625,15 @@ def _held_by_arr(rec: dict[str, Any], client: ArrClient,
     """The download finished and the *arr will not import it. Check it, and
     either have it imported or throw it back."""
     eps = set(episode_ids(rec))
-    candidates = client.manual_import_candidates(rec["download_id"],
-                                                 rec["arr_parent_id"])
     mine = []
-    for c in candidates:
+    for c in client.manual_import_candidates(rec["download_id"]):
+        local = client.local_path(c.get("path") or "")
+        if not _inside(local, item.local_path):
+            # Never a file from outside the download. The library's own copy
+            # of this episode is what such a list has held, live
+            # (`ArrClient.manual_import_candidates`): judged, it fails as the
+            # heavily re-encoded file it is, and the good download goes back.
+            continue
         refusals = " ".join(str((x or {}).get("reason", x)) if isinstance(x, dict)
                             else str(x) for x in c.get("rejections") or []).lower()
         if "sample" in refusals:
@@ -632,12 +641,11 @@ def _held_by_arr(rec: dict[str, Any], client: ArrClient,
         if rec["source"] == "sonarr":
             if not eps <= {int(e.get("id")) for e in c.get("episodes") or []}:
                 continue
-        mine.append(c)
+        mine.append((c, local))
     if not mine:
         return _reject(rec, client, item, "nothing in the download is this "
                        + ("episode" if rec["source"] == "sonarr" else "film"))
-    best = max(mine, key=lambda c: c.get("size") or 0)
-    local = client.local_path(best.get("path") or "")
+    best, local = max(mine, key=lambda m: m[0].get("size") or 0)
     ok, why, measured = judge(local, rec, s)
     if not ok:
         return _reject(rec, client, item, why)
@@ -648,6 +656,14 @@ def _held_by_arr(rec: dict[str, Any], client: ArrClient,
     db.log("replacement_accepted", "info", rec["path"],
            {"release": rec.get("title"), "measured": measured})
     return "importing"
+
+
+def _inside(path: str, root: str) -> bool:
+    """Whether ``path`` is ``root`` itself or somewhere under it."""
+    if not path or not root:
+        return False
+    path, root = os.path.normpath(path), os.path.normpath(root)
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
 def _reject(rec: dict[str, Any], client: ArrClient, item: intake.QueueItem,
