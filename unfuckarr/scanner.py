@@ -558,7 +558,7 @@ class Scanner:
         # reading it as 0 put all eleven of them behind every readable disc.
         def order(item: tuple) -> tuple:
             item_row, _, item_info, item_decision = item
-            if item_decision.action == "research":
+            if item_decision.action in ("research", "replace"):
                 return (1, item_row.get("last_research") or 0.0)
             if item_decision.action == "convert":
                 size = item_info.size if item_info else item_row.get("size") or 0
@@ -605,13 +605,19 @@ class Scanner:
                                {"cap": s.policy.max_shrinks_per_scan})
                         capped_shrinks = True
                     continue
-            elif decision.action == "research":
+            elif decision.action in ("research", "replace"):
                 # The cooldown is checked here, not only inside `apply`,
                 # because a file that is merely waiting must not spend one of
                 # the pass's slots — otherwise the first five files in the
                 # backlog absorb the cap every night for a month and nothing
                 # behind them is ever asked about.
-                waiting = self.remediator.research_blocked(row)
+                #
+                # A replacement shares the re-search cap: it is the same
+                # interactive search, fanned out to the same indexers, and the
+                # cap is there for them.
+                waiting = (self.remediator.research_blocked(row)
+                           if decision.action == "research"
+                           else self.remediator.replace_blocked(row))
                 if waiting is not None:
                     continue
                 if researches >= s.policy.max_researches_per_scan:
@@ -659,7 +665,7 @@ class Scanner:
                 shrinks += 1
             elif decision.action == "convert":
                 conversions += 1
-            elif decision.action == "research":
+            elif decision.action in ("research", "replace"):
                 researches += 1
             elif decision.action != "flag":
                 applied += 1

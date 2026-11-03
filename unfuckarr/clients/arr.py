@@ -14,6 +14,7 @@ that matter and are easy to get wrong:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Literal
 
 import httpx
@@ -40,13 +41,14 @@ class ArrClient:
 
     # -- plumbing ---------------------------------------------------------
 
-    def _request(self, method: str, path: str, **kw: Any) -> Any:
+    def _request(self, method: str, path: str, timeout: float | None = None,
+                 **kw: Any) -> Any:
         if not self.cfg.url or not self.cfg.api_key:
             raise ArrError(f"{self.flavour} is not configured")
         url = f"{self.cfg.url}/api/v3/{path.lstrip('/')}"
         headers = {"X-Api-Key": self.cfg.api_key, "Accept": "application/json"}
         try:
-            with httpx.Client(timeout=self.timeout) as client:
+            with httpx.Client(timeout=timeout or self.timeout) as client:
                 resp = client.request(method, url, headers=headers, **kw)
         except httpx.HTTPError as exc:
             raise ArrError(f"{self.flavour} unreachable: {exc}") from exc
@@ -319,6 +321,123 @@ class ArrClient:
             "skipRedownload": skip_redownload,
         }
         self._request("DELETE", f"queue/{queue_id}", params=params)
+
+    # -- replacing a file ourselves (see `replace.py`) --------------------
+
+    def releases(self, entity_id: int,
+                 episode_ids: list[int] | None = None) -> list[dict[str, Any]]:
+        """Every release the indexers offer for this episode or movie.
+
+        This is the interactive search, the one behind the person icon in the
+        *arr's UI: it fans out to every indexer, waits for them all, and hands
+        back each release with the *arr's reasons for refusing it — which is
+        the part `replace.choose` needs, because on a library whose profiles
+        forbid upgrades every single release comes back refused, and only the
+        *reasons* say which of them are refused for a reason we can overrule.
+
+        One episode at a time on Sonarr: asked by episode id it returns the
+        releases parsed to that episode, plus season packs, which `choose`
+        skips. A multi-episode file is asked about by its first episode.
+
+        Slow — tens of seconds, and over a minute when an indexer is having a
+        bad day — so it gets its own timeout rather than the client's 30 s.
+        """
+        params = ({"movieId": entity_id} if self.flavour == "radarr"
+                  else {"episodeId": (episode_ids or [entity_id])[0]})
+        return self._request("GET", "release", timeout=180.0, params=params) or []
+
+    def grab(self, guid: str, indexer_id: int) -> dict[str, Any]:
+        """Send one release from the last `releases` call to the download client.
+
+        The *arr looks the release up in the cache that search filled (it keeps
+        it for about half an hour), so this has to follow `releases` closely.
+        It does not re-run its own decision: the UI lets a person grab a
+        release it refused, and this is the same call.
+        """
+        return self._request("POST", "release", timeout=60.0,
+                             json={"guid": guid, "indexerId": indexer_id}) or {}
+
+    def history_for_download(self, download_id: str) -> list[dict[str, Any]]:
+        """Every history event for one download: grabbed, imported, failed."""
+        data = self._request("GET", "history", params={
+            "downloadId": download_id, "pageSize": 50,
+            "sortKey": "date", "sortDirection": "descending"}) or {}
+        return data.get("records", []) if isinstance(data, dict) else list(data)
+
+    def find_grab(self, entity_id: int, episode_ids: list[int] | None,
+                  title: str, since: float) -> str | None:
+        """The download id the *arr recorded for a grab we just made, by title.
+
+        The grab call does not return one, and the download id is the only
+        name a download keeps from the queue to the history to the import.
+        Matched on the release title and on being newer than ``since``, so an
+        earlier grab of the same release (a retry, a person) is not mistaken
+        for this one.
+        """
+        if self.flavour == "radarr":
+            hist = self._request("GET", "history/movie", params={
+                "movieId": entity_id, "eventType": 1}) or []
+            records = hist if isinstance(hist, list) else hist.get("records", [])
+        else:
+            records = []
+            for eid in (episode_ids or [])[:1]:
+                h = self._request("GET", "history", params={
+                    "episodeId": eid, "eventType": 1, "pageSize": 20}) or {}
+                records.extend(h.get("records", []) if isinstance(h, dict) else h)
+        cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(since - 120))
+        for r in sorted(records, key=lambda r: r.get("date", ""), reverse=True):
+            if (r.get("sourceTitle") == title and r.get("downloadId")
+                    and (r.get("date") or "") >= cutoff):
+                return str(r["downloadId"])
+        return None
+
+    def manual_import_candidates(self, download_id: str,
+                                 entity_id: int) -> list[dict[str, Any]]:
+        """What the *arr would import from a finished download, file by file.
+
+        The same list its Manual Import dialog shows, with each file's parsed
+        episode or movie, quality, languages and the reasons the automatic
+        import refused it. `filterExistingFiles` off, because "a file is
+        already there" is exactly the case this is for.
+        """
+        params: dict[str, Any] = {"downloadId": download_id,
+                                  "filterExistingFiles": False}
+        params["movieId" if self.flavour == "radarr" else "seriesId"] = entity_id
+        return self._request("GET", "manualimport", timeout=120.0,
+                             params=params) or []
+
+    def manual_import(self, item: dict[str, Any], entity_id: int,
+                      episode_ids: list[int] | None,
+                      download_id: str) -> int | None:
+        """Import one file from a download the *arr is holding. Returns the
+        command id.
+
+        A manual import is the *arr's own import, decided by a person: it
+        moves the file into the library and replaces the existing one through
+        its ordinary upgrade path, which removes the old file only once the
+        new one is in place. Nothing here deletes anything.
+        """
+        entry: dict[str, Any] = {
+            "path": item.get("path"),
+            "folderName": item.get("folderName") or "",
+            "quality": item.get("quality"),
+            "languages": item.get("languages") or [],
+            "releaseGroup": item.get("releaseGroup") or "",
+            "indexerFlags": item.get("indexerFlags") or 0,
+            "downloadId": download_id,
+        }
+        if self.flavour == "radarr":
+            entry["movieId"] = entity_id
+        else:
+            entry["seriesId"] = entity_id
+            entry["episodeIds"] = list(episode_ids or [])
+            entry["releaseType"] = item.get("releaseType") or "singleEpisode"
+        data = self._request("POST", "command", json={
+            "name": "ManualImport", "importMode": "auto", "files": [entry]}) or {}
+        return data.get("id")
+
+    def command_status(self, command_id: int) -> dict[str, Any]:
+        return self._request("GET", f"command/{command_id}") or {}
 
     def rescan(self, entity_id: int) -> None:
         """Make the *arr re-read the folder — needed after we replace a file

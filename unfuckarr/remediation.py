@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from . import db, disc, governor, makemkv, quality, recycle, transcode
+from . import db, disc, governor, makemkv, quality, recycle, replace, transcode
 from .checks import CheckResult
 from .checks.compat import resolve as resolve_profile
 from .checks.integrity import looks_repairable
@@ -33,7 +33,7 @@ from .state import bus, clear_task, set_task
 
 log = logging.getLogger(__name__)
 
-Action = str  # none | flag | transcode | repair | shrink | convert | redownload | research
+Action = str  # none | flag | transcode | repair | shrink | convert | redownload | research | replace
 
 # A transcode that does not clear the finding would otherwise be repeated on
 # every scan for ever. Two goes, then the file is flagged and left alone.
@@ -218,6 +218,17 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
             # them, and on the default (`flag`) the old shape meant the file
             # was reported as untidy for ever with no way to say "this one
             # needs a better source". `unfixable_action` is that way.
+            codes = [f.code for f in warnings]
+            if ("very_low_bitrate" in codes
+                    and policy.low_bitrate_action == "replace"):
+                # The one unfixable finding a better release can be told
+                # apart for before it is downloaded — its size over the
+                # runtime says how much picture it has. Invariant 30.
+                return Decision("replace",
+                                "heavily re-encoded: finding a release with "
+                                "real detail in it, and keeping this one until "
+                                "a better copy has arrived and been checked",
+                                codes)
             if policy.unfixable_action == "research":
                 # The same reasoning that rules a rewrite out is what makes a
                 # re-search the only move left: these findings describe the
@@ -523,6 +534,8 @@ class Remediator:
                 return self._redownload(job_id, file_row, decision.reason)
             if decision.action == "research":
                 return self._research(job_id, file_row, decision.reason)
+            if decision.action == "replace":
+                return self._replace(job_id, file_row, info)
             self._set_job(job_id, "failed", 0, f"unknown action {decision.action}")
             return {"action": decision.action, "ok": False,
                     "message": "unknown action"}
@@ -1946,6 +1959,32 @@ class Remediator:
         db.log("research", "info", path, {"reason": reason})
         self._set_job(job_id, "done", 1.0, message)
         return {"action": "research", "ok": True, "message": message}
+
+    # -- replace ----------------------------------------------------------
+
+    def replace_blocked(self, file_row: dict[str, Any]) -> str | None:
+        """`replace.blocked`, for the scan to ask before it spends a slot."""
+        return replace.blocked(file_row, self._settings())
+
+    def _replace(self, job_id: int, file_row: dict[str, Any],
+                 info: MediaInfo | None) -> dict[str, Any]:
+        """Grab a better release for a heavily re-encoded file. Keep the file.
+
+        The grab is all that happens here. What follows — checking the
+        download, having the *arr import it, or throwing it back — happens on
+        the queue worker's pass (`replace.advance`), because a download takes
+        minutes to days and the scan cannot wait on it. Invariant 30.
+        """
+        client = self._arr_for(file_row)
+        if client is None:
+            message = "no *arr configured for this file"
+            self._set_job(job_id, "done", 1.0, message)
+            return {"action": "replace", "ok": True, "message": message}
+        out = replace.start(file_row, info, client, self._settings())
+        self._set_job(job_id, "done" if out["ok"] else "failed",
+                      1.0 if out["ok"] else 0, out["message"],
+                      error=None if out["ok"] else out["message"])
+        return {"action": "replace", **out}
 
     # -- redownload -------------------------------------------------------
 

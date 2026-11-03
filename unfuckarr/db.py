@@ -196,6 +196,40 @@ CREATE TABLE IF NOT EXISTS playback (
 CREATE INDEX IF NOT EXISTS idx_playback_ts ON playback(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_playback_path ON playback(path);
 
+-- Replacements unfuckarr grabbed itself for a heavily re-encoded file, and how
+-- each one ended. One row per grab, kept after it ends, because the attempt
+-- cap and "never grab this release twice" are both answered from here, and
+-- the file's own row cannot answer them: a replacement that lands is a
+-- different file at a different path.
+CREATE TABLE IF NOT EXISTS replacements (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    arr_key       TEXT NOT NULL,      -- sonarr:<episode ids> | radarr:<movie id>
+    path          TEXT NOT NULL,      -- the file it is meant to replace
+    source        TEXT NOT NULL,      -- sonarr | radarr
+    arr_parent_id INTEGER,
+    arr_episode_ids TEXT,             -- JSON list, sonarr only
+    title         TEXT,               -- the release
+    guid          TEXT,
+    indexer       TEXT,
+    protocol      TEXT,
+    size          INTEGER,
+    download_id   TEXT,               -- NULL until the *arr's history names it
+    command_id    INTEGER,            -- our ManualImport, once sent
+    held_copy     INTEGER,            -- recycle.id of the original kept aside
+    old_mbps      REAL,               -- H.264-equivalent, as measured
+    old_duration  REAL,
+    old_tier      INTEGER,
+    est_mbps      REAL,               -- H.264-equivalent, from the release size
+    new_path      TEXT,
+    state         TEXT NOT NULL,      -- grabbed|importing|imported|imported_worse|rejected|failed|vanished|expired
+    message       TEXT,
+    grabbed       REAL NOT NULL,
+    updated       REAL NOT NULL,
+    finished      REAL
+);
+CREATE INDEX IF NOT EXISTS idx_replacements_key ON replacements(arr_key);
+CREATE INDEX IF NOT EXISTS idx_replacements_state ON replacements(state);
+
 CREATE TABLE IF NOT EXISTS recycle (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     original  TEXT NOT NULL,

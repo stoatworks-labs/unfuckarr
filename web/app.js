@@ -214,13 +214,16 @@ function updateTotals() {
     [t.files_deleted, 'deleted',
      'Files removed from the library. They go to the recycle bin first unless '
      + 'retention is set to zero.'],
+    [t.files_replaced, 'replaced',
+     'Heavily re-encoded files swapped for a better release that unfuckarr '
+     + 'grabbed and checked after it arrived.'],
     [t.redownloads, 're-searched',
      'Deletions where an *arr was actually asked for a replacement. Lower than '
      + 'the deleted count when a file belongs to no *arr, because then nothing '
      + 'is coming to replace it.'],
   ];
 
-  // Nothing has happened yet: six zeroes is a worse first impression than no
+  // Nothing has happened yet: a row of zeroes is a worse first impression than no
   // strip at all, and it says nothing a new install does not already know.
   const everything = items.every(([n]) => !n || n === '—');
   strip.classList.toggle('hidden', everything);
@@ -763,6 +766,13 @@ async function openDrawer(path) {
       onclick: () => fileAction(path, 'research'),
     }, 'Re-search (keep file)'),
     el('button', {
+      class: 'btn',
+      title: 'Search the indexers for a release with clearly more picture in '
+        + 'it and grab it. This file stays where it is until the download has '
+        + 'arrived and been checked; a copy waits in the recycle bin until then.',
+      onclick: () => fileAction(path, 'replace'),
+    }, 'Find a better copy (keep file)'),
+    el('button', {
       class: 'btn btn-danger',
       onclick: () => {
         if (!confirm(`Delete ${basename(path)} and ask the *arr for a replacement?\n\nThe file goes to the recycle bin first.`)) return;
@@ -1129,6 +1139,7 @@ const FIELD_HELP = {
   'policy.oversize_action': 'What to do with a file that has not been measured for a saving yet. This can never delete: the worst it can do is re-encode, and only when a measured quality check says the result is indistinguishable from the original.',
   'policy.max_actions_per_scan': 'Hard cap on how many files one scan may transcode or delete. Shrinks are counted separately, below.',
   'policy.unfixable_action': 'What to do with a file whose problems no rewrite can fix — a heavily re-encoded source, image-only subtitles. (An Emby refusal is not one of these any more: unfuckarr asks Emby again to find the reason, and re-encodes the file when nothing smaller will do.) `research` asks Sonarr/Radarr for a better release and never deletes: the *arr imports the replacement and removes the old file itself, only on a successful download. `flag` just keeps reporting it.',
+  'policy.low_bitrate_action': 'What to do with a heavily re-encoded file (under a megabit at 720p and up). `replace` searches the indexers itself through Sonarr/Radarr, grabs a release that is clearly better — judged on its bitrate for its codec, not on its quality name — checks the download when it lands, and only then has the *arr import it over the old file. A copy of the old file sits in the recycle bin until the new one has passed. `unfixable` leaves these to the setting above. Shares the re-search cap and cooldown below.',
   'policy.max_researches_per_scan': 'How many re-searches one scan may ask for. This is indexer etiquette, not server load — each one is a query fanned out to every indexer your *arr has, so keep it low.',
   'policy.research_after_days': 'Leave a file alone for this long after asking about it. Also what makes the cap walk through the backlog instead of re-asking about the same few files every night.',
   'policy.max_shrinks_per_scan': 'Only applies when continuous shrinking is off. Then it is really \u201chow many hours of encoding per scan\u201d: shrinks run one after another at roughly 15\u201325 minutes each, so 5 is about two hours. With continuous shrinking on, the GPU share below is what paces the work instead, and this is ignored.',
@@ -1360,7 +1371,9 @@ async function viewSettings() {
       settingField('policy.oversize_action', s.policy.oversize_action,
         { options: ['none', 'flag', 'shrink'] }),
       settingField('policy.unfixable_action', s.policy.unfixable_action,
-        { options: ['none', 'flag', 'research'] })),
+        { options: ['none', 'flag', 'research'] }),
+      settingField('policy.low_bitrate_action', s.policy.low_bitrate_action,
+        { options: ['unfixable', 'replace'], label: 'Heavily re-encoded files' })),
     settingField('policy.try_repair_before_redownload', s.policy.try_repair_before_redownload,
       { label: 'Try a remux before re-downloading a corrupt file' }),
     settingField('policy.blocklist_on_redownload', s.policy.blocklist_on_redownload,
