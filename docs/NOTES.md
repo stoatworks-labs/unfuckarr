@@ -2093,3 +2093,58 @@ real searches and no grab. One would grab: BattleBots S06E02, a 1.96 GB 1080p x2
 6.27 H.264-equivalent Mbps against 1.98. Two would not: Storyville "Flee" and Voyager's
 two-part Endgame. On branch `claude/low-bitrate-replace`; not merged, not deployed, and no
 grab has ever been made by it.
+
+Merged with the Emby work as `eefefb5`. On the way in, a kept copy became exempt from the bin's
+size limit, its retention sweep and Empty bin while its grab is open (`recycle.held`), and a
+ManualImport that never takes is thrown back after an hour instead of blocking the episode.
+
+### 2026-11-03 19:22: deployed `eefefb5`, `replace` switched on
+
+Built on lilnasx as `unfuckarr-makemkv:new-eefefb5` (`825a2193`): `/app` matched the build
+clone (29 `.py` files), MakeMKV 1.18.4 answered, version 1.5.0. Rollback tag
+`unfuckarr-makemkv:rollback-2026-11-03-06c2936` (the old `4f6514e6`). Backup
+`.unfk-backups/pre-emby-refusals-2026-11-03`: db with its WAL, 18,901 files, integrity ok, plus
+`config.json` and the recreate script. While unfk was stopped:
+- `fix_attempts` went back to 0 for 124 files: 111 `incompatible` and 13 `hygiene`, each with at
+  least one finding other than `image_subtitles_only` and `very_low_bitrate`. The 61 left at 2
+  have only those.
+- `policy.low_bitrate_action` became `replace`.
+
+Healthy about 25 s after `recreate-unfk.sh`.
+
+The first live replacement went through `POST /api/files/recheck?act=true` on BattleBots
+S06E02 (0.99 Mbps HEVC 720p). It grabbed "BattleBots 2015 S06E02 1080p HEVC x265-MeGusta"
+(1.96 GB torrent, about 3.2× the picture), as the dry run had chosen. `find_grab` named the
+download at once, the original's copy in `/media/.recycle` is a hard link (same inode, two
+links, so shfs links within the media share), and qBittorrent has it queued.
+
+The first broadcast capture did not go through. The Sky at Night S2019E11 was asked about
+again, and the diagnosis found `ContainerNotSupported` itself, as designed. But the plan was a
+remux, which died in ten seconds on "Can't write packet with unknown timestamp". Variants on the
+same file, written to Matroska on `/dev/null`:
+
+| Variant | Result |
+|---|---|
+| `-c copy` | fails |
+| `-fflags +genpts` | fails |
+| `+genpts+igndts`, audio encoded | fails |
+| `aresample=async=1` | fails |
+| `asetpts` | fails |
+| video alone, copied | **fails** |
+| audio alone, encoded | passes |
+| the real `_reencode` command, 180 s | passes: `hevc_vaapi`, AC-3 224k, the DVB subtitle copied |
+
+So for MPEG-TS there is no smaller job. `plan` now goes straight to `_reencode`
+(`UNCOPYABLE_CONTAINERS`), and the first attempt no longer goes on a remux that cannot work.
+91 of the library's `.ts` files are `incompatible`.
+
+Six library files are broken downloads from February and March: 0.7 to 10 MB each, against
+headers that claim 43 to 85 minutes.
+- Silo S01E08
+- Once Upon a Time S07E16 and S07E21
+- Deadliest Catch S11E01
+- Westworld S03E07 and S03E08
+
+They show as `incompatible` or `hygiene` with `very_low_bitrate`, not as corrupt, so the
+integrity check is not catching a file that is almost all missing. Left alone; it is a
+separate question.

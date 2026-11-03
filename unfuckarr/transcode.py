@@ -151,6 +151,15 @@ SUBTITLE_CONVERSIONS = {
 # what gives such a packet a time, so a re-encode of one of these decodes
 # the audio too, where for these containers it keeps the originals.
 TIMESTAMPED_CONTAINERS = {"mkv", "mp4", "m4v", "mov", "webm"}
+# ...and the ones where that leaves no smaller job at all. The video fails
+# too: live, The Sky at Night S2019E11 would not remux with only its video
+# stream copied (`-c:v copy`, alone, "Can't write packet with unknown
+# timestamp"), while its audio alone encoded cleanly and the full re-encode
+# ran through. So `plan` goes straight to `_reencode` for these, rather than
+# spending a file's first attempt on a remux that dies in ten seconds and
+# leaving the encode it needs to the next night. MPEG-TS only, because that is
+# where it was measured; an AVI copies into Matroska.
+UNCOPYABLE_CONTAINERS = {"ts"}
 
 # The language an untagged track is given, and the one preferred when a file
 # must have one default audio track chosen for it. `build_command` has always
@@ -280,6 +289,10 @@ def plan(info: MediaInfo, result: CheckResult, tcfg: TranscodeConfig,
         p.faststart = container == "mp4"
         p.drop_subtitles = _subtitles_to_drop(info, container)
         return p
+
+    if ((info.container or "").lower() in UNCOPYABLE_CONTAINERS
+            and info.video is not None and not info.is_disc):
+        return _reencode(p, info, profile, tcfg)
 
     v = info.video
     needs_video = bool(codes & {

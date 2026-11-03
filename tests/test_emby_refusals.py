@@ -374,3 +374,28 @@ def test_a_fix_for_a_refusal_is_counted_even_when_the_file_looks_fixed(
                  (out["path"],))["fix_attempts"] == 1
     assert db.q1("SELECT COUNT(*) n FROM activity "
                  "WHERE event='transcode_awaits_emby'")["n"] == 1
+
+
+def test_a_broadcast_capture_goes_straight_to_the_reencode(settings):
+    """The Sky at Night S2019E11, live after the deploy: its first attempt was a
+    remux, which died in ten seconds, because not even its video will copy
+    into Matroska. There is no smaller job, so the plan is the re-encode at
+    once, whatever the finding."""
+    info = _info(audio=[("ac3", 2, True)], subs=[("dvb_subtitle", False, False)],
+                 container="ts")
+    p = transcode.plan(info, _refused(info, "ContainerNotSupported"),
+                       settings.transcode, settings.emby_compat)
+    assert p.reencode and p.video_action == "encode"
+    assert p.audio_action == "encode" and p.audio_codec == "ac3"
+
+    tidy = CheckResult(path=info.path)
+    tidy.add(Finding("hygiene", "audio_missing_language", "warning", ""))
+    assert transcode.plan(info, tidy, settings.transcode,
+                          settings.emby_compat).reencode
+
+
+def test_other_containers_still_try_the_remux_first(settings):
+    info = _info(audio=[("mp3", 2, True)], container="avi")
+    p = transcode.plan(info, _refused(info, "ContainerNotSupported"),
+                       settings.transcode, settings.emby_compat)
+    assert not p.reencode and p.is_remux

@@ -449,7 +449,9 @@ Break any of these and the failure is quiet and expensive.
     decodes all of it where it does not (MPEG-TS: every Matroska remux of a broadcast capture
     died on "Can't write packet with unknown timestamp", whatever the flags). It runs when the
     diagnosis names nothing, when the smaller fix has had its go, or when the smaller fix is
-    already in the file and Emby still says no. A fix for an Emby refusal is counted in
+    already in the file and Emby still says no — and first, for an MPEG-TS source
+    (`UNCOPYABLE_CONTAINERS`), where even its video will not copy into Matroska and there is no
+    smaller job to try. A fix for an Emby refusal is counted in
     `fix_attempts` *even when the re-check passes*, because that re-check never asks Emby — leave
     it uncounted and a fix Emby does not accept is redone every pass, which is invariant 27's
     Blade II again. A re-encode sets the counter to the cap and `shrink_skipped`: a second encode
