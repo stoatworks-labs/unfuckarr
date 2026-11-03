@@ -15,12 +15,13 @@ scanner.collect_library()      → inventory from Sonarr/Radarr APIs + extra pat
   ↓
 scanner.check_file()           → integrity → (emby direct-play OR local compat) → hygiene → efficiency
   ↓                              produces CheckResult: a list of Findings with categories
-remediation.decide()           → CheckResult + Policy → Decision (none|flag|transcode|repair|shrink|convert|redownload)
+remediation.decide()           → CheckResult + Policy → Decision (none|flag|transcode|repair|shrink|convert|research|replace|redownload)
   ↓
 Remediator.apply()             → transcode.plan() → build_command() → run() → verify → replace
                                  or: quality.search() → encode → quality.verify() → replace
                                  or: makemkv.titles() → select() → rip() → verify → replace + extras/
                                  or: recycle.store() → arr.delete_file() → arr.blocklist_last_grab()
+                                 or: replace.start() → arr.releases() → choose() → recycle.keep_copy() → arr.grab()
 ```
 
 `Scanner._remediate()` sits between decide and apply and holds the safety brakes.
@@ -52,6 +53,17 @@ intake.triage()                → pure; working | manual | unrecognised. NEVER 
 intake.inspect()               → opens the files; the ONLY route to bad_release (invariant 23)
   ↓
 arr.remove_from_queue()        → remove + blocklist + let the *arr re-search, in one call
+```
+
+A replacement grab is followed on the same worker's tick, whether or not intake is enabled
+(invariant 29):
+
+```
+replace.advance()              → every open row in `replacements`, against one queue read per *arr
+  ↓
+held by the *arr?              → judge() the download → ManualImport, or remove + blocklist, no re-search
+imported by the *arr itself?   → judge() what it imported → imported, or imported_worse (the copy stays)
+failed / vanished / stuck      → recorded; the old file was never touched
 ```
 
 The watch folder path is the same pipeline with a different trigger:
@@ -407,6 +419,49 @@ Break any of these and the failure is quiet and expensive.
     falls back to the latest start of the same item on the same device (`Play.device_key`),
     and a completion is believed only with a position past 0; without one, the wall clock
     measures the play. Keep both: either alone still loses that play.
+
+29. **`replace` grabs, and still never deletes, recycles or blocklists the file it is
+    replacing.** It exists because `research` cannot help a heavily re-encoded file on a library
+    set up like the live one: a cutoff at the floor is met by the file already there (invariant
+    25), so the *arr refuses every release and grabs nothing. `replace` (behind
+    `policy.low_bitrate_action`, off by default, and only for `very_low_bitrate`: image-only
+    subtitles say nothing a release's size can answer) runs the interactive search itself and
+    overrules exactly one kind of refusal, "the file on disk is already as good"
+    (`UPGRADE_REFUSALS`). Every other refusal stands: seeders, size limits, wrong episode,
+    unparseable, already in the queue. `choose` is pure, like `decide`.
+
+    Candidates are compared on **codec-equivalent** bitrate, not raw. The first live search
+    (2026-11-03, Have I Got News for You S49E07, HEVC 720p at 0.71 Mbps) offered one release that
+    cleared the finding by its number: 720p x264 at 1.5 Mbps, which is the same picture in a
+    worse codec. A pass needs twice the H.264-equivalent rate, 1.25 Mbps raw, no drop in
+    resolution tier, the same number of episodes, and no season pack. The smallest that passes
+    wins, with weakly seeded torrents last. Each pass is checked again on arrival by `judge`
+    with the ordinary `check_file`, because a release's size is the indexer's claim.
+
+    The old file's safety is the point of the design, and the *arr does not provide it. A
+    same-quality release passes Sonarr's import check (it rejects only downgrades), so the *arr
+    may import our grab by itself and remove the old file in the same moment. Neither *arr has a
+    recycle bin (`recycleBin` empty on both, live 2026-11-03). So before the grab,
+    `recycle.keep_copy` hard-links the original into unfuckarr's own bin, and **no bin means no
+    grab**. The copy is let go only when the replacement was checked before it was imported, or
+    the original is still there unchanged. Whatever the *arr imported that `judge` then refuses
+    is `imported_worse`, and the copy stays for `recycle_bin_days`, restorable from the bin page.
+    The usual path is the *arr holding the download as `importBlocked` "Not an upgrade". There
+    `advance` opens it and asks for a ManualImport only if it passes. Otherwise it removes and
+    blocklists it with `skip_redownload`, because the next attempt is unfuckarr's to choose, and
+    the original never moved.
+
+    Three more rules. `intake` must never act on our grab, so `replace.owns` turns its verdict to
+    `manual` whatever the message says. Its `bad_release` path would remove the grab and let the
+    *arr re-search, and the *arr would then grab something nobody chose (invariant 24's race,
+    with ourselves). The grab also shares `max_researches_per_scan` and `research_after_days`
+    with `research`, checked in `Scanner._remediate` before a slot is spent, and each episode
+    gets at most `MAX_ATTEMPTS` (3), one open at a time. And Cleanuparr runs beside it on the
+    live box (queue cleaner every 30 minutes, 3 failed-import strikes, qBittorrent its only
+    client, `failed_import_skip_if_not_found_in_client` on). So a usenet grab is never struck,
+    and a torrent held as `importBlocked` could be removed after 60–90 minutes. The 10-minute
+    `advance` gets there first. If unfuckarr is paused that long, the worst case is one
+    blocklisted release, recorded as `failed` or `vanished`, with the original still in place.
 
 ## Traps found the hard way
 
@@ -805,6 +860,22 @@ On the live install the downloads sit at `/mnt/user/media/downloads/complete`, i
 existing `/mnt/user/media → /media` bind, so the mapping is `/downloads` → `/media/downloads/complete`
 and no new volume is needed. Without a mapping every blocked download reads as `unrecognised`,
 which is the safe direction but does nothing useful.
+
+**Read off the live *arrs, 2026-11-03 — `replace`, and what was not run:** the release search
+shape was read off Sonarr 4.0.20 (`rejections` as plain strings, `downloadAllowed`,
+`mappedEpisodeNumbers`, `fullSeason`, `quality.quality.resolution`, `protocol`, `seeders`).
+`history?downloadId=` returns the grab and the import, with `eventType` as a name, not a
+number, and `data.importedPath` path-maps to the file unfuckarr sees. That was checked on two
+Sonarr imports and two Radarr imports. Then a dry run of `choose` on the three largest
+distinct shows among 1,549 `very_low_bitrate` files, with a real interactive search and
+nothing grabbed. BattleBots S06E02 (720p HEVC, 0.99 Mbps) would take a 1.96 GB 1080p x265
+torrent: 6.27 H.264-equivalent Mbps against 1.98. Storyville S2024E11 (1080p HEVC, 0.98 Mbps)
+had nothing clearly better among 17 releases. Voyager's two-part Endgame had nothing among 122,
+none of which covered both episodes. One search took 103 s, which is why `releases` waits
+180. **Not run against anything real:** the grab, `find_grab`, `manual_import`, the ManualImport
+command, removing our own grab, and `keep_copy` on Unraid's shfs. The bin and the library
+report the same device, so it should be a hard link, but if `link` fails `keep_copy` makes a
+full copy instead. Those paths are tested only against a fake *arr.
 
 **Verified in CI** — the test suite, green, run against real ffmpeg output on every push:
 

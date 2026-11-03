@@ -155,6 +155,7 @@ hand:
 | Genuinely corrupt | Delete, blocklist the release, trigger a new search |
 | Intact but Emby would transcode | Transcode, copying every stream that already passes |
 | Hygiene | Flag only |
+| Heavily re-encoded, with `low_bitrate_action: replace` | Find a clearly better release and grab it. The old file stays until the new one has arrived and been checked. |
 | Not yet measured for a saving | Measure it, and re-encode only if the result is smaller *and* still scores at the quality target |
 | A disc image nothing can open | Report it, and do nothing |
 | A disc image, with MakeMKV configured | Copy the feature out to `.mkv`, bonus features to `extras/`, recycle the image |
@@ -170,6 +171,20 @@ within 2% of the source) before it's allowed to replace anything.
 **Blocked imports are opened, not pattern-matched.** The queue watcher won't remove a download
 because of what the status message said. It opens what arrived and decides on that.
 See [the download queue](#the-download-queue--imports-that-will-never-happen).
+
+**A heavily re-encoded file is replaced, never deleted.** A file at a fraction of a sane bitrate
+plays perfectly well, so deleting it and hoping is the wrong way round. Asking the *arr to search
+again doesn't work either on most libraries: the file already meets the cutoff, so every release
+is refused and nothing is grabbed. With **Heavily re-encoded files** set to *replace*, unfuckarr
+runs the search itself and overrules only the "you already have this" refusals. It picks the
+smallest release that is clearly better: twice the detail once the codec is allowed for (1.5 Mbps
+of x264 is no improvement on 0.7 Mbps of HEVC), no lower a resolution, and the same episodes.
+Then it grabs it. Before the grab it keeps a hard-linked copy of the old file in its recycle
+bin, because the *arr may import the new one by itself and remove the old file with no bin of its
+own. With the recycle bin off, nothing is grabbed. When the download arrives it is opened and
+checked like any other file. Only a better one is imported; anything else is blocklisted and the
+old file stays. These grabs share the research limits: five a scan by default, and each file waits
+30 days before it is tried again.
 
 **Shrinking is measured, not guessed.** This is the only thing unfuckarr does to a file that
 nothing's wrong with, so it isn't allowed to guess, either about which files to touch or about

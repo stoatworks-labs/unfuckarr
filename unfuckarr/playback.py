@@ -410,11 +410,18 @@ def _not_for_this(decision: Decision, result: CheckResult) -> Decision:
     play is the wrong trade. And a remux whose only reason is the decode of
     the stopping place cannot be confirmed — `_confirm_fixed` re-checks the
     replacement with the ordinary samples, which never look there, so it would
-    record a fix it had not seen (invariant 9). Both become a flag.
+    record a fix it had not seen (invariant 9). Both become a flag. So does a
+    replacement: a low bitrate makes a picture soft, not a play fail, and the
+    grab belongs to the scan, which caps and paces it for the indexers.
     """
     if decision.action == "shrink":
         return Decision("flag", "nothing in the file explains the failed play "
                                 "(it is only waiting to be measured for a saving)",
+                        decision.findings)
+    if decision.action == "replace":
+        return Decision("flag", "nothing in the file explains the failed play "
+                                "(it is heavily re-encoded, which the nightly "
+                                "scan replaces at its own pace)",
                         decision.findings)
     if decision.action in ("transcode", "repair"):
         codes = {f.code for f in result.errors if f.category == "integrity"}

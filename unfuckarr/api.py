@@ -149,7 +149,7 @@ def totals_summary() -> dict[str, int]:
     stored = db.totals()
     return {name: int(stored.get(name, 0)) for name in (
         "bytes_saved", "files_fixed", "files_shrunk", "discs_converted",
-        "files_deleted", "redownloads",
+        "files_deleted", "redownloads", "files_replaced",
     )}
 
 
@@ -271,7 +271,7 @@ def recheck(path: str, act: bool = False) -> dict[str, Any]:
 @api.post("/files/action")
 def force_action(path: str, action: str) -> dict[str, Any]:
     if action not in ("transcode", "repair", "shrink", "convert",
-                      "redownload", "research", "flag"):
+                      "redownload", "research", "replace", "flag"):
         raise HTTPException(400, f"unknown action {action}")
     try:
         return service.force_action(path, action)
@@ -388,6 +388,28 @@ def list_intake(verdict: str | None = None, live: bool = True,
                     d[field_name] = json.loads(d[field_name])
                 except (TypeError, json.JSONDecodeError):
                     d[field_name] = None
+        out.append(d)
+    return out
+
+
+@api.get("/replacements")
+def replacements(limit: int = 200, open_only: bool = False) -> list[dict[str, Any]]:
+    """Releases unfuckarr grabbed to replace heavily re-encoded files.
+
+    Newest first. ``open_only`` keeps the ones still downloading or importing.
+    """
+    sql = "SELECT * FROM replacements"
+    if open_only:
+        sql += " WHERE state IN ('grabbed','importing')"
+    sql += " ORDER BY grabbed DESC LIMIT ?"
+    out = []
+    for r in db.q(sql, (limit,)):
+        d = {k: r[k] for k in r.keys()}
+        if d.get("arr_episode_ids"):
+            try:
+                d["arr_episode_ids"] = json.loads(d["arr_episode_ids"])
+            except (TypeError, json.JSONDecodeError):
+                d["arr_episode_ids"] = None
         out.append(d)
     return out
 

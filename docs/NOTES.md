@@ -2025,3 +2025,31 @@ behind, and the sweep moved on to Underworld.
 
 So the hang is not certain on a given disc: Monty Python hung once and not again, and Star Trek
 hung twice. A hang now costs 30 minutes.
+
+## 2026-11-03: heavily re-encoded files get a better copy, and keep the old one until it lands
+
+Allan wanted the "heavily re-encoded" files to go looking for a better copy without losing
+the one they have. `research` was never going to manage it here. Every Sonarr profile but one
+has its cutoff at the floor, so the file on disk already meets it, and an interactive search
+for Have I Got News for You S49E07 showed every release refused with "Existing file on disk
+is of equal or higher preference". The one release that would have cleared the finding was
+720p x264 at 1.5 Mbps, against the file's 0.71 Mbps of HEVC, so it was the same picture in a
+worse codec.
+
+So `policy.low_bitrate_action: replace` (default `unfixable`, i.e. unchanged) runs the search
+itself, chooses on codec-equivalent bitrate, and grabs with `POST /release`. The *arr may
+import our grab by itself, removing the old file, and neither *arr has a recycle bin
+(`recycleBin` empty on both). So a hard link of the original goes into unfuckarr's bin first,
+and stays there if what was imported turns out worse. The `replacements` table follows each
+grab on the intake worker's 10-minute tick. Invariant 29 has the rules.
+
+Cleanuparr runs beside it: queue cleaner every 30 minutes, 3 failed-import strikes, and
+qBittorrent its only download client, so it never touches a usenet grab. A torrent grab held
+as `importBlocked` would be struck out after an hour or so, and `advance` decides long before
+that. I read its config off lilnasx read-only.
+
+The dry run looked at the three largest distinct shows of 1,549 `very_low_bitrate` files, with
+real searches and no grab. One would grab: BattleBots S06E02, a 1.96 GB 1080p x265 torrent,
+6.27 H.264-equivalent Mbps against 1.98. Two would not: Storyville "Flee" and Voyager's
+two-part Endgame. On branch `claude/low-bitrate-replace`; not merged, not deployed, and no
+grab has ever been made by it.

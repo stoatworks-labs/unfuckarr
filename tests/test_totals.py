@@ -47,6 +47,7 @@ def test_every_key_is_present_from_the_first_load():
     assert totals_summary() == {
         "bytes_saved": 0, "files_fixed": 0, "files_shrunk": 0,
         "discs_converted": 0, "files_deleted": 0, "redownloads": 0,
+        "files_replaced": 0,
     }
 
 

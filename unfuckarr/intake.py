@@ -777,6 +777,17 @@ class IntakeWatcher:
         minutes would be a subprocess per blocked download per pass, for ever,
         to reach the answer already on the row.
         """
+        # Ours first, before any stored verdict: a replacement unfuckarr
+        # grabbed is blocked on purpose ("Not an upgrade"), and what happens
+        # to it is the replacement pass's call — it has opened the files and
+        # measured them against the file they are meant to replace, which
+        # nothing here knows about. One owner per download (invariant 24).
+        from . import replace  # replace reads the queue through this module
+        if replace.owns(item.source, item.download_id):
+            return Verdict("manual", "unfuckarr grabbed this to replace a "
+                                     "heavily re-encoded file; the replacement "
+                                     "pass checks it and decides",
+                           {"replacement": True})
         if row is not None and row["verdict"] and row["state"] == item.state:
             try:
                 evidence = json.loads(row["evidence"] or "{}")

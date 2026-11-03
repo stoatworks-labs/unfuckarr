@@ -351,6 +351,25 @@ class Policy(BaseModel):
     # Default stays `flag`: a re-search spends someone's bandwidth and indexer
     # goodwill, and turning that on is a choice the operator makes.
     unfixable_action: Literal["none", "flag", "research"] = "flag"
+    # A heavily re-encoded file (`very_low_bitrate`) is the one unfixable
+    # finding a better copy can be *recognised* for before it is downloaded:
+    # the release's size over the runtime is its bitrate. So `replace` does the
+    # search itself, grabs a release that is clearly better, checks the
+    # download when it lands, and only then has the *arr import it over the
+    # old file — and the old file is kept in the recycle bin until the new one
+    # has passed. `unfixable` leaves these files to `unfixable_action` like
+    # every other finding no rewrite can fix.
+    #
+    # Its own setting rather than a fourth value of `unfixable_action`,
+    # because that one also covers image-only subtitles, and a re-search for
+    # those has no size to judge a release by: switching both on together
+    # would spend the same capped slots on a blind grab.
+    #
+    # The literal type is the enforcement again: there is no value here that
+    # deletes, and the path behind `replace` never does (invariant 29).
+    # Default stays the old behaviour for the reason `unfixable_action`'s
+    # does — it spends someone's bandwidth.
+    low_bitrate_action: Literal["unfixable", "replace"] = "unfixable"
     # Re-searches get their own cap, for a different reason than shrinks and
     # conversions. Those are capped for server load; this one is capped for
     # indexer etiquette. Each re-search is a query fanned out to every indexer

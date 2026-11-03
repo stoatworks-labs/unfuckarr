@@ -252,6 +252,79 @@ def store(path: str, reason: str, configured_bin: str, days: int,
     return str(dest)
 
 
+def keep_copy(path: str, reason: str, configured_bin: str, days: int,
+              max_bytes: int = 0) -> int | None:
+    """Put a copy of ``path`` in the bin and leave the file where it is.
+
+    Returns the recycle row's id, or None when no copy could be kept — the bin
+    is switched off, or the copy failed — in which case the caller must not
+    go ahead with whatever made it want one.
+
+    A hard link where it can be one, which costs no space and no time: the bin
+    holds a second name for the same bytes, and those bytes outlive the
+    library's name for them. That is the whole point. A replacement the *arr
+    imports by itself removes the old file at once, and neither *arr here has
+    a recycle bin of its own (both `recycleBin` empty, 2026-11-03), so without
+    this the only copy of the file being replaced would be gone before
+    anything had looked at what replaced it. A full copy otherwise, which for
+    a heavily re-encoded episode is a few hundred megabytes.
+
+    Recorded like any other recycled file, so it shows in the bin, can be
+    restored from it, and goes when retention sweeps it.
+    """
+    src = Path(path)
+    if days <= 0 or not src.is_file():
+        return None
+    size = src.stat().st_size
+    enforce_limit(max_bytes, configured_bin, incoming=size)
+    root = bin_path(configured_bin) / time.strftime("%Y-%m-%d")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        db.log("recycle_failed", "error", path, str(exc))
+        return None
+    stem = "_".join(p for p in src.parts[-3:-1] if p not in ("/", ""))
+    dest = root / (f"{stem}__{src.name}" if stem else src.name)
+    n = 1
+    while dest.exists():
+        dest = dest.with_name(f"{dest.stem}.{n}{dest.suffix}")
+        n += 1
+    try:
+        os.link(src, dest)
+        how = "hard link"
+    except OSError:
+        try:
+            shutil.copy2(src, dest)
+            how = "copy"
+        except OSError as exc:
+            dest.unlink(missing_ok=True)
+            log.error("could not keep a copy of %s: %s", path, exc)
+            db.log("recycle_failed", "error", path, str(exc))
+            return None
+    row_id = db.ex("INSERT INTO recycle (original, stored, size, deleted, reason) "
+                   "VALUES (?,?,?,?,?)", (path, str(dest), size, time.time(), reason))
+    db.log("file_copy_kept", "info", path,
+           {"reason": reason, "stored": str(dest), "how": how})
+    return row_id
+
+
+def discard(recycle_id: int, why: str) -> bool:
+    """Remove one entry from the bin for good. Returns whether it went."""
+    row = db.q1("SELECT * FROM recycle WHERE id = ?", (recycle_id,))
+    if row is None:
+        return False
+    stored = row["stored"]
+    if stored:
+        try:
+            Path(stored).unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not discard %s: %s", stored, exc)
+            return False
+    db.ex("DELETE FROM recycle WHERE id = ?", (recycle_id,))
+    db.log("recycle_discarded", "info", row["original"], {"why": why})
+    return True
+
+
 def restore(recycle_id: int) -> str:
     row = db.q1("SELECT * FROM recycle WHERE id = ?", (recycle_id,))
     if row is None:

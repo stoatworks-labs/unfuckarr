@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import config, db, intake, playback, quality, recycle, transcode
+from . import config, db, intake, playback, quality, recycle, replace, transcode
 from .clients.arr import ArrClient, ArrError
 from .clients.emby import EmbyClient, EmbyError
 from .config import Settings, WatchFolder
@@ -355,6 +355,17 @@ class Service:
                     log.exception("intake pass failed")
                     db.log("intake_worker_error", "error", detail=str(exc))
                     wait = max(wait, 300)
+            # Replacements unfuckarr grabbed itself ride on the same tick
+            # whether or not the intake watch is on: they are ours, they are
+            # in the queue, and the step after a finished download — check it,
+            # import it or throw it back — must not wait for the nightly scan.
+            if not state.paused:
+                try:
+                    replace.advance(s, lambda source: self.remediator._arr_for(
+                        {"source": source}))
+                except Exception as exc:  # noqa: BLE001 - the worker must not die
+                    log.exception("replacement pass failed")
+                    db.log("replacement_worker_error", "error", detail=str(exc))
             self._sched_stop.wait(wait)
 
     def run_intake_pass(self, force: bool = False) -> dict[str, Any]:
