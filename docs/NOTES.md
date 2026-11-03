@@ -2167,3 +2167,16 @@ the right episode id. Had the download been held, `_held_by_arr` would have judg
 file and thrown the good download back. Now the candidates are asked for by `downloadId` alone,
 and only files under the queue item's own output path are considered. A held download with no
 output path waits out the expiry.
+
+### 2026-11-03 19:39: deployed `93f4d08`, and the first broadcast capture re-encoded
+
+Built as `unfuckarr-makemkv:new-93f4d08` (`643ff076`): `/app` matched the clone (29 `.py`), and
+MakeMKV 1.18.4 answered. Rollback tag `unfuckarr-makemkv:rollback-2026-11-03-eefefb5`; no
+database changes this time. Healthy 15 s after `recreate-unfk.sh`.
+
+The Sky at Night S2019E11 was asked about again with `act`, and went straight to the re-encode.
+It took 87 s: `hevc_vaapi` qp 20, AC-3 224k stereo, the DVB subtitle kept and the teletext
+dropped. 1,748.76 s long, the same as the `.ts`. 727 MB in, 790 MB out. The `.ts` is in
+`/media/.recycle/2026-11-03/`. The row is at `fix_attempts` 3 with `shrink_skipped` set, and
+`transcode_awaits_emby` is logged, because Emby's stuck scan has not seen the new file yet. It
+now shows only `image_subtitles_only`.
