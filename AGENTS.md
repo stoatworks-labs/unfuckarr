@@ -97,7 +97,8 @@ Break any of these and the failure is quiet and expensive.
    decides what happens to it.
 7. **Emby's verdict wins over the local codec table.** When `check_direct_play` returns `True`
    (Emby answered), `compat.check` is skipped entirely so the two cannot contradict each other
-   in the UI.
+   in the UI. `colour.check` runs regardless: Emby says yes to a Dolby Vision file with no
+   fallback, and that yes is how the purple picture reaches the screen (invariant 31).
 8. **Only `/config` is chowned at start.** Recursively chowning a 40 TB media mount on every
    container start is how someone loses an evening.
 9. **A transcode must be confirmed to have fixed the finding.** `_confirm_fixed` re-checks the
@@ -505,6 +506,27 @@ Break any of these and the failure is quiet and expensive.
     and a torrent held with a warning could be removed after 60–90 minutes. The 10-minute
     `advance` gets there first. If unfuckarr is paused that long, the worst case is one
     blocklisted release, recorded as `failed` or `vanished`, with the original still in place.
+
+31. **Dolby Vision with no HDR10 or SDR base layer is never re-encoded, by any path.** A profile 5
+    stream (most streaming WEB-DLs) codes its base layer in IPTPQc2, not Y'CbCr, and is right only
+    after the RPU's reshaping. No ffmpeg here applies it, so an encode reads the IPT planes as
+    Y'CbCr and writes a purple-and-green, flat picture into an ordinary file with the Dolby Vision
+    metadata gone — wrong for every client, Dolby Vision ones included, and nothing in the
+    output's tags says so afterwards. That is how The Pitt S02E08 (2026-09-15) and Rings of Power
+    S03E02 (2026-11-11) were destroyed: `is_hdr` matched "dolby vision" and ffprobe calls the
+    stream record "DOVI configuration record", so a stream with no colour tags read as SDR and
+    the shrink took it. 65 more were queued when it was found (2026-11-15).
+
+    So the refusal is in four places, not one: `decide` sends `dolby_vision_no_fallback` to
+    `unfixable_action` before the compat branch (so Emby's silent "no" cannot become invariant
+    29's re-encode, and a fixable DTS track beside it does not open the transcoder either);
+    `efficiency.check` gives it the terminal `dolby_vision_not_shrunk` ahead of the HDR gate, so
+    `allow_hdr` cannot open it; `_shrink` skips it permanently; and `_transcode` refuses any plan
+    with `video_action == "encode"`, uncounted. `replace.judge` turns away a replacement that is
+    one, whatever `dolby_vision_clients` says, because the file it replaces plays everywhere.
+    `MediaInfo.dovi_without_fallback` is the one test all of them ask — it also covers the RPU in
+    the frames with no container record (`dovi_in_stream`, read only for untagged 10-bit HEVC),
+    which no tag can show. `dolby_vision_clients` changes the finding's severity and nothing else.
 
 ## Traps found the hard way
 
@@ -1228,6 +1250,7 @@ unfuckarr/
     integrity.py     Is it intact? + looks_repairable()
     compat.py        Local Emby direct-play model + the three presets
     hygiene.py       Stream metadata
+    colour.py        Dolby Vision with no fallback (profile 5) — never re-encoded
     efficiency.py    Is it far bigger than it needs to be? + the bitrate arithmetic
   clients/
     arr.py           Sonarr + Radarr v3

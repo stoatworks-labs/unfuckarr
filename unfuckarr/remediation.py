@@ -23,6 +23,7 @@ from typing import Any, Iterator
 
 from . import db, disc, governor, makemkv, quality, recycle, replace, transcode
 from .checks import CheckResult
+from .checks import colour as colour_checks
 from .checks.compat import resolve as resolve_profile
 from .checks.integrity import looks_repairable
 from .clients.arr import ArrClient, ArrError
@@ -141,6 +142,27 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
                             codes or [f.code for f in result.findings])
         if policy.disc_action == "convert":
             log.debug("not converting %s: %s", result.path, blocked)
+
+    if any(f.code == colour_checks.CODE for f in compat):
+        # Before the rest of compat, and never the transcoder, whatever else
+        # the file has wrong with it. Every road through `_transcode` that
+        # could clear Emby's "no" re-encodes the picture, and re-encoding a
+        # profile 5 stream writes the purple and green into a normal file —
+        # The Pitt S02E08 and Rings of Power S03E02, through the shrink. A
+        # DTS default track beside it is beside the point while the picture
+        # is the wrong colour. Invariant 31.
+        codes = [f.code for f in compat]
+        if policy.unfixable_action == "research":
+            return Decision("research",
+                            "Dolby Vision with no HDR10 or SDR base layer — "
+                            "no rewrite can fix the colour, so ask for a "
+                            "release that has one",
+                            codes)
+        return Decision(policy.unfixable_action,
+                        "Dolby Vision with no HDR10 or SDR base layer — no "
+                        "rewrite can fix the colour, and a re-encode would "
+                        "make it permanent",
+                        codes)
 
     if compat:
         action = policy.incompatible_action
@@ -607,6 +629,20 @@ class Remediator:
             # not re-read is set aside as `emby_stale` before it gets here).
             plan = transcode.plan(info, result, s.transcode, s.emby_compat,
                                   reencode=True)
+        if plan.video_action == "encode" and info.dovi_without_fallback:
+            # `decide` never sends one of these here; this is the guard for
+            # every other way in (an Emby refusal escalated on a second
+            # attempt, a decision made before the check existed). The encode
+            # would read the IPT planes as Y'CbCr and write the purple and
+            # green into the file for good. Not counted as an attempt:
+            # nothing ran. Invariant 31.
+            msg = ("refused: this is Dolby Vision with no HDR10 or SDR base "
+                   "layer, and re-encoding it would bake the wrong colours "
+                   "into the picture")
+            self._set_job(job_id, "done", 1.0, msg)
+            db.log("transcode_refused", "warn", path,
+                   {"reason": msg, "plan": plan.describe})
+            return {"action": "flag", "ok": True, "message": msg}
         if not repair and transcode.changes_nothing(plan, info):
             # `decide` thought there was work here and the planner found none.
             # Nothing ran, so nothing is counted — but it is logged as a
@@ -1034,6 +1070,14 @@ class Remediator:
                 self._set_job(job_id, "failed", 0, msg)
                 return {"action": "flag", "ok": False, "message": msg}
 
+        if info.dovi_without_fallback:
+            # Ahead of the HDR gate, because `allow_hdr` must not open this
+            # one: no encode here can apply the Dolby Vision reshaping, so the
+            # output would be purple and green for every client. Invariant 31.
+            return self._skip_shrink(job_id, path,
+                                     "Dolby Vision with no HDR10 or SDR base "
+                                     "layer — a re-encode would bake the "
+                                     "wrong colours in")
         if info.is_hdr and not s.efficiency.allow_hdr:
             return self._skip_shrink(job_id, path,
                                      "HDR, and allow_hdr is off")

@@ -94,6 +94,10 @@ class MediaInfo:
     bitrate: int = 0
     streams: list[Stream] = field(default_factory=list)
     faststart: bool | None = None  # None when the question does not apply
+    # Dolby Vision RPU found in the first frame of a stream whose container
+    # has no Dolby Vision record. None when nobody looked — it is only asked
+    # of a stream that could be one (`_could_hide_dovi`).
+    dovi_in_stream: bool | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -131,9 +135,65 @@ class MediaInfo:
             return True
         if primaries == "bt2020" and transfer.startswith("bt2020"):
             return True
+        if self.dovi_in_stream:
+            return True
+        # "DOVI configuration record" is what ffprobe calls the stream-level
+        # Dolby Vision record. It matters more than the other names here: a
+        # profile 5 stream carries no transfer, primaries or matrix at all, so
+        # this record is the *only* sign that it is HDR. Matching "dolby
+        # vision" alone missed every one of them and let the shrink re-encode
+        # them as SDR, which bakes the purple-and-green cast into the picture.
         return any((sd.get("side_data_type") or "").lower().startswith(
-            ("mastering display", "content light level", "dolby vision"))
+            ("mastering display", "content light level", "dolby vision", "dovi"))
             for sd in v.raw.get("side_data_list") or [])
+
+    @property
+    def dovi(self) -> dict[str, Any] | None:
+        """The video stream's Dolby Vision configuration record, or None."""
+        v = self.video
+        if v is None:
+            return None
+        for sd in v.raw.get("side_data_list") or []:
+            kind = (sd.get("side_data_type") or "").lower()
+            if kind.startswith(("dovi configuration", "dolby vision configuration")):
+                return sd
+        return None
+
+    @property
+    def dovi_without_fallback(self) -> bool:
+        """Dolby Vision whose base layer is neither HDR10, SDR nor HLG.
+
+        Profile 5 is the common case: the base layer is coded in Dolby's own
+        IPTPQc2 colour space rather than Y'CbCr, and it is only correct after
+        the RPU's reshaping is applied. A player — or an ffmpeg — that does
+        not do that reads the IPT planes as if they were Y'CbCr and shows the
+        picture purple and green. Streaming WEB-DLs are usually profile 5;
+        profile 8.1 (HDR10 underneath) and 7 (Blu-ray, HDR10 underneath)
+        degrade to plain HDR10 instead.
+
+        ``dv_bl_signal_compatibility_id`` 0 means "no compatible base layer";
+        1, 2, 4 and 6 name HDR10, SDR, HLG and Blu-ray HDR10. It is trusted
+        over the profile when both are present but only when the base layer
+        itself has no colour description, because a profile-8 stream that
+        mislabels its compatibility but carries proper PQ tags still plays
+        as HDR10 everywhere.
+
+        A stream with the RPU in its frames and no record at all
+        (`dovi_in_stream`) counts too: nothing tells a player it is Dolby
+        Vision, so even a Dolby Vision client shows the base layer raw.
+        """
+        v = self.video
+        transfer = ((v.raw.get("color_transfer") if v else None) or "").lower()
+        untagged = transfer in ("", "unknown")
+        d = self.dovi
+        if not d:
+            return bool(self.dovi_in_stream) and untagged
+        if _to_int(d.get("dv_profile")) == 5:
+            return True
+        compat = d.get("dv_bl_signal_compatibility_id")
+        if compat is None or _to_int(compat) != 0:
+            return False
+        return untagged
 
     @property
     def source(self) -> str:
@@ -158,6 +218,9 @@ class MediaInfo:
                 "pix_fmt": v.pix_fmt, "bit_depth": v.bit_depth,
                 "fps": round(v.fps, 3),
                 "hdr": self.is_hdr,
+                "dovi_profile": _to_int(self.dovi.get("dv_profile")) if self.dovi else None,
+                "colour": {k: v.raw.get(k) for k in (
+                    "color_space", "color_transfer", "color_primaries", "color_range")},
             } if v else None,
             "audio": [
                 {"codec": a.codec_name, "channels": a.channels,
@@ -303,6 +366,8 @@ def probe(path: str | Path, ffprobe: str = "ffprobe", timeout: int = 120,
     )
     if not disc_kind and info.container in ("mp4", "m4v", "mov"):
         info.faststart = check_faststart(path)
+    if _could_hide_dovi(info):
+        info.dovi_in_stream = dovi_rpu_in_first_frame(url, ffprobe=ffprobe)
 
     if disc_kind and found_disc is not None and found_disc.runs:
         # A raw MPEG-TS read through `subfile` reports a duration that is
@@ -337,6 +402,48 @@ def _container_from(path: str, format_name: str) -> str:
     if "mpegts" in parts:
         return "ts"
     return parts[0] if parts else ext
+
+
+def _could_hide_dovi(info: MediaInfo) -> bool:
+    """Whether this stream could be Dolby Vision with its record missing.
+
+    HEVC, more than 8 bits, no Dolby Vision record and no transfer function —
+    which is exactly what a profile 5 stream looks like once a remux has
+    dropped the record. On the live library that was 485 files of 18,976
+    (old 10-bit x265 SDR encodes, mostly — one was Dolby Vision), so the
+    frame read costs nothing across a scan. A disc image is never one: UHD
+    Blu-ray uses profile 7, which carries HDR10 tags.
+    """
+    v = info.video
+    if v is None or info.is_disc or info.dovi is not None:
+        return False
+    if v.codec_name != "hevc" or v.bit_depth <= 8:
+        return False
+    transfer = (v.raw.get("color_transfer") or "").lower()
+    return transfer in ("", "unknown")
+
+
+def dovi_rpu_in_first_frame(source: str, ffprobe: str = "ffprobe",
+                            timeout: int = 60) -> bool | None:
+    """True when the first video frame carries Dolby Vision RPU data.
+
+    ffmpeg's HEVC decoder parses the RPU NAL units and attaches them to the
+    frame whatever the container says, so this sees what a container-level
+    probe cannot. Measured at 0.1–0.4 s on a 2160p file. None when the frame
+    could not be read — "could not look" is not "is not Dolby Vision".
+    """
+    cmd = [ffprobe, "-v", "error", "-print_format", "json",
+           "-select_streams", "v:0", "-read_intervals", "%+#1",
+           "-show_frames", "-show_entries", "frame=side_data_list", source]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        frames = json.loads(proc.stdout or "{}").get("frames") or []
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+    if not frames:
+        return None
+    return any((sd.get("side_data_type") or "").lower().startswith("dolby vision")
+               for sd in frames[0].get("side_data_list") or [])
 
 
 def check_faststart(path: str, ffprobe: str = "ffprobe") -> bool | None:

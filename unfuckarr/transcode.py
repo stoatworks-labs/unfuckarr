@@ -773,6 +773,13 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
 
     if p.faststart and p.container == "mp4":
         cmd += ["-movflags", "+faststart"]
+    if p.container == "mp4" and p.video_action == "copy" and info.dovi is not None:
+        # ffmpeg 8.0.1's MP4 muxer drops the Dolby Vision record on a stream
+        # copy unless told it may write it — measured on Slow Horses S01E01:
+        # the .mkv kept it, the .mp4 lost it, the .mp4 with this kept it. A
+        # profile 8.1 file without its record falls back to HDR10; a profile
+        # 5 one is purple on every client, Dolby Vision ones included.
+        cmd += ["-strict", "unofficial"]
 
     cmd += ["-max_muxing_queue_size", "4096", dst]
     return cmd

@@ -33,7 +33,7 @@ It runs as a Docker container with a web UI, and it's packaged for Unraid Commun
 
 ## What it checks
 
-Five independent classes of problem, each with its own remediation policy.
+Six independent classes of problem, each with its own remediation policy.
 
 **Integrity: is the file actually intact?**
 ffprobe refuses it, the container has no duration, there's no video or audio stream, the file is
@@ -56,6 +56,18 @@ play. For those, unfuckarr makes the playable track the default if it's the same
 many channels, and otherwise adds an AC3 5.1 copy of the default in front of it, leaving the
 original where it was for anything that can pass it through. A file with no playable audio at all
 gets the same treatment rather than losing its DTS.
+
+**Colour: will it look right?**
+A Dolby Vision profile 5 file, which is what most streaming WEB-DLs are, has no HDR10 or SDR
+picture underneath the Dolby Vision. Its base layer is coded in Dolby's own colour space, so any
+client that doesn't decode Dolby Vision itself shows it purple and green and flat. Emby says
+it'll direct play it, because the client asked for HEVC and got it. unfuckarr flags these
+whatever Emby says, including the ones whose container has lost its Dolby Vision record, which
+it finds by reading the first frame. It never re-encodes one: no encoder here can apply the Dolby
+Vision colour, so the purple would be baked into an ordinary file for good. The fix is a release
+with an HDR10 base layer (Dolby Vision profile 8, or plain HDR10). In Sonarr and Radarr that
+means the TRaSH Guides "DV (WEBDL)" custom format at a large negative score. If every client you
+own decodes Dolby Vision, set `emby_compat.dolby_vision_clients` and these become a note instead.
 
 **Stream hygiene: will it behave?**
 Missing audio language tags, no default track among several, image-only subtitles (which force a
@@ -155,6 +167,7 @@ hand:
 | Genuinely corrupt | Delete, blocklist the release, trigger a new search |
 | Intact but Emby would transcode | Transcode, copying every stream that already passes. Emby gives no reason, so unfuckarr asks it again with each part of the profile relaxed to find one; when nothing smaller will do, or the smaller fix did not take, it re-encodes the file to the target profile, once |
 | Hygiene | Flag only |
+| Dolby Vision with no HDR10/SDR base layer | Flag (or `research`). Never re-encoded or shrunk, by any path |
 | Heavily re-encoded, with `low_bitrate_action: replace` | Find a clearly better release and grab it. The old file stays until the new one has arrived and been checked. |
 | Not yet measured for a saving | Measure it, and re-encode only if the result is smaller *and* still scores at the quality target |
 | A disc image nothing can open | Report it, and do nothing |

@@ -133,6 +133,20 @@ def check(info: MediaInfo, cfg: EfficiencyConfig, result: CheckResult,
         "size": info.size, "duration": round(info.duration),
     }
 
+    if info.dovi_without_fallback:
+        # Terminal, and ahead of the HDR gate so that `allow_hdr` cannot open
+        # it: no encode here can apply the Dolby Vision reshaping, so a shrink
+        # would bake the purple and green into the picture (invariant 31).
+        result.add(Finding(
+            "efficiency", "dolby_vision_not_shrunk", "info",
+            f"{mbps:.1f} Mbps at {v.height}p, but this is Dolby Vision with no "
+            "HDR10 or SDR base layer — a re-encode cannot apply the Dolby "
+            "Vision colour and would make the picture purple and green for "
+            "good, so it is never measured.",
+            {**data, "hdr": True},
+        ))
+        return
+
     if info.is_hdr and not cfg.allow_hdr:
         # Worth saying out loud rather than staying silent: "why is this 60 GB
         # file never measured" is otherwise unanswerable from the UI.

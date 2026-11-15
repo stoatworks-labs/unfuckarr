@@ -1129,6 +1129,7 @@ const FIELD_HELP = {
   'integrity.depth': 'quick = ffprobe only (seconds per file). sample = decode the start, middle and end. full = decode every frame; correct but very slow.',
   'integrity.duration_tolerance_pct': 'A file more than this much shorter than the runtime Sonarr/Radarr expects is reported — but only reported. That runtime is nominal (for TV it is the broadcast slot, ad breaks included), so a normal episode sits well under it.',
   'integrity.duration_truncated_pct': 'A file this much shorter than its expected runtime is treated as truncated, and the corrupt action applies. Keep it high: a 44 min drama in a 60 min slot is 27% short and perfectly healthy.',
+  'emby_compat.dolby_vision_clients': 'Leave off unless every device that plays this library decodes Dolby Vision itself. A Dolby Vision profile 5 file (most streaming WEB-DLs) has no HDR10 or SDR picture underneath, so anything else \u2014 most Emby apps, every browser \u2014 shows it purple and green. On, those files are noted instead of flagged. Either way they are never re-encoded: no encode here can apply the Dolby Vision colour.',
   'emby_compat.target_profile': 'modern = a current Emby app (HEVC, 10-bit). conservative = Chromecast-class hardware (H.264 8-bit only). permissive = only reject what nothing plays.',
   'policy.corrupt_action': 'What to do with a file that is genuinely broken.',
   'policy.incompatible_action': 'What to do with an intact file Emby would have to transcode.',
@@ -1306,7 +1307,9 @@ async function viewSettings() {
     el('div', { class: 'cols' },
       settingField('emby_compat.max_height', s.emby_compat.max_height)),
     settingField('emby_compat.allow_10bit', s.emby_compat.allow_10bit),
-    settingField('emby_compat.require_faststart_mp4', s.emby_compat.require_faststart_mp4)));
+    settingField('emby_compat.require_faststart_mp4', s.emby_compat.require_faststart_mp4),
+    settingField('emby_compat.dolby_vision_clients', s.emby_compat.dolby_vision_clients,
+      { label: 'Every client plays Dolby Vision' })));
 
   v.append(el('div', { class: 'card' },
     el('h3', {}, 'Stream hygiene'),

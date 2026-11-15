@@ -102,6 +102,13 @@ class EmbyCompatConfig(BaseModel):
     max_height: int = 2160
     # A non-faststart MP4 makes Emby read the whole file before it can seek.
     require_faststart_mp4: bool = True
+    # Every client that plays this library decodes Dolby Vision itself. Off by
+    # default: a Dolby Vision file with no HDR10/SDR base layer (profile 5,
+    # most streaming WEB-DLs) shows purple and green on anything that does
+    # not, which is most Emby clients and every browser. When this is on the
+    # finding drops to information. It never permits re-encoding one — that
+    # is wrong for every client (`checks.colour`).
+    dolby_vision_clients: bool = False
 
 
 class HygieneConfig(BaseModel):

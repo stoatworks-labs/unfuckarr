@@ -468,6 +468,14 @@ def judge(local_path: str, rec: dict[str, Any],
         return False, f"it is damaged: {broken[0].detail}", {}
     if any(f.code == "very_low_bitrate" for f in result.findings):
         return False, "it is heavily re-encoded too", {}
+    if info.dovi_without_fallback:
+        # Asked of the file, not of the findings, so it holds even with
+        # `dolby_vision_clients` on: the file it replaces plays everywhere,
+        # and swapping it for one that is purple on half the clients is not
+        # an upgrade whatever its bitrate. Streaming WEB-DLs are mostly
+        # profile 5, so this is the likeliest way a 2160p replacement fails.
+        return False, ("it is Dolby Vision with no HDR10 or SDR base layer — "
+                       "purple and green on any client without Dolby Vision"), {}
     m = measure(info) or {}
     if rec.get("old_duration") and m.get("duration"):
         ratio = m["duration"] / rec["old_duration"]

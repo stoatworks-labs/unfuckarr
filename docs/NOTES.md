@@ -2218,3 +2218,52 @@ unverified: an *arr importing a grab by itself, which leads to `imported_worse`.
 
 Cleanuparr had struck the download once, at 19:30, over the old "No files found" warning. The
 import came two strikes before it would have removed it.
+
+## 2026-11-15: purple and green — Dolby Vision profile 5, and two files the shrink destroyed
+
+Reported as "Slow Horses S1E1 has an RGB/YUV mismatch" (E2 too), with a screenshot of a magenta
+room and green trousers. It is not a tag mismatch. Both are new **Dolby Vision profile 5**
+WEB-DLs (`dv_profile` 5, `dv_bl_signal_compatibility_id` 0, no transfer/primaries/matrix): the
+base layer is IPTPQc2, so anything that does not decode Dolby Vision shows the IPT planes as
+Y'CbCr. E03–E05 of the same season are HDR10 and fine.
+
+A read-only ffprobe survey of all 18,987 files (inside `unfk`, ~25 min): **no RGB matrix on a
+Y'CbCr stream anywhere**, 3 BT.2020-SDR Acolyte episodes, 140 `pc`-range files — and **67
+profile 5** (Sex Education S3–4, Wednesday, Strange New Worlds, Boba Fett, Spider-Noir,
+Bridgerton S2, HotD, Mandalorian, Obi-Wan, two films…), 581 profile 8.1 and 41 profile 7. One
+more, House of the Dragon S03E07, has the RPU in every frame and **no** container record, so it
+looks like plain untagged HEVC; reading the first frame finds it (0.1–0.4 s). Only 485 files
+(untagged 10-bit HEVC with no record) need that read.
+
+**The shrink had been eating them.** `is_hdr` matched side data starting "dolby vision"; ffprobe
+calls the stream record "DOVI configuration record", and a profile 5 stream has no other HDR
+sign, so it read as SDR. The Pitt S02E08 (shrunk 09-15) and Rings of Power S03E02 (11-11) came
+out of the shrink purple and green for good — confirmed by eye from extracted frames, against
+an unshrunk neighbouring episode. The recycle bin held only the day's 5 entries, so both
+originals are gone: those two need a redownload, not a repair. The Predator (2018), shrunk
+09-24, has the same tags (untagged 10-bit, `pc`) but looks like an intended warm grade; left
+alone. 65 of the 68 were `unmeasured`, i.e. in the shrink queue. With Allan's go-ahead the live
+box had `shrink.enabled` and `shrink.continuous` turned off at 16:20 (the scan's own repair
+phase shrinks too — `max_shrinks_per_scan` is 100,000 — so `continuous` alone did nothing) until
+this is deployed.
+
+The change is `checks/colour.py` and invariant 31: one finding, `dolby_vision_no_fallback`
+(compat, error; info with the new `emby_compat.dolby_vision_clients`), routed to
+`unfixable_action`, and four refusals behind it. Checked inside `unfk` against the real files
+with the worktree's code on `PYTHONPATH`: Slow Horses E01/E02, HotD E04, Mandalorian S03E04
+(an `.mp4`) and the stripped HotD E07 flag, never shrink; HDR10 and SDR files unchanged.
+
+**What fixes the files is not unfuckarr.** No rewrite can, and Sonarr will grab profile 5 again —
+the two Slow Horses copies were *Propers*. Sonarr has no custom formats here, so the fix is
+TRaSH's "DV (WEBDL)" format at a large negative score (it matches WEB-DL DV without HDR10
+fallback), then a re-search. `research` before that format exists just asks for the same thing.
+On Emby's side, server tone mapping of profile 5 needs a transcode and is unreliable per the
+forums; a Dolby Vision client (Apple TV 4K, a DV TV's own app) is the other way to see these
+right.
+
+**A remux keeps the record in Matroska and drops it in MP4.** Measured with `unfk`'s ffmpeg 8.0.1
+on a 10 s cut of Slow Horses S01E01: `-c copy` to `.mkv` kept `DOVI configuration record`
+(profile 5); to `.mp4` it came out plain `hev1` with no record; to `.mp4` with
+`-strict unofficial` it kept it. `build_command` now adds that flag for any Dolby Vision source
+copied into MP4. Live `transcode.container` is `mkv`, so no file was stripped this way — HotD
+S03E07's missing record came from somewhere else (the release, most likely).

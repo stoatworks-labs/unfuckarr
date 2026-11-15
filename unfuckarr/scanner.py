@@ -22,6 +22,7 @@ from typing import Any, Iterable
 
 from . import db, disc, recycle, transcode
 from .checks import CheckResult, Finding
+from .checks import colour as colour_checks
 from .checks import compat as compat_checks
 from .checks import efficiency as efficiency_checks
 from .checks import hygiene as hygiene_checks
@@ -186,6 +187,10 @@ def check_file(path: str, s: Settings, expected_runtime: int | None = None,
     # already agree the file is bad, so they cannot contradict each other.
     if not answered or _verdict_without_reasons(result):
         compat_checks.check(info, s.emby_compat, result)
+    # Outside the condition above on purpose: Emby says yes to a Dolby
+    # Vision file with no fallback, and that yes is how the purple picture
+    # reaches the screen (`checks.colour`).
+    colour_checks.check(info, s.emby_compat, result)
 
     hygiene_checks.check(info, s.hygiene, result)
     efficiency_checks.check(info, s.efficiency, result,
