@@ -143,6 +143,31 @@ def decide(result: CheckResult, settings: Settings) -> Decision:
         if policy.disc_action == "convert":
             log.debug("not converting %s: %s", result.path, blocked)
 
+    if any(f.code == colour_checks.BAKED for f in compat):
+        # The same place and the same reason as profile 5 below: the picture
+        # is the fault, and every road through `_transcode` re-encodes the
+        # picture. Here the damage is already done, so a re-encode would only
+        # spend a generation on it; what fixes the file is a different
+        # release. Invariant 32.
+        codes = [f.code for f in compat]
+        if policy.baked_colour_action == "replace":
+            return Decision("replace",
+                            "the colour was baked in by a re-encode of Dolby "
+                            "Vision profile 5: finding a release with an HDR10 "
+                            "or SDR base layer, and keeping this one until it "
+                            "has arrived and been checked",
+                            codes)
+        if policy.unfixable_action == "research":
+            return Decision("research",
+                            "the colour was baked in by a re-encode of Dolby "
+                            "Vision profile 5 — no rewrite can undo it, so ask "
+                            "for a release with an HDR10 or SDR base layer",
+                            codes)
+        return Decision(policy.unfixable_action,
+                        "the colour was baked in by a re-encode of Dolby Vision "
+                        "profile 5 — no rewrite can undo it",
+                        codes)
+
     if any(f.code == colour_checks.CODE for f in compat):
         # Before the rest of compat, and never the transcoder, whatever else
         # the file has wrong with it. Every road through `_transcode` that
@@ -557,7 +582,7 @@ class Remediator:
             if decision.action == "research":
                 return self._research(job_id, file_row, decision.reason)
             if decision.action == "replace":
-                return self._replace(job_id, file_row, info)
+                return self._replace(job_id, file_row, info, result)
             self._set_job(job_id, "failed", 0, f"unknown action {decision.action}")
             return {"action": decision.action, "ok": False,
                     "message": "unknown action"}
@@ -905,7 +930,8 @@ class Remediator:
         s = self._settings()
         try:
             result, info = check_file(
-                final, s, expected_runtime=file_row.get("expected_runtime"))
+                final, s, expected_runtime=file_row.get("expected_runtime"),
+                release=file_row.get("release"))
             stat = os.stat(final)
             persist_result(final, result, info, stat.st_size, stat.st_mtime)
         except Exception as exc:  # noqa: BLE001 - never fail the job over this
@@ -1421,7 +1447,7 @@ class Remediator:
         try:
             result, info = check_file(
                 final, s, expected_runtime=file_row.get("expected_runtime"),
-                already_shrunk=already_shrunk)
+                already_shrunk=already_shrunk, release=file_row.get("release"))
             stat = os.stat(final)
             persist_result(final, result, info, stat.st_size, stat.st_mtime)
         except Exception as exc:  # noqa: BLE001 - never fail the job over this
@@ -2011,20 +2037,29 @@ class Remediator:
         return replace.blocked(file_row, self._settings())
 
     def _replace(self, job_id: int, file_row: dict[str, Any],
-                 info: MediaInfo | None) -> dict[str, Any]:
+                 info: MediaInfo | None,
+                 result: CheckResult | None = None) -> dict[str, Any]:
         """Grab a better release for a heavily re-encoded file. Keep the file.
 
         The grab is all that happens here. What follows — checking the
         download, having the *arr import it, or throwing it back — happens on
         the queue worker's pass (`replace.advance`), because a download takes
         minutes to days and the scan cannot wait on it. Invariant 30.
+
+        A file whose colour is baked in is replaced for its colour, not its
+        bitrate (invariant 32), and `replace.start` judges the releases that
+        way. Read off the check, not the decision, so that the UI's Replace
+        button, whose decision carries no findings, does the same.
         """
         client = self._arr_for(file_row)
         if client is None:
             message = "no *arr configured for this file"
             self._set_job(job_id, "done", 1.0, message)
             return {"action": "replace", "ok": True, "message": message}
-        out = replace.start(file_row, info, client, self._settings())
+        colour = result is not None and any(
+            f.code == colour_checks.BAKED for f in result.findings)
+        out = replace.start(file_row, info, client, self._settings(),
+                            colour=colour)
         self._set_job(job_id, "done" if out["ok"] else "failed",
                       1.0 if out["ok"] else 0, out["message"],
                       error=None if out["ok"] else out["message"])

@@ -2376,3 +2376,50 @@ and these have none left. There are two signals that would catch them:
 - 8-bit full-range untagged HEVC at 2160p.
 
 Neither is built.
+
+### 2026-11-15 20:13: both signals built — `dolby_vision_baked` (not deployed)
+
+`checks.colour.baked` gives a new finding, `dolby_vision_baked` (compat, error), on either signal
+above. Invariant 32 has the rules. The release title is now in the inventory: `ArrClient.library`
+reads `sceneName` (Radarr's `movie.movieFile` carries it when it has one, 135 of 412; Sonarr
+14,077 of 18,692), `files.release` keeps it, and every `check_file` caller passes it on.
+
+Routing: `decide` sends it to the new `policy.baked_colour_action` (`unfixable` by default,
+`replace` to grab), otherwise to `unfixable_action`. On the live settings (`unfixable_action:
+flag`) a deploy only flags them. `replace` judges a colour replacement on its colour: no bitrate
+gain asked, DV-without-HDR titles refused, `old_mbps` NULL. `judge` refuses any download that is
+baked by either signal, whatever the switch.
+
+**Checked inside `unfk`** with the worktree's code served from memory (nothing written to the
+box): a probe and `colour.check` on every file whose release names DV without HDR (127), every
+other file whose stored probe says `yuvj420p` or `pc` (21), and the named comparison sets (79).
+- **20 of the 22 flag.** Andor S02E01 and E07 were missing from disk and Bridgerton S02E02 was
+  HDR10 by then: the other session's replacements (`replacements` 40–47, grabbed 20:04–20:07)
+  had landed. `check_file`, `decide` and `judge` then passed the new files.
+- Signals per file: release only for SNW S04E09/E10 and Sabrina S02E04 (10-bit, `pc`); shape
+  only for Halo S01E05, HotD S01E01 and The Electric State (no `sceneName`); both for the rest.
+- **None of the good ones flag:** Blade Trinity, Futurama S11E05, all 8 Scott Pilgrim Takes Off,
+  all 60 The Wire.
+- **Not flagged, correctly:** Sherlock S02E01–E03 (8-bit full range at 2160p, but tagged PQ).
+  Also 107 DV-titled files that still carry a record (`dolby_vision_no_fallback`), HotD S03E07
+  (RPU in the frames), and the 1080p/720p full-range BT.709 files.
+- **Two more flag:**
+  - **The Pitt S02E08** is the shrink's baked output, its SAUERKRAUT replacement still on the
+    way, so that one is right.
+  - **The Predator (2018)** is a shrink output (09-24) of
+    `The.Predator.2018.1080p.DSNP.WEB-DL.DDP5.1.Atmos.DV.H.265-OnlyWeb`: 10-bit, `pc`, untagged.
+    This morning's sweep called it "an intended warm grade". But the shrink took it as SDR, so
+    its source carried no HDR tags, and a DV-named WEB-DL with no HDR tags is profile 5. It
+    has The Pitt's exact pattern: a DV-named source, shrunk, now 10-bit, `pc` and untagged. So
+    it is probably baked. Worth an eye check against a known-good frame before replacing it.
+
+With `baked_colour_action: replace`, a dry `decide` on SNW S04E09, Halo S01E05 and The Electric
+State gives `replace`. As replacements, `judge` refuses all three.
+
+Left as they are:
+- After an import, `files.release` keeps the old title until the next scan re-enumerates. A watch
+  folder arrival in that window is judged against the old name. It only matters for an untagged
+  replacement, and `replace.blocked`'s cooldown stops a second grab.
+- A 10-bit re-encode of a profile 5 source can pass `choose`'s colour mode, as the Vyndros Andor
+  S02E01 might have, and is caught only if it arrives with one of the two signals. That Vyndros
+  file turned out tagged HDR10.

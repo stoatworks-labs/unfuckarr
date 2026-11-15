@@ -35,6 +35,10 @@ CREATE TABLE IF NOT EXISTS files (
     size            INTEGER,
     mtime           REAL,
     expected_runtime INTEGER,        -- seconds, from the *arr
+    -- The release the file was imported from: the *arr's `sceneName`, which
+    -- survives a re-encode in place. NULL when the *arr has none (a file it
+    -- found on disk rather than grabbed). `checks.colour.baked` reads it.
+    release         TEXT,
     status          TEXT DEFAULT 'unknown',   -- unknown|ok|corrupt|incompatible|hygiene|missing|error
     last_checked    REAL,
     last_result     TEXT,            -- JSON CheckResult
@@ -271,6 +275,7 @@ MIGRATIONS = [
     ("files", "convert_attempts", "INTEGER DEFAULT 0"),
     ("files", "last_research", "REAL"),
     ("files", "research_attempts", "INTEGER DEFAULT 0"),
+    ("files", "release", "TEXT"),
 ]
 
 

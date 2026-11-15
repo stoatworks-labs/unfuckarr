@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from ..config import EfficiencyConfig
 from ..probe import MediaInfo, _to_int
-from . import CheckResult, Finding
+from . import CheckResult, Finding, colour
 
 MB = 1024 * 1024
 
@@ -94,7 +94,7 @@ def priority(info: MediaInfo, cfg: EfficiencyConfig) -> float:
 
 
 def check(info: MediaInfo, cfg: EfficiencyConfig, result: CheckResult,
-          already_shrunk: bool = False) -> None:
+          already_shrunk: bool = False, release: str | None = None) -> None:
     if not cfg.enabled or info is None:
         return
     v = info.video
@@ -132,6 +132,19 @@ def check(info: MediaInfo, cfg: EfficiencyConfig, result: CheckResult,
         "codec": v.codec_name, "height": v.height,
         "size": info.size, "duration": round(info.duration),
     }
+
+    if colour.baked(info, release):
+        # Terminal too: the picture is already ruined and waiting for a
+        # different release (invariant 32), so an encode would spend hours
+        # on a file that is going to be replaced.
+        result.add(Finding(
+            "efficiency", "dolby_vision_not_shrunk", "info",
+            f"{mbps:.1f} Mbps at {v.height}p, but its colour was baked in by a "
+            "re-encode of Dolby Vision profile 5 — it needs a different "
+            "release, not a smaller copy of this one, so it is never measured.",
+            {**data, "baked": True},
+        ))
+        return
 
     if info.dovi_without_fallback:
         # Terminal, and ahead of the HDR gate so that `allow_hdr` cannot open

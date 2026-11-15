@@ -49,6 +49,7 @@ from collections import Counter
 from typing import Any, Callable
 
 from . import db, intake, recycle
+from .checks import colour as colour_checks
 from .clients.arr import ArrClient, ArrError
 from .config import Settings
 from .probe import MediaInfo
@@ -197,7 +198,8 @@ def _refusals(release: dict[str, Any]) -> list[str]:
 
 def choose(releases: list[dict[str, Any]], current: dict[str, Any], *,
            episode_count: int = 1, sonarr: bool = True,
-           tried: set[str] | None = None) -> tuple[dict[str, Any] | None, Counter]:
+           tried: set[str] | None = None,
+           colour: bool = False) -> tuple[dict[str, Any] | None, Counter]:
     """The release to grab, or None — and why each of the others was not.
 
     Pure, for the same reason `remediation.decide` is. ``current`` is
@@ -209,6 +211,13 @@ def choose(releases: list[dict[str, Any]], current: dict[str, Any], *,
     last. Every one that passes is already a clear improvement, so the rest is
     cost: the smallest is the quickest to arrive and the least space, and the
     library's own shrink can do the rest later at a measured quality.
+
+    ``colour`` is a replacement for a file whose colour was baked in
+    (invariant 32). Its fault is not its bitrate — Rings of Power S03E02's
+    shrink output was 13.3 Mbps HEVC, and no 2160p release was twice that — so
+    the gain is not asked for; a title that names Dolby Vision with no HDR
+    fallback is refused instead, because that is profile 5 again. The floor
+    and the resolution still apply: a heavily re-encoded copy is no cure.
     """
     tried = tried or set()
     skipped: Counter = Counter()
@@ -256,7 +265,11 @@ def choose(releases: list[dict[str, Any]], current: dict[str, Any], *,
             skipped["would still be heavily re-encoded"] += 1
             continue
         equiv = mbps * efficiency(codec_of_title(title))
-        if equiv < MIN_GAIN * current["equiv"]:
+        if colour:
+            if colour_checks.names_dv_without_hdr(title):
+                skipped["Dolby Vision with no HDR fallback"] += 1
+                continue
+        elif equiv < MIN_GAIN * current["equiv"]:
             skipped["not enough better"] += 1
             continue
         weak = (r.get("protocol") == "torrent"
@@ -350,11 +363,15 @@ def _tried(key: str) -> set[str]:
 # -- starting one ------------------------------------------------------------
 
 def start(row: dict[str, Any], info: MediaInfo | None, client: ArrClient,
-          s: Settings) -> dict[str, Any]:
+          s: Settings, colour: bool = False) -> dict[str, Any]:
     """Search, choose, keep a copy, grab. Returns the job's outcome.
 
     Touches nothing in the library. The only file written is the copy in the
     recycle bin, and it is taken away again if the grab does not happen.
+
+    ``colour``: the file's colour is baked in, so the release is chosen for
+    its colour, not its bitrate (`choose`), and the row records no bitrate to
+    beat, so that `judge` does not ask for one either.
     """
     path = row["path"]
     why = blocked(row, s)
@@ -392,11 +409,14 @@ def start(row: dict[str, Any], info: MediaInfo | None, client: ArrClient,
           (now, path))
 
     choice, skipped = choose(releases, current, episode_count=max(1, len(eps)),
-                             sonarr=sonarr, tried=_tried(key))
+                             sonarr=sonarr, tried=_tried(key), colour=colour)
     if choice is None:
         message = (f"none of {len(releases)} releases is clearly better than "
                    f"{current['mbps']:.2f} Mbps {current['codec']} at "
                    f"{current['tier']}p")
+        if colour:
+            message = (f"none of {len(releases)} releases is one without Dolby "
+                       f"Vision profile 5 at {current['tier']}p or better")
         db.log("replacement_none_found", "info", path,
                {"releases": len(releases), "skipped": dict(skipped.most_common(8)),
                 "current": current})
@@ -432,14 +452,19 @@ def start(row: dict[str, Any], info: MediaInfo | None, client: ArrClient,
           (key, path, row.get("source"), parent, json.dumps(eps) if eps else None,
            choice.get("title"), choice.get("guid"), choice.get("indexer"),
            choice.get("protocol"), choice.get("size"), download_id, held,
-           current["equiv"], current["duration"], current["tier"],
-           choice["_est_equiv"], "grabbed", "waiting for the download", now, now))
+           None if colour else current["equiv"], current["duration"],
+           current["tier"], choice["_est_equiv"], "grabbed",
+           "waiting for the download", now, now))
     db.bump("replacements_grabbed")
     message = (f"grabbed {choice.get('title')} — about "
                f"{choice['_est_equiv'] / max(current['equiv'], 0.01):.1f}× the "
                "picture; this file stays until it has arrived and been checked")
+    if colour:
+        message = (f"grabbed {choice.get('title')} for its colour; this file "
+                   "stays until it has arrived and been checked")
     db.log("replacement_grabbed", "info", path, {
         "release": choice.get("title"), "size": choice.get("size"),
+        "for": "colour" if colour else "bitrate",
         "protocol": choice.get("protocol"), "est_equiv_mbps": choice["_est_equiv"],
         "current": current, "skipped": dict(skipped.most_common(8))})
     return {"ok": True, "message": message}
@@ -476,6 +501,19 @@ def judge(local_path: str, rec: dict[str, Any],
         # profile 5, so this is the likeliest way a 2160p replacement fails.
         return False, ("it is Dolby Vision with no HDR10 or SDR base layer — "
                        "purple and green on any client without Dolby Vision"), {}
+    baked = colour_checks.baked(info, rec.get("title"))
+    if baked:
+        # Asked of the file and the title that was grabbed, not of the
+        # findings, for the reason above, and whatever the file it replaces
+        # is: a picture with the cast already in it is never the better copy.
+        # The title is the release the row records, so a DV-named release
+        # whose download has no Dolby Vision left is caught here as well as
+        # the 8-bit full-range shape (invariant 32).
+        why = ("its release names Dolby Vision with no HDR fallback and "
+               "nothing of the Dolby Vision is left in it" if "release" in baked
+               else "it is 8-bit full-range HEVC at 2160p with no colour tags")
+        return False, (f"its colour is baked in from Dolby Vision profile 5 — "
+                       f"{why}"), {}
     m = measure(info) or {}
     if rec.get("old_duration") and m.get("duration"):
         ratio = m["duration"] / rec["old_duration"]

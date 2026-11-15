@@ -66,8 +66,19 @@ whatever Emby says, including the ones whose container has lost its Dolby Vision
 it finds by reading the first frame. It never re-encodes one: no encoder here can apply the Dolby
 Vision colour, so the purple would be baked into an ordinary file for good. The fix is a release
 with an HDR10 base layer (Dolby Vision profile 8, or plain HDR10). In Sonarr and Radarr that
-means the TRaSH Guides "DV (WEBDL)" custom format at a large negative score. If every client you
-own decodes Dolby Vision, set `emby_compat.dolby_vision_clients` and these become a note instead.
+means the TRaSH Guides "DV (w/o HDR fallback)" custom format (it used to be called "DV (WEBDL)")
+at a large negative score. If every client you own decodes Dolby Vision, set
+`emby_compat.dolby_vision_clients` and these become a note instead.
+
+Some files have already been through that re-encode, by unfuckarr's shrink before it knew better
+or by some other tool, and the purple and green is now in the pixels with no Dolby Vision left to
+show it. unfuckarr finds them two ways. The first is the release a file came from (the *arr's
+scene name): it says Dolby Vision and no HDR, yet the file has no Dolby Vision and no colour tags.
+The second is the shape such a re-encode leaves: 8-bit, full-range HEVC at 2160p with no colour
+tags. These are wrong on every client, Dolby Vision ones included. They're flagged, re-searched
+with `unfixable_action: research`, or replaced with `baked_colour_action: replace`, which grabs a
+release that isn't profile 5, checks its colour when it lands, and keeps the old file until then.
+A plain SDR file that just lacks colour tags isn't flagged.
 
 **Stream hygiene: will it behave?**
 Missing audio language tags, no default track among several, image-only subtitles (which force a
@@ -168,6 +179,7 @@ hand:
 | Intact but Emby would transcode | Transcode, copying every stream that already passes. Emby gives no reason, so unfuckarr asks it again with each part of the profile relaxed to find one; when nothing smaller will do, or the smaller fix did not take, it re-encodes the file to the target profile, once |
 | Hygiene | Flag only |
 | Dolby Vision with no HDR10/SDR base layer | Flag (or `research`). Never re-encoded or shrunk, by any path |
+| Dolby Vision colour already baked in by a re-encode | Flag (or `research`, or with `baked_colour_action: replace` grab a release that isn't profile 5, checked for its colour before the old file goes). Never re-encoded or shrunk |
 | Heavily re-encoded, with `low_bitrate_action: replace` | Find a clearly better release and grab it. The old file stays until the new one has arrived and been checked. |
 | Not yet measured for a saving | Measure it, and re-encode only if the result is smaller *and* still scores at the quality target |
 | A disc image nothing can open | Report it, and do nothing |

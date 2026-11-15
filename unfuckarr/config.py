@@ -377,6 +377,17 @@ class Policy(BaseModel):
     # Default stays the old behaviour for the reason `unfixable_action`'s
     # does — it spends someone's bandwidth.
     low_bitrate_action: Literal["unfixable", "replace"] = "unfixable"
+    # A file whose colour was baked in by a re-encode of Dolby Vision profile 5
+    # (`dolby_vision_baked`) is the other one a better copy can be told apart
+    # for before it is downloaded: a release title that names HDR or SDR, or
+    # does not name Dolby Vision at all, is not profile 5 by the *arr's own
+    # custom format, and `judge` checks the colour of what arrives. `replace` grabs
+    # one the same safe way round as above, judged on the colour rather than
+    # the bitrate, because these files are often not small — Mission:
+    # Impossible's is 6.3 Mbps HEVC — and their fault is not their size.
+    # `unfixable` leaves them to `unfixable_action`. Its own setting so that
+    # switching one kind of replacement on does not switch on the other.
+    baked_colour_action: Literal["unfixable", "replace"] = "unfixable"
     # Re-searches get their own cap, for a different reason than shrinks and
     # conversions. Those are capped for server load; this one is capped for
     # indexer etiquette. Each re-search is a query fanned out to every indexer

@@ -89,7 +89,7 @@ def collect_library(s: Settings) -> tuple[list[dict[str, Any]], list[str]]:
             rows.setdefault(path, {
                 "path": path, "arr_id": None, "arr_parent_id": None,
                 "arr_episode_ids": None, "title": Path(path).stem,
-                "expected_runtime": 0, "size": 0, "quality": "",
+                "expected_runtime": 0, "size": 0, "quality": "", "release": None,
                 "source": "folder", "library": Path(root).name or root,
             })
 
@@ -110,18 +110,20 @@ def sync_inventory(rows: list[dict[str, Any]]) -> tuple[int, int]:
             conn.execute(
                 """INSERT INTO files
                      (path, library, source, arr_id, arr_parent_id, arr_episode_ids,
-                      title, size, mtime, expected_runtime)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                      title, size, mtime, expected_runtime, release)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(path) DO UPDATE SET
                      library=excluded.library, source=excluded.source,
                      arr_id=excluded.arr_id, arr_parent_id=excluded.arr_parent_id,
                      arr_episode_ids=excluded.arr_episode_ids,
                      title=excluded.title, size=excluded.size, mtime=excluded.mtime,
-                     expected_runtime=excluded.expected_runtime""",
+                     expected_runtime=excluded.expected_runtime,
+                     release=excluded.release""",
                 (r["path"], r.get("library"), r.get("source"), r.get("arr_id"),
                  r.get("arr_parent_id"),
                  json.dumps(r["arr_episode_ids"]) if r.get("arr_episode_ids") else None,
-                 r.get("title"), size, mtime, r.get("expected_runtime") or 0),
+                 r.get("title"), size, mtime, r.get("expected_runtime") or 0,
+                 r.get("release") or None),
             )
             seen += 1
 
@@ -154,8 +156,14 @@ def _verdict_without_reasons(result: CheckResult) -> bool:
 
 def check_file(path: str, s: Settings, expected_runtime: int | None = None,
                emby: EmbyClient | None = None,
-               already_shrunk: bool = False) -> tuple[CheckResult, MediaInfo | None]:
-    """Run every enabled check against one file."""
+               already_shrunk: bool = False,
+               release: str | None = None) -> tuple[CheckResult, MediaInfo | None]:
+    """Run every enabled check against one file.
+
+    ``release`` is the title of the release the file came from — the *arr's
+    ``sceneName``, kept in ``files.release`` — when there is one. Only the
+    colour check reads it (`checks.colour.baked`).
+    """
     result, info = integrity_checks.check(
         path, s.integrity, ffprobe=s.ffprobe_path, ffmpeg=s.ffmpeg_path,
         expected_runtime=expected_runtime,
@@ -190,11 +198,11 @@ def check_file(path: str, s: Settings, expected_runtime: int | None = None,
     # Outside the condition above on purpose: Emby says yes to a Dolby
     # Vision file with no fallback, and that yes is how the purple picture
     # reaches the screen (`checks.colour`).
-    colour_checks.check(info, s.emby_compat, result)
+    colour_checks.check(info, s.emby_compat, result, release=release)
 
     hygiene_checks.check(info, s.hygiene, result)
     efficiency_checks.check(info, s.efficiency, result,
-                            already_shrunk=already_shrunk)
+                            already_shrunk=already_shrunk, release=release)
     return result, info
 
 
@@ -454,7 +462,8 @@ class Scanner:
         try:
             result, info = check_file(
                 path, s, expected_runtime=row["expected_runtime"], emby=emby,
-                already_shrunk=bool(row["shrunk"] or row["shrink_skipped"]))
+                already_shrunk=bool(row["shrunk"] or row["shrink_skipped"]),
+                release=row["release"])
         except ProbeError as exc:
             result, info = CheckResult(path=path, error=str(exc)), None
         except Exception as exc:  # noqa: BLE001

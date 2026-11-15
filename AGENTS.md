@@ -528,6 +528,42 @@ Break any of these and the failure is quiet and expensive.
     the frames with no container record (`dovi_in_stream`, read only for untagged 10-bit HEVC),
     which no tag can show. `dolby_vision_clients` changes the finding's severity and nothing else.
 
+32. **A file whose colour was baked in by that re-encode is replaced, never rewritten.** Once an
+    encode has read the IPT planes as Y'CbCr, the purple and green are in the pixels of an
+    ordinary file and nothing of the Dolby Vision is left — no record, no RPU, no colour tags —
+    so invariant 31's test cannot see it. The 2026-11-15 sweep found 22: nineteen 8-bit
+    full-range HEVC 2160p files some earlier tool made, and two of the shrink's own outputs
+    (Strange New Worlds S04E09/E10, 10-bit, limited range). `checks.colour.baked` gives
+    `dolby_vision_baked` (compat, error, whatever `dolby_vision_clients` says) on either of two
+    signals, each taken from those files and nothing else:
+
+    - **release**: the release the file came from names Dolby Vision and no HDR — TRaSH's
+      "DV (w/o HDR fallback)" title test, `\b(dv|dovi|dolby[ .]?v(ision)?)\b` without
+      `\bHDR(\b|\d)`, any case — and the file has no Dolby Vision and no colour tags. The
+      release is the *arr's `sceneName`, now carried as `files.release` from `ArrClient.library`
+      through `sync_inventory` to every `check_file`. It survives a re-encode in place, which is
+      the only reason the shrink outputs can be found at all: as streams they are a plain
+      untagged SDR encode.
+    - **shape**: HEVC, 8-bit, full range (`yuvj420p`, or `pc`), 2160p by height or width, no
+      colour tags. Every such file in the live library was baked; an honest 8-bit 4K encode is
+      limited range or tagged (Sherlock S02 is full range and tagged PQ).
+
+    Both refuse when anything says otherwise: any colour tag, a Dolby Vision record or RPU (that
+    is invariant 31's file, still curable by a Dolby Vision client), a disc image, or a first
+    frame that could have held an RPU and could not be read. A plain untagged SDR file whose
+    release says nothing of Dolby Vision is never flagged.
+
+    `decide` routes the finding ahead of the compat branch, beside invariant 31's, to
+    `policy.baked_colour_action: replace` (off by default; its own switch, so that replacing
+    heavily re-encoded files does not start replacing these) or else to `unfixable_action`
+    (`research` or a flag). Never to the transcoder or the shrink: `efficiency.check` gives it
+    the terminal `dolby_vision_not_shrunk` too. A colour replacement goes through invariant 30's
+    machinery with one difference: `choose` asks for no bitrate gain (Mission: Impossible's baked
+    file is 6.3 Mbps HEVC, and Rings of Power's shrink output was 13.3 — no 2160p release is
+    twice either) and refuses DV-without-HDR titles instead, and the row records `old_mbps` NULL
+    so `judge` does not ask for the gain either. `judge` refuses any download that is itself
+    baked by either signal, with the grabbed title as its release, whatever the switch says.
+
 ## Traps found the hard way
 
 - **The recycle bin's size is what is on disk, not `SUM(size)` from the table.** The two disagree,
@@ -1076,6 +1112,20 @@ container's own ffmpeg:
 
 **Still assumed:**
 
+- **`dolby_vision_baked` rests on 22 files.** Checked inside `unfk` on 2026-11-15 with the
+  worktree's code: it flags all 20 of the 22 still on disk (Andor S02E01/E07 and Bridgerton
+  S02E02 had been replaced that evening, and their replacements pass), and none of Blade
+  Trinity, Futurama S11E05, the eight Scott Pilgrim Takes Off or the sixty The Wire files. It
+  also flags The Pitt S02E08 (the shrink's baked output, its replacement still downloading) and
+  The Predator (2018), a shrink output whose release says DV with no HDR; the first sweep that
+  day called its picture a warm grade, by eye and with nothing to compare. The signals are evidence from one
+  library, not a specification: a DV-named release that some tool tone-mapped properly and left
+  untagged would be flagged too, and a baked re-encode whose name drops the DV and whose range is
+  limited would not.
+- **A colour replacement has never been grabbed by this code.** The two grabbed on 11-15 for
+  baked files (The Pitt, Rings of Power) were by hand, through the same calls; `choose`'s colour
+  mode picks the smallest release that passes, and a 10-bit re-encode of a profile 5 source can
+  pass it and only be caught on arrival.
 - **`allow_hdr` is better than it was and still not proven.** `transcode.colour_args` now carries
   the transfer function, primaries, matrix and range onto the encode — ffmpeg does not do that on
   its own, and without them an HDR re-encode plays grey and washed out with nothing reporting it.
@@ -1250,7 +1300,8 @@ unfuckarr/
     integrity.py     Is it intact? + looks_repairable()
     compat.py        Local Emby direct-play model + the three presets
     hygiene.py       Stream metadata
-    colour.py        Dolby Vision with no fallback (profile 5) — never re-encoded
+    colour.py        Dolby Vision with no fallback (profile 5) — never re-encoded;
+                     and its colour already baked in by a re-encode — replaced
     efficiency.py    Is it far bigger than it needs to be? + the bitrate arithmetic
   clients/
     arr.py           Sonarr + Radarr v3

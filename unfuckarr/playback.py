@@ -419,9 +419,11 @@ def _not_for_this(decision: Decision, result: CheckResult) -> Decision:
                                 "(it is only waiting to be measured for a saving)",
                         decision.findings)
     if decision.action == "replace":
+        what = ("its colour is baked in" if "dolby_vision_baked"
+                in (decision.findings or []) else "it is heavily re-encoded")
         return Decision("flag", "nothing in the file explains the failed play "
-                                "(it is heavily re-encoded, which the nightly "
-                                "scan replaces at its own pace)",
+                                f"({what}, which the nightly scan replaces at "
+                                "its own pace)",
                         decision.findings)
     if decision.action in ("transcode", "repair"):
         codes = {f.code for f in result.errors if f.category == "integrity"}
@@ -588,7 +590,8 @@ class PlaybackWatcher:
             result, info = check_file(
                 path, s, expected_runtime=record.get("expected_runtime"),
                 emby=emby,
-                already_shrunk=bool(record.get("shrunk") or record.get("shrink_skipped")))
+                already_shrunk=bool(record.get("shrunk") or record.get("shrink_skipped")),
+                release=record.get("release"))
         except ProbeError as exc:
             result, info = CheckResult(path=path, error=str(exc)), None
         window = decode_where_it_stopped(info, play.position, s.integrity,

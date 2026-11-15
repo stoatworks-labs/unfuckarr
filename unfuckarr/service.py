@@ -316,7 +316,8 @@ class Service:
         s = config.get()
         result, info = check_file(
             path, s, expected_runtime=record.get("expected_runtime"),
-            already_shrunk=bool(record.get("shrunk") or record.get("shrink_skipped")))
+            already_shrunk=bool(record.get("shrunk") or record.get("shrink_skipped")),
+            release=record.get("release"))
         try:
             stat = Path(path).stat()
             persist_result(path, result, info, stat.st_size, stat.st_mtime)
@@ -562,7 +563,8 @@ class Service:
                     # sits in the backlog for ever — observed on the live
                     # library within two minutes of the first real shrink.
                     already_shrunk=bool(record.get("shrunk")
-                                        or record.get("shrink_skipped")))
+                                        or record.get("shrink_skipped")),
+                    release=record.get("release"))
             except Exception as exc:  # noqa: BLE001
                 log.exception("arrival check failed for %s", path)
                 db.log("arrival_check_failed", "error", path, str(exc))
@@ -597,7 +599,8 @@ class Service:
         emby = EmbyClient(s.emby) if s.emby.enabled else None
         result, info = check_file(
             path, s, expected_runtime=record.get("expected_runtime"), emby=emby,
-            already_shrunk=bool(record.get("shrunk") or record.get("shrink_skipped")))
+            already_shrunk=bool(record.get("shrunk") or record.get("shrink_skipped")),
+            release=record.get("release"))
         try:
             stat = Path(path).stat()
             persist_result(path, result, info, stat.st_size, stat.st_mtime)
@@ -623,7 +626,8 @@ class Service:
             path, s, expected_runtime=record.get("expected_runtime"),
             # An explicit request should see the file as it is, not as the
             # shrink bookkeeping has already labelled it.
-            already_shrunk=action != "shrink" and bool(record.get("shrunk")))
+            already_shrunk=action != "shrink" and bool(record.get("shrunk")),
+            release=record.get("release"))
         return self.remediator.apply(
             record, result, info,
             Decision(action, f"{action} requested from the web UI", force=True),
