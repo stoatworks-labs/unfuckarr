@@ -2267,3 +2267,44 @@ on a 10 s cut of Slow Horses S01E01: `-c copy` to `.mkv` kept `DOVI configuratio
 `-strict unofficial` it kept it. `build_command` now adds that flag for any Dolby Vision source
 copied into MP4. Live `transcode.container` is `mkv`, so no file was stripped this way — HotD
 S03E07's missing record came from somewhere else (the release, most likely).
+
+### 2026-11-15 16:41: deployed `0a8e4d4`, shrinking back on, and the two baked files replaced
+
+Built as `unfuckarr-makemkv:new-0a8e4d4` (`d5ad6740`) on top of the published `edge`, whose revision label is the same commit:
+`/app` matched the build clone (34 files), MakeMKV present. Rollback tag
+`unfuckarr-makemkv:rollback-2026-11-15-7e89aed` (the old `a3d428db`). Backup
+`.unfk-backups/pre-dolby-vision-2026-11-15`: online `.backup()` as uid 99, integrity ok, 18,988
+files, plus `config.json`, inspect and the recreate script. Scan 69 was stopped first through
+`/api/scan/stop`, 41 of 2,961 repairs in; it settled at once.
+
+**Start-up took about five minutes, and read as `unhealthy` for most of it.** Not a hang: the
+one thread sat in `request_wait_answer` (a FUSE wait on `/mnt/user`) with an fd open on
+`/media/movies` — the watcher adding its inotify watches synchronously, before uvicorn binds,
+while spun-down array disks woke one by one. Earlier deploys (15–90 s) found the disks awake.
+Look at `/proc/<host pid>/wchan` (`docker top unfk` for the pid) before suspecting the code.
+
+Checked live through `/api/files/recheck`: Slow Horses S01E01 and HotD S03E04/E07 come back
+`incompatible` with `dolby_vision_no_fallback` and decision `flag`; Slow Horses S01E03 (HDR10)
+is `ok`. `shrink.enabled` and `continuous` went back on once that recheck passed.
+
+**Sonarr and Radarr fell over during this, not because of it.** Both containers were started at
+16:48:28 and exited 0 five seconds later (no restart policy), so their tailnet nodes went
+offline and every `*arr` call from unfk timed out. Nothing in the deploy touches them; the cause
+is unknown. Started again at 17:06 on Allan's say-so and stayed up.
+
+The two files the shrink had baked: **The Pitt S02E08** went through `replace` as it is, which
+grabbed `The.Pitt.S02E08.GERMAN.DL.DV.HDR.2160p.WEB.h265-SAUERKRAUT` (2.0x, German + English, so
+the default track may be German — nothing here fixes a foreign default). **Rings of Power
+S03E02** found nothing: the shrink output is 13.3 Mbps HEVC, and no 2160p release is twice that
+H.264-equivalent, because `choose` judges bitrate and this file's fault is colour. Grabbed by hand
+instead through the same machinery (`keep_copy`, `grab`, a `replacements` row, id 34) with
+`old_mbps` NULL so `judge` skips only the bitrate comparison:
+`…S03E02.HDR.2160p.WEB.H265-CAKES`, usenet, 10.7 GB. `replace.advance` takes both from here.
+
+**Converting profile 5 here is not available yet.** `unfk`'s ffmpeg 8.0.1 has libplacebo, Vulkan
+and shaderc, and the Radeon 890M's `/dev/dri` is passed in, but the image has no Vulkan driver:
+`-init_hw_device vulkan` fails with `VK_ERROR_INCOMPATIBLE_DRIVER`. Mesa's RADV in the image would
+be the first step, then proving `libplacebo=apply_dolbyvision=1` output by eye, then an HDR10
+encode. **Emby's side cannot fix it either:** its own `ffmpeg 5.1-emby_2023_06_25` has only
+`tonemap`, `supertonemap`, `tonemap_opencl/vaapi/cuda`, none of which reads the RPU, and Emby says
+direct play to these files anyway.
