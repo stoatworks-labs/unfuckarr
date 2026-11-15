@@ -2308,3 +2308,71 @@ be the first step, then proving `libplacebo=apply_dolbyvision=1` output by eye, 
 encode. **Emby's side cannot fix it either:** its own `ffmpeg 5.1-emby_2023_06_25` has only
 `tonemap`, `supertonemap`, `tonemap_opencl/vaapi/cuda`, none of which reads the RPU, and Emby says
 direct play to these files anyway.
+
+### 2026-11-15 19:45: the *arr side, and 22 more files with the colour baked in
+
+**Sonarr and Radarr now reject profile 5 WEB releases.** TRaSH's custom format, renamed
+`DV (w/o HDR fallback)` in Sept 2025 (it was `DV (WEBDL)`; file `dv-wo-hdr-fallback.json`), was
+added to both (Sonarr id 5, Radarr id 1) and scored −10000 in every quality profile. Every profile
+has a minimum of 0, so a matching release is refused. The format reads the release title only:
+it needs `DV`/`DoVi`/`Dolby Vision` and a WEB source, and it skips titles with `HDR`/`HDR10`/`HDR10+`,
+the group Flights, and `hulu`. Checks:
+- Sonarr: all 67 files its own mediaInfo calls `DV` match (−10000).
+- Radarr: both such files match (`moviefile` shows the score; `movie.movieFile` does not).
+- `parse` scores a `DV.H.265` title −10000 and passes `DV.HDR` and `DV.HDR10Plus`.
+- A real title is needed for Radarr's `parse` to score at all.
+
+**Side effects:**
+- Existing profile 5 files now score below `cutoffFormatScore` 0, so Sonarr and Radarr count
+  them as upgradable. RSS will replace them when a clean release turns up, but nothing searches
+  for them actively.
+- Eight Sex Education S02 files (SiC, `DoVi` with no `HDR` in the name) are really
+  `DV HDR10` and match anyway. Same for any other title that omits `HDR`. The cost is only a
+  needless upgrade.
+
+`replace.choose` already treats any rejection that is not an upgrade refusal as a skip, so it
+now skips profile 5 releases on its own. A dry run picked:
+- Andor S02E01: a Vyndros 10-bit re-encode, which may itself be baked.
+- Bridgerton S02E02: EDITH's `HDR` release.
+- The Electric State: AOC's `SDR` WEB-DL.
+
+**The baked-file sweep earlier today missed most of them.** It asked for 10-bit, untagged, full
+range, among files the shrink had touched. Matching the new format against Sonarr's own
+mediaInfo turned up files the format matches that Sonarr reads as SDR. A library-wide ffprobe
+sweep then found two kinds:
+- **8-bit HEVC, `yuvj420p`, full range, no colour tags at all**, 2160p, low bitrate
+  (1–4 Mbps). Nineteen files, none touched by unfuckarr's shrink. Their release names say DV,
+  and their seasonmates are still live profile 5. Some tool re-encoded them in 8-bit. Mtimes run
+  from 2025-05 to 2026-10, and the activity log only goes back to 11-11, so it is unknown what
+  did it.
+- **Shrink outputs at 10-bit, limited range, untagged.** Strange New Worlds S04E09 and S04E10,
+  shrunk 09-18 and 09-24 from DV-named sources. Limited range is why the sweep's `pc` test
+  missed them.
+
+Frames show the purple/green cast on Andor S02E01, Bridgerton S02E02, HotD S01E01, Locke & Key
+S02E07, SNW S04E09/E10 and The Electric State. MI: The Final Reckoning and Halo S01E05 look
+green. Sabrina S02E04 is too dark to call.
+
+The full list, 20 on Sonarr and 2 on Radarr:
+- *A Knight of the Seven Kingdoms* S01E01
+- *Andor* S02E01, E07, E11, E12
+- *Bridgerton* S02E02, E03, E06, E07, E08
+- *Chilling Adventures of Sabrina* S02E01, E04, E05
+- *Dexter: Resurrection* S01E07
+- *Halo* S01E05
+- *House of the Dragon* S01E01, E03
+- *Locke & Key* S02E07
+- *Strange New Worlds* S04E09, E10
+- *Mission: Impossible – The Final Reckoning*
+- *The Electric State*
+
+Other untagged 4K shrink outputs looked right: Blade Trinity, Futurama S11E05, Scott Pilgrim
+Takes Off, and The Wire's upscales.
+
+**unfuckarr cannot see these files.** `dovi_without_fallback` needs Dolby Vision in the file,
+and these have none left. There are two signals that would catch them:
+- a release title (the *arr's `sceneName`) that names DV with no HDR, on a file with neither a
+  DV record nor HDR tags;
+- 8-bit full-range untagged HEVC at 2160p.
+
+Neither is built.
