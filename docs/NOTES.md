@@ -2423,3 +2423,75 @@ Left as they are:
 - A 10-bit re-encode of a profile 5 source can pass `choose`'s colour mode, as the Vyndros Andor
   S02E01 might have, and is caught only if it arrives with one of the two signals. That Vyndros
   file turned out tagged HDR10.
+
+### 2026-11-15 23:30: how the replacements went, and Slow Horses
+
+Rows 34–62 have all settled. Every imported copy had its codec, tags and side data probed, and
+two frames (at 30% and 60%) were checked by eye.
+
+**20 landed with the right picture:**
+
+| Kind | Files |
+|---|---|
+| HDR10 | Rings of Power S03E02, Andor S02E01 and E12, Bridgerton S02E02 and E03, Sabrina S02E04, HotD S01E01 (with mastering metadata) |
+| DV + HDR10 hybrid | Andor S02E07 and E11, Bridgerton S02E06, HotD S01E03 |
+| SDR, tagged BT.709 | Knight S01E01, Bridgerton S02E07 and E08, Sabrina S02E01, Locke & Key S02E07, MI: The Final Reckoning, The Electric State, The Pitt S02E08 |
+
+- The SDR copies are what `choose` picked from titles with no `HDR` in them. Their colour is
+  right but they have no HDR. A later HDR upgrade is optional.
+- **HotD S01E03 defaults to French audio.** It is QTZ `MULTi VFI`: French audio and French forced
+  subtitles are the defaults, and English is audio track 2.
+- **Sabrina S02E05 defaults to Portuguese audio** (see below).
+- Neither default was changed. There is no mkvtoolnix on lilnasx, on the host or in any
+  container. Emby's per-user preferred audio language picks English whatever the flag says.
+
+**8 downloads failed:**
+
+| Cause | Files |
+|---|---|
+| Incomplete usenet post. SABnzbd: "Aborted, cannot be completed". | SNW S04E09/E10 (SAUERKRAUT), Slow Horses S01E01/E02 (CRFW on NZBFinder) |
+| Public torrent stalled and was marked failed at :00 or :30 | Sabrina S02E05, Dexter S01E07, Halo S01E05, The Predator |
+
+Usenet is fine in general: most of today's grabs came through SABnzbd. Posts two or more years
+old of popular shows are the ones that come back incomplete. Slow Horses S02E02's REPACK failed
+four times before one imported.
+
+**Sonarr fixed four of them by itself.** After each failure, its failed-download handling searched
+and imported an alternative. It could do that because those files are not REPACKs.
+- SNW S04E09 and E10: 8-bit BT.709.
+- Dexter S01E07: 10-bit BT.709.
+- Sabrina S02E05: DV + HDR10, but Portuguese is the default audio.
+
+All four frames look right.
+
+**Halo S01E05 and The Predator were still baked**, with green frames. Both were grabbed again by
+hand (`replacements` 63–64):
+- Halo: GGEZ `HDR.2160p` (kickass, 108 seeders).
+- The Predator: NTG 1080p AMZN (TorrentLeech, 36 seeders).
+
+**Slow Horses S01E01/E02 are live profile 5** (NTb `REPACK ... DoVi`), the files that started all
+this. Sonarr can never upgrade them on its own:
+- The custom format scores them −10000, but Sonarr ranks revision above custom-format score.
+- So it refuses every clean release with "Existing file on disk is of equal or higher revision:
+  v2".
+- This applies to any profile 5 file that came as a REPACK or PROPER. It needs a hand grab, or
+  `replace` once `baked_colour_action`/`dolby_vision_no_fallback` routing grabs on colour.
+
+**unfk has no `files` rows for five series:** Slow Horses, Black Doves, Killing Eve and Honey (all
+added 11-14), and Cunk on Cinema (added 11-03), 85 episodes in all. No full scan has finished since
+(scan 69 was stopped). So the two Slow Horses rows (59–60, then 61–62) were built from Sonarr's
+IDs. `replace.advance` works from the `replacements` row alone, so judging and import are
+unchanged.
+
+The first grab was CRFW's DV+HDR10 hybrid on usenet, and both posts were incomplete. The second
+was the same release from TorrentLeech, with 31 and 13 seeders. For an old, popular episode, a
+private-tracker torrent is the safer pick.
+
+Both copies were imported by `replace.advance` at 23:49 ("better in every way measured"):
+- HEVC 10-bit, PQ/BT.2020, Dolby Vision profile 8.1 on an HDR10 base, English audio.
+- Frames at 25%, 50% and 75% show natural colour.
+- The old REPACK files are gone.
+- Emby's item for each episode points at the new file, with "DolbyVision Profile 8.1 (HDR10
+  compatible)".
+
+Halo S01E05 and The Predator (rows 63–64) were still downloading at the time of writing.
