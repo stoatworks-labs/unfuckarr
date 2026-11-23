@@ -366,12 +366,20 @@ Break any of these and the failure is quiet and expensive.
     nothing had ever touched were written off at `fix_attempts` 2 — refused by every scan after
     it, a month of nightly "actions" that were all flags.
 
-27. **Emby opens a file on its default audio track, and the plan has to aim at that track.**
-    `compat.default_audio` (the track flagged default, else the first) is shared by the check and
-    the planner. An unplayable default beside a playable track is `default_audio_unplayable`
-    (error); `_fix_default_audio` promotes a stand-in (same language, not a commentary or
-    description, channels ≥ min(default, 6)) or else adds a converted copy of the default as
-    output audio 0 and keeps the original. A file with *no* playable track (`bad_audio_codec`)
+27. **Emby opens a file on its FIRST audio track, not the default-flagged one, so the plan's
+    default is always written as output audio 0.** Corrected 2026-11-23: Penny Dreadful
+    S01E01 (TrueHD first, AC-3 flagged default) is refused, direct play with `AudioStreamIndex`
+    on the AC-3, and S02E07 (AC-3 first) direct plays as it stands — Emby 4.10.2, admin user with
+    PlayDefaultAudioTrack on. `compat.audio_leads` (the first track, then the default) is what
+    the check judges: either one unplayable beside a playable track is `default_audio_unplayable`
+    (error). `compat.default_audio` (flagged, else first) still picks the language and channels a
+    stand-in must match. `_fix_default_audio` promotes a stand-in (same language, not a
+    commentary or description, channels ≥ min(default, 6)) — flagged default **and moved to the
+    front** by `transcode.audio_order` — or else adds a converted copy of the default as
+    output audio 0 and keeps the original. Every per-track option in `build_command` (codec,
+    language tag, disposition) goes through the source→output index map, never `i` or `i + 1`.
+    Before this, a promotion only flipped flags: 26 Penny Dreadful episodes sat at the attempt cap
+    after two remuxes and a full re-encode that each left the TrueHD first. A file with *no* playable track (`bad_audio_codec`)
     takes the same add path rather than having every track re-encoded and the DTS discarded;
     only a non-Matroska target, which cannot carry DTS or TrueHD, still re-encodes everything.
     Verified against live Emby 2026-10-12: Battlestar

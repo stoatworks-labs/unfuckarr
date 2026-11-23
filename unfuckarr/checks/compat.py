@@ -97,12 +97,29 @@ def resolve(cfg: EmbyCompatConfig) -> Profile:
 
 
 def default_audio(audio: list[Stream]) -> Stream:
-    """The track a player opens with: the one flagged default, else the first.
+    """The track flagged default, else the first.
 
     Shared with the planner, which has to aim at the same track this check
-    complained about.
+    complained about. Not the whole answer to "which track does a player
+    open with" — Emby reads the stream order, not this flag; see
+    `audio_leads`.
     """
     return next((a for a in audio if a.is_default), audio[0])
+
+
+def audio_leads(audio: list[Stream]) -> list[Stream]:
+    """The tracks a player may open a file on: the first, then the default.
+
+    Emby opens on the first audio track and does not read the default flag
+    (4.10.2, measured 2026-11-23): Penny Dreadful S01E01, TrueHD first and
+    AC-3 flagged default, is refused; the same PlaybackInfo call with
+    `AudioStreamIndex` on the AC-3 says direct play; and S02E07, the one
+    episode with the AC-3 first, direct plays as it stands. Most other
+    players do read the flag, so a file is only safe when both are playable —
+    which is why the planner writes its chosen default as output audio 0.
+    """
+    lead = default_audio(audio)
+    return [audio[0]] if lead is audio[0] else [audio[0], lead]
 
 
 def check(info: MediaInfo, cfg: EmbyCompatConfig, result: CheckResult) -> None:
@@ -175,34 +192,48 @@ def check(info: MediaInfo, cfg: EmbyCompatConfig, result: CheckResult) -> None:
     if audio:
         playable = [a for a in audio if a.codec_name in profile.audio]
         lead = default_audio(audio)
+        unplayable_lead = next((a for a in audio_leads(audio)
+                                if a.codec_name not in profile.audio), None)
         if not playable:
             worst = audio[0].codec_name
             detail = PROBLEM_AUDIO.get(
                 worst, f"no audio track in the target profile (found {worst})")
             result.add(Finding("compat", "bad_audio_codec", "error", detail,
                                {"codecs": [a.codec_name for a in audio]}))
-        elif lead.codec_name not in profile.audio:
-            # A playable track beside the default is not enough: Emby judges
-            # the file by the track it would open with, which is the default.
-            # Measured on the live library 2026-10-12: Battlestar Galactica
-            # S01E01 (DTS default, AC3 second) is refused, and the same
-            # PlaybackInfo call with AudioStreamIndex on the AC3 track says
-            # direct play. This used to be `mixed_audio_support` at info
-            # severity, on the theory that "Emby picks" the playable track —
-            # it does not, and the planner had nothing to do with that
-            # finding, so every one of these files was remuxed unchanged.
+        elif unplayable_lead is not None:
+            # A playable track elsewhere is not enough: Emby judges the file
+            # by the track it would open with. Measured on the live library
+            # 2026-10-12: Battlestar Galactica S01E01 (DTS default, AC3
+            # second) is refused, and the same PlaybackInfo call with
+            # AudioStreamIndex on the AC3 track says direct play. This used
+            # to be `mixed_audio_support` at info severity, on the theory
+            # that "Emby picks" the playable track — it does not, and the
+            # planner had nothing to do with that finding, so every one of
+            # these files was remuxed unchanged.
+            #
+            # The track it opens with is the *first*, not the default
+            # (2026-11-23, `audio_leads`), so a playable default behind an
+            # unplayable first track is the same fault. Penny Dreadful's 26
+            # episodes were information here and refused by Emby all along.
+            first = unplayable_lead is audio[0] and lead is not audio[0]
+            where = ("first audio track" if first else "default audio track")
+            why = ("Emby opens a file on its first track whatever is flagged "
+                   f"default (here {lead.codec_name})" if first else
+                   "Emby opens a file on that track")
             result.add(Finding(
                 "compat", "default_audio_unplayable", "error",
-                f"the default audio track is {lead.codec_name}, outside the "
-                f"target profile — Emby opens a file on its default track, so "
-                f"it transcodes every play although {len(playable)} playable "
-                f"track(s) exist",
-                {"default": audio.index(lead), "codec": lead.codec_name,
+                f"the {where} is {unplayable_lead.codec_name}, outside the "
+                f"target profile — {why}, so it transcodes every play "
+                f"although {len(playable)} playable track(s) exist",
+                {"default": audio.index(lead),
+                 "track": audio.index(unplayable_lead),
+                 "codec": unplayable_lead.codec_name,
                  "playable": [a.codec_name for a in playable]},
             ))
         else:
-            # The default plays, so the other tracks only matter to a viewer
-            # who picks one. Information, not a fault, and nothing to plan.
+            # The first and default tracks play, so the others only matter to
+            # a viewer who picks one. Information, not a fault, and nothing
+            # to plan.
             problem = [a.codec_name for a in audio if a.codec_name in PROBLEM_AUDIO]
             if problem and len(playable) < len(audio):
                 result.add(Finding(

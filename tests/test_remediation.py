@@ -168,6 +168,75 @@ def test_a_stand_in_track_is_promoted_to_default(settings):
     assert not transcode.changes_nothing(p, info)
 
 
+def _audio_maps_and_flags(cmd: list[str]) -> tuple[list[str], dict[str, str]]:
+    maps = [cmd[i + 1] for i, a in enumerate(cmd)
+            if a == "-map" and cmd[i + 1].startswith("0:a")]
+    flags = {cmd[i]: cmd[i + 1] for i, a in enumerate(cmd)
+             if a.startswith("-disposition:a:")}
+    return maps, flags
+
+
+def test_a_promoted_track_is_moved_to_the_front(settings):
+    """Penny Dreadful: TrueHD first, AC-3 flagged default. Emby opens on the
+    first track whatever the flag says, so a remux that only flags the AC-3
+    leaves the file refused — it has to be output audio 0."""
+    info = _tracks(("truehd", 6, False), ("ac3", 6, True))
+    p = transcode.plan(info, _unplayable_default(info), settings.transcode,
+                       settings.emby_compat)
+    assert p.set_default_audio == 1
+    assert transcode.audio_order(p, 2) == [1, 0]
+    assert "move audio track 2 first" in p.describe
+    cmd = transcode.build_command(info.path, "/tmp/out.mkv", info, p,
+                                  settings.transcode)
+    maps, flags = _audio_maps_and_flags(cmd)
+    assert maps == ["0:a:1", "0:a:0"]
+    assert flags == {"-disposition:a:0": "default", "-disposition:a:1": "0"}
+    assert cmd[cmd.index("-c:a") + 1] == "copy"
+
+
+def test_a_promoted_default_is_moved_ahead_of_the_one_it_replaces(settings):
+    """Cosmos S01E06: TrueHD default first, AC-3 second. Flagged, the AC-3
+    used to stay second — exactly the file above, which Emby refuses."""
+    info = _tracks(("truehd", 6, True), ("dts", 6, False), ("ac3", 6, False))
+    p = transcode.plan(info, _unplayable_default(info), settings.transcode,
+                       settings.emby_compat)
+    assert p.set_default_audio == 2
+    cmd = transcode.build_command(info.path, "/tmp/out.mkv", info, p,
+                                  settings.transcode)
+    maps, flags = _audio_maps_and_flags(cmd)
+    assert maps == ["0:a:2", "0:a:0", "0:a:1"]
+    assert flags == {"-disposition:a:0": "default", "-disposition:a:1": "0",
+                     "-disposition:a:2": "0"}
+
+
+def test_a_default_already_first_keeps_the_plain_map(settings):
+    info = _two_audio((True, True))
+    result = CheckResult(path=info.path)
+    result.add(Finding("hygiene", "multiple_default_audio", "warning", ""))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    assert p.set_default_audio == 0
+    cmd = transcode.build_command(info.path, "/tmp/out.mkv", info, p,
+                                  settings.transcode)
+    assert _audio_maps_and_flags(cmd)[0] == ["0:a?"]
+    assert p.describe.endswith("set default audio")
+
+
+def test_language_tags_follow_a_moved_track(settings):
+    """The tag is written by output index, so it has to land on the track it
+    was meant for once the order has changed."""
+    info = _tracks(("truehd", 6, False, "eng"), ("ac3", 6, True, ""))
+    result = _unplayable_default(info)
+    result.add(Finding("hygiene", "audio_missing_language", "warning", ""))
+    p = transcode.plan(info, result, settings.transcode, settings.emby_compat)
+    assert p.set_default_audio == 1 and p.fix_language_tags
+    cmd = transcode.build_command(info.path, "/tmp/out.mkv", info, p,
+                                  settings.transcode)
+    languages = {cmd[i]: cmd[i + 1] for i, a in enumerate(cmd)
+                 if a.startswith("-metadata:s:a:")}
+    # The untagged AC-3 was source track 1 and is output track 0.
+    assert languages == {"-metadata:s:a:0": "language=eng"}
+
+
 def test_a_stereo_track_does_not_stand_in_for_surround(settings):
     """Battlestar Galactica: DTS 5.1 default, AC3 2.0 beside it. Promoting the
     stereo track would make a 5.1 episode stereo for everyone, so a converted
@@ -306,6 +375,48 @@ def test_an_added_default_track_really_plays(tmp_path, settings):
            for a in after_info.audio]
     assert got == [("ac3", 6, True, "eng"), ("pcm_s16le", 6, False, "eng"),
                    ("ac3", 2, False, "eng")]
+    after = CheckResult(path=str(out))
+    compat.check(after_info, settings.emby_compat, after)
+    assert not after.errors, [f.code for f in after.errors]
+
+
+@needs_ffmpeg
+def test_a_moved_default_track_really_leads(tmp_path, settings):
+    """End to end through ffmpeg: a playable default behind an unplayable
+    first track comes out first, flagged, with nothing re-encoded, and the
+    result passes the check that condemned the source."""
+    import subprocess
+    from unfuckarr.checks import compat
+
+    src = tmp_path / "behind.mkv"
+    subprocess.run([
+        settings.ffmpeg_path, "-v", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc=size=320x180:rate=25:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=880:duration=6",
+        "-map", "0:v", "-map", "1:a", "-map", "2:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a:0", "pcm_s16le", "-ac:a:0", "6", "-c:a:1", "ac3", "-ac:a:1", "6",
+        "-metadata:s:a:0", "language=eng", "-metadata:s:a:1", "language=eng",
+        "-metadata:s:a:0", "title=PCM", "-metadata:s:a:1", "title=AC3",
+        "-disposition:a:0", "0", "-disposition:a:1", "default", str(src),
+    ], check=True, capture_output=True)
+
+    info = probe(str(src), settings.ffprobe_path)
+    before = CheckResult(path=str(src))
+    compat.check(info, settings.emby_compat, before)
+    assert "default_audio_unplayable" in {f.code for f in before.errors}
+
+    p = transcode.plan(info, before, settings.transcode, settings.emby_compat)
+    out = tmp_path / "out.mkv"
+    cmd = transcode.build_command(str(src), str(out), info, p, settings.transcode,
+                                  ffmpeg=settings.ffmpeg_path)
+    subprocess.run(cmd, check=True, capture_output=True)
+
+    after_info = probe(str(out), settings.ffprobe_path)
+    got = [(a.codec_name, a.channels, a.is_default, a.title)
+           for a in after_info.audio]
+    assert got == [("ac3", 6, True, "AC3"), ("pcm_s16le", 6, False, "PCM")]
     after = CheckResult(path=str(out))
     compat.check(after_info, settings.emby_compat, after)
     assert not after.errors, [f.code for f in after.errors]

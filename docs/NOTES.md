@@ -2495,3 +2495,40 @@ Both copies were imported by `replace.advance` at 23:49 ("better in every way me
   compatible)".
 
 Halo S01E05 and The Predator (rows 63–64) were still downloading at the time of writing.
+
+## 2026-11-23: Emby opens on the FIRST audio track — and the promotion that never moved it
+
+**The finding.** The incompatible list had ~30 files that unfuckarr had "fixed" two or three
+times each and given up on: Penny Dreadful (26 episodes), The Hobbit BR-DISK, Cosmos S01E06, The
+Last of Us S01E08/09, The Sopranos S02E06, Westworld S03E07/08. Every one had a playable AC-3
+track that was flagged default but was **not first**. Asked directly (PlaybackInfo as the admin
+user, PlayDefaultAudioTrack on, no language preference):
+
+| file | audio | Emby picks | direct play |
+|---|---|---|---|
+| Penny Dreadful S01E01 | truehd, **ac3\*** | track 1 (truehd) | no |
+| same, `AudioStreamIndex` = ac3 | | | **yes** |
+| Penny Dreadful S02E07 | **ac3\***, truehd | track 1 (ac3) | **yes** |
+| The Dark Knight, Terminator 3 | ac3\* first, truehd later | track 1 | yes |
+
+So invariant 27's premise — "Emby opens a file on its default track" — was wrong; it opens on the
+first. The 2026-10-12 Battlestar measurement could not tell the two apart (DTS was both default
+*and* first). `_fix_default_audio`'s promote path flipped flags only, so for these files it was a
+remux that changed nothing Emby reads, and the escalation re-encoded the picture and kept the
+TrueHD first as well (Penny Dreadful S01E01, 2026-11-17: H.264 remux → HEVC, still refused).
+
+**The fix.** `transcode.audio_order` writes the plan's chosen default as output audio 0 (an added
+track already went there); `build_command` maps tracks explicitly when the order changes and
+routes every per-track option through a source→output index map. `compat.audio_leads` makes the
+local check judge the first track as well as the default, so the post-transcode re-check — which
+never asks Emby — can now tell a flag flip from a real fix. `_reencode` asks the same question.
+
+**Not covered by this:** the files above are at `fix_attempts` 2–3, so they need the counter
+reset (`UPDATE files SET fix_attempts=0 …`) before a forced or scheduled transcode will touch
+them — `force_action` does not bypass `MAX_FIX_ATTEMPTS`. At attempts 0 the plan is "move audio
+track N first as the default": a stream-copy remux, nothing re-encoded.
+
+**Also learned in the same sweep:** Once Upon a Time S07E14 (DTS only) is container-damaged from
+~1.1 GB ("Element … exceeds containing master element"), so every rewrite comes out 906 s of
+2591 and `_verify_output` rightly refuses it — the integrity check never flagged the source. A
+file stuck at the cap with `transcode_output_bad` is worth a full read before another attempt.

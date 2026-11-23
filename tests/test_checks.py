@@ -252,6 +252,22 @@ def test_with_no_default_flag_the_first_track_is_the_default(settings):
     assert "default_audio_unplayable" in {f.code for f in result.errors}
 
 
+def test_an_unplayable_first_track_is_an_error_behind_a_playable_default(settings):
+    """Emby opens on the first track and does not read the default flag.
+    Penny Dreadful S01E01 on the live library (2026-11-23): TrueHD first, AC-3
+    flagged default — refused; direct play with the AC-3 selected; and
+    S02E07, AC-3 first, direct plays as it stands."""
+    result = CheckResult(path="/media/x.mkv")
+    compat.check(_audio_info(("truehd", 6, False), ("ac3", 6, True)),
+                 settings.emby_compat, result)
+    codes = {f.code: f for f in result.findings}
+    found = codes["default_audio_unplayable"]
+    assert found.severity == "error"
+    assert found.data["track"] == 0 and found.data["default"] == 1
+    assert "first audio track is truehd" in found.detail
+    assert "mixed_audio_support" not in codes
+
+
 def test_an_unplayable_track_that_is_not_the_default_is_information(settings):
     result = CheckResult(path="/media/x.mkv")
     compat.check(_audio_info(("ac3", 6, True), ("dts", 6, False)),

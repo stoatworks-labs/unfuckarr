@@ -25,7 +25,7 @@ from typing import Any, Callable
 
 from . import governor as governor_mod
 from .checks import CheckResult
-from .checks.compat import default_audio, resolve as resolve_profile
+from .checks.compat import audio_leads, default_audio, resolve as resolve_profile
 from .checks.hygiene import UNKNOWN_LANGS
 from .config import EmbyCompatConfig, TranscodeConfig
 from .probe import MediaInfo, Stream
@@ -206,6 +206,8 @@ class TranscodePlan:
     container: str = "mkv"
     drop_subtitles: list[int] = field(default_factory=list)
     fix_language_tags: bool = False
+    # A source audio index: flagged default and written as output audio 0,
+    # the rest after it in their own order (`audio_order`).
     set_default_audio: int | None = None
     # Mapped ahead of every source track, so it is output audio 0, and it
     # takes the default flag from all of them. `set_default_audio` is ignored
@@ -253,7 +255,9 @@ class TranscodePlan:
         if self.fix_language_tags:
             bits.append("tag languages")
         if self.set_default_audio is not None and self.add_audio is None:
-            bits.append("set default audio")
+            bits.append("set default audio" if self.set_default_audio == 0 else
+                        f"move audio track {self.set_default_audio + 1} "
+                        "first as the default")
         if self.clear_forced_subtitles:
             bits.append("clear forced subtitles")
         elif self.clear_subtitle_flags:
@@ -312,9 +316,9 @@ def plan(info: MediaInfo, result: CheckResult, tcfg: TranscodeConfig,
                 codes.add("bad_audio_codec")
             if "AudioCodecNotSupported" in reasons:
                 # Emby judges the track it would open on, which is the
-                # default (invariant 27). Asked as `default_audio_unplayable`
+                # first (invariant 27). Asked as `default_audio_unplayable`
                 # so a file with a playable track beside its DTS gets that
-                # track promoted rather than nothing.
+                # track promoted, and moved to the front, rather than nothing.
                 codes.add("default_audio_unplayable")
             if "ContainerNotSupported" in reasons:
                 p.is_remux = True
@@ -361,7 +365,9 @@ def _fix_default_audio(p: TranscodePlan, info: MediaInfo, profile: Any,
     """Give the file a default audio track the target profile can play.
 
     A playable track that can stand in for the current default is promoted,
-    which is a remux measured in seconds and changes no audio. "Stand in"
+    which is a remux measured in seconds and changes no audio: flagged
+    default *and* moved to the front (`audio_order`), because Emby opens on
+    the first track and never reads the flag. "Stand in"
     means the same language, not a commentary or a description, and at
     least as many channels as the default — capped at 5.1, because that is
     all a converted track could offer either, so a Blu-ray's AC-3 5.1 core
@@ -431,7 +437,10 @@ def _reencode(p: TranscodePlan, info: MediaInfo, profile: Any,
     if not info.audio or tcfg.audio_codec == "copy":
         return p
     if (info.container or "").lower() in TIMESTAMPED_CONTAINERS:
-        if default_audio(info.audio).codec_name not in profile.audio:
+        # The first track as well as the default: a re-encode that left a
+        # TrueHD track in front of the AC-3 default was refused exactly as
+        # the source was (Penny Dreadful S01E01, 2026-11-17).
+        if any(a.codec_name not in profile.audio for a in audio_leads(info.audio)):
             _fix_default_audio(p, info, profile, tcfg)
         return p
     p.audio_action = "encode"
@@ -646,6 +655,24 @@ def video_encode_args(codec: str, hw: str, crf: int, preset: str,
     return args
 
 
+def audio_order(p: TranscodePlan, count: int) -> list[int]:
+    """The source audio tracks in the order the output carries them.
+
+    The plan's chosen default first, then the rest as they were. Emby opens a
+    file on its first audio track and does not read the default flag
+    (invariant 27), so promoting a track by its flag alone fixes the file
+    only for players that read it. Live, Penny Dreadful: 26 episodes with
+    TrueHD first and AC-3 flagged default, each still refused after two such
+    remuxes and a full re-encode, while S02E07 — AC-3 first — direct played.
+    An added track already goes in front of every source track, so with one
+    nothing moves.
+    """
+    d = p.set_default_audio
+    if p.add_audio is not None or d is None or not 0 <= d < count:
+        return list(range(count))
+    return [d] + [i for i in range(count) if i != d]
+
+
 def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
                   tcfg: TranscodeConfig, ffmpeg: str = "ffmpeg",
                   default_language: str = DEFAULT_LANGUAGE) -> list[str]:
@@ -681,7 +708,15 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
     shift = 1 if added is not None else 0
     if added is not None:
         cmd += ["-map", f"0:a:{added.source}"]
-    cmd += ["-map", "0:a?"]
+    order = audio_order(p, len(info.audio))
+    # Source audio index -> output audio index, for every per-track option
+    # below: codec, language tag and disposition all follow the track.
+    out_a = {src_i: pos + shift for pos, src_i in enumerate(order)}
+    if order == list(range(len(info.audio))):
+        cmd += ["-map", "0:a?"]
+    else:
+        for i in order:
+            cmd += ["-map", f"0:a:{i}"]
     if tcfg.keep_subtitles:
         for i, _ in enumerate(info.subtitles):
             if i not in p.drop_subtitles:
@@ -706,8 +741,8 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
         cmd += ["-c:a", p.audio_codec]
         for i, a in enumerate(info.audio):
             channels = min(a.channels or 2, 6)
-            cmd += [f"-b:a:{i}", surround if channels > 2 else stereo,
-                    f"-ac:a:{i}", str(channels)]
+            cmd += [f"-b:a:{out_a[i]}", surround if channels > 2 else stereo,
+                    f"-ac:a:{out_a[i]}", str(channels)]
     elif p.audio_action == "encode":
         cmd += ["-c:a", tcfg.audio_codec, "-b:a", tcfg.audio_bitrate]
         # 7.1 downmixed by ffmpeg's default matrix is quiet and muddy; cap at
@@ -742,7 +777,7 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
         # never fixed.
         for i, a in enumerate(info.audio):
             if (a.language or "") in UNKNOWN_LANGS:
-                cmd += [f"-metadata:s:a:{i + shift}", f"language={default_language}"]
+                cmd += [f"-metadata:s:a:{out_a[i]}", f"language={default_language}"]
         out_i = 0
         for i, s in enumerate(info.subtitles):
             if i in p.drop_subtitles:
@@ -758,7 +793,7 @@ def build_command(src: str, dst: str, info: MediaInfo, p: TranscodePlan,
     elif p.set_default_audio is not None:
         for i in range(len(info.audio)):
             flag = "default" if i == p.set_default_audio else "0"
-            cmd += [f"-disposition:a:{i}", flag]
+            cmd += [f"-disposition:a:{out_a[i]}", flag]
 
     if p.clear_forced_subtitles or p.clear_subtitle_flags:
         # Output-stream indices, so the dropped tracks are skipped the same way

@@ -225,6 +225,17 @@ def test_a_reencode_of_a_matroska_file_keeps_its_original_audio(settings):
     assert p.describe.startswith("re-encode to the target profile")
 
 
+def test_a_reencode_moves_a_playable_default_ahead_of_truehd(settings):
+    """Penny Dreadful S01E01, 2026-11-17: TrueHD first, AC-3 default. The
+    re-encode checked only the default, found it playable, kept the order,
+    and Emby — which opens on the first track — refused the result too."""
+    info = _info(audio=[("truehd", 6, False), ("ac3", 6, True)])
+    p = transcode.plan(info, _refused(info, "AudioCodecNotSupported"),
+                       settings.transcode, settings.emby_compat, reencode=True)
+    assert p.reencode and p.set_default_audio == 1 and p.add_audio is None
+    assert transcode.audio_order(p, 2) == [1, 0]
+
+
 def test_a_reencode_of_a_broadcast_capture_decodes_the_audio_too(settings):
     """The Sky at Night S2018E01: every remux to Matroska died on a packet with
     no timestamp, audio and subtitle packets included. Decoding is what gives
