@@ -2532,3 +2532,34 @@ track N first as the default": a stream-copy remux, nothing re-encoded.
 ~1.1 GB ("Element … exceeds containing master element"), so every rewrite comes out 906 s of
 2591 and `_verify_output` rightly refuses it — the integrity check never flagged the source. A
 file stuck at the cap with `transcode_output_bad` is worth a full read before another attempt.
+
+## 2026-11-24: a new file under an old name inherited the old file's history
+
+**What happened.** Cosmos (2014) S01 had held the 1980 series since March: two failed usenet grabs
+of the genuine remux, then Sonarr took the 1980 CHX pack for the 2014 series and called it an
+upgrade. Those 13 files were recycled and the BONZO remux grabbed instead. It imported at 02:39
+under the **same filenames**. `sync_inventory` upserts on path, and the watch folder acts on the
+row as it stands, so each new episode came with the 1980 file's `fix_attempts` (0–3) and stale
+`arr_id`:
+
+- E04–E06, E09, E10 and E12 were refused ("already transcoded 3 time(s)").
+- E03 and E08 were at attempts 1. `_transcode` escalates a refused file at attempts ≥ 1 to a full
+  re-encode, so a pristine H.264 remux became HEVC when all it needed was an AC-3 track. E03
+  finished and was restored from the bin; E08 was cancelled at 97%.
+
+The rows were reset by hand and E03–E13 re-run through `/api/files/recheck`. Each took the cheap
+fix (AC-3 5.1 added as track 0, DTS kept). Afterwards Emby reported direct play for all 13.
+
+**The fix (invariant 33).** `scanner.forget_replaced` clears the per-file history when the size
+on disk differs from `checked_signature`, and logs `file_replaced` with what it forgot. Every path
+that reads a row before checking or acting calls it. `_move_db_row` and `recycle.restore` now sign
+the file they put in place, so unfuckarr's own swaps and the UI's restore are never mistaken for an
+outside replacement. Size only, because a mtime-only change is a mover or a `touch`. Forgetting
+`shrunk` on one of those would shrink the file twice.
+
+**Not covered:** `arr_id` stays stale until the next scan's enumeration. A redownload decided by
+the arrival check before that scan still recycles the file, but `delete_file` is sent the old
+episode-file id and fails (`arr_delete_failed`). Sonarr then believes the episode is present until
+its own rescan, which is exactly what invariant 1 exists to prevent. It takes an outside
+replacement that is itself broken, before a scan has run, so it is rare. The fix would be to look
+up the current id when the stored one is refused.

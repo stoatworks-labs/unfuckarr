@@ -21,7 +21,7 @@ from .clients.emby import EmbyClient, EmbyError
 from .config import Settings, WatchFolder
 from .probe import probe
 from .remediation import Remediator, decide
-from .scanner import Scanner, check_file, persist_result
+from .scanner import Scanner, check_file, forget_replaced, persist_result
 from .state import bus, clear_task, set_task, state
 from .watcher import WatchManager
 
@@ -309,6 +309,7 @@ class Service:
         return {k: row[k] for k in row.keys()} if row else None
 
     def _shrink_one(self, record: dict[str, Any], decision) -> dict[str, Any] | None:
+        record = forget_replaced(record)
         path = record["path"]
         if not Path(path).exists():
             db.ex("UPDATE files SET status='missing' WHERE path=?", (path,))
@@ -546,7 +547,9 @@ class Service:
                       "VALUES (?,?,?,?)",
                       (path, "Watch", "watch", Path(path).stem))
                 row = db.q1("SELECT * FROM files WHERE path = ?", (path,))
-            record = {k: row[k] for k in row.keys()}
+            # An *arr import lands under the old name, so this is often the
+            # first look at a new file through the old file's row.
+            record = forget_replaced(row)
 
             set_task(f"watch:{path}", kind="probing", path=path,
                      title=record.get("title") or Path(path).name,
@@ -594,7 +597,7 @@ class Service:
     def recheck(self, path: str, act: bool = True) -> dict[str, Any]:
         s = config.get()
         row = db.q1("SELECT * FROM files WHERE path = ?", (path,))
-        record = ({k: row[k] for k in row.keys()} if row
+        record = (forget_replaced(row) if row
                   else {"path": path, "source": "folder", "title": Path(path).name})
         emby = EmbyClient(s.emby) if s.emby.enabled else None
         result, info = check_file(
@@ -621,7 +624,7 @@ class Service:
         row = db.q1("SELECT * FROM files WHERE path = ?", (path,))
         if row is None:
             raise FileNotFoundError(path)
-        record = {k: row[k] for k in row.keys()}
+        record = forget_replaced(row)
         result, info = check_file(
             path, s, expected_runtime=record.get("expected_runtime"),
             # An explicit request should see the file as it is, not as the

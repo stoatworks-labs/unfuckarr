@@ -45,7 +45,7 @@ from .clients.emby import EmbyClient, EmbyError
 from .config import IntegrityConfig, Settings, apply_path_mappings
 from .probe import MediaInfo, ProbeError, decode_check_full
 from .remediation import Decision, Remediator, decide
-from .scanner import check_file, persist_result
+from .scanner import check_file, forget_replaced, persist_result
 from .state import bus, state
 
 log = logging.getLogger(__name__)
@@ -578,7 +578,7 @@ class PlaybackWatcher:
             }
 
         file_row = db.q1("SELECT * FROM files WHERE path=?", (path,))
-        record = ({k: file_row[k] for k in file_row.keys()} if file_row
+        record = (forget_replaced(file_row) if file_row
                   else {"path": path, "source": "folder", "title": play.title})
         if record.get("arr_episode_ids"):
             try:

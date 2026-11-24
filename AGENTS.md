@@ -572,6 +572,33 @@ Break any of these and the failure is quiet and expensive.
     so `judge` does not ask for the gain either. `judge` refuses any download that is itself
     baked by either signal, with the grabbed title as its release, whatever the switch says.
 
+33. **A file replaced by something other than unfuckarr starts with no history.** Rows are keyed
+    by path and an *arr upgrade imports under the old name, so the new file used to inherit
+    everything recorded against the old bytes: `fix_attempts`, every shrink and conversion
+    marker, the research cooldown. With attempts inherited, `_transcode`'s escalation
+    (`refused and attempts >= 1` → re-encode) or the cap then acted on a file nothing had ever
+    touched. Live, 2026-11-24: the genuine Cosmos (2014) remux replaced a misfiled 1980 pack.
+    Six episodes were refused as "already transcoded", and E03/E08 were fully re-encoded to HEVC
+    when all they needed was an AC-3 track (E08 was stopped at 97%).
+
+    `scanner.forget_replaced` is the reset, and every path that reads a row and then checks or
+    acts calls it first: the scan's `_check_one`, the watch folder, the shrink worker, the
+    playback-failure check, and the UI's re-check and forced actions. It clears
+    `scanner.FILE_HISTORY` when the file's **size** differs from `checked_signature`'s, and logs
+    `file_replaced` with what it forgot. Three things keep it from firing on unfuckarr's own work,
+    and each is load-bearing, because a false positive wipes `shrunk` and the file is shrunk a
+    second time (invariant 11):
+
+    - **Size only, never mtime.** A mover, a backup tool or a `touch` changes the mtime of a file
+      that is still the same bytes. An upgrade is never byte-for-byte the same length.
+    - **`_move_db_row` signs the swap.** All three swaps (transcode, shrink, convert) write the
+      replacement's signature at the moment of the swap. The re-check after them would write it
+      too, but it swallows its errors, and a restart can cut it short.
+    - **`recycle.restore` signs the restored file.** A restore is an undo. Read as a new file it
+      would lose `shrunk`, and the worker would shrink the file the user had just put back.
+
+    `arr_id` is not touched; the next enumeration brings the new one.
+
 ## Traps found the hard way
 
 - **The recycle bin's size is what is on disk, not `SUM(size)` from the table.** The two disagree,

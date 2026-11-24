@@ -357,6 +357,19 @@ def restore(recycle_id: int) -> str:
     original = Path(row["original"])
     original.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(stored), str(original))
+    # A restore is an undo, so the row's history still applies to the file it
+    # brings back. Signed here, the next look does not read the original as a
+    # file replaced from outside and forget it (`scanner.forget_replaced`) —
+    # which would drop `shrunk` and shrink again the file the user had just
+    # put back. The row's last result described the file that was there, so
+    # it is re-checked as well.
+    try:
+        st = original.stat()
+        db.ex("UPDATE files SET checked_signature=?, status='unknown', "
+              "last_checked=NULL WHERE path=?",
+              (f"{st.st_size}:{st.st_mtime}", str(original)))
+    except OSError:
+        pass
     db.ex("DELETE FROM recycle WHERE id = ?", (recycle_id,))
     db.log("file_restored", "info", str(original))
     return str(original)

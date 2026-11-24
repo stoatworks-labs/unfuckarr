@@ -237,6 +237,77 @@ def persist_result(path: str, result: CheckResult, info: MediaInfo | None,
               (path, f.category, f.code, f.severity, f.detail, now))
 
 
+# What a pass records about the *bytes* at a path rather than the path itself,
+# with the value a file that has never been touched carries. Rows are keyed by
+# path and an *arr upgrade imports under the same name, so without a reset the
+# new file inherits all of it.
+FILE_HISTORY: dict[str, Any] = {
+    "fix_attempts": 0,
+    "shrunk": None, "shrunk_from": None, "shrink_score": None,
+    "shrink_metric": None, "shrink_skipped": None, "shrink_attempts": 0,
+    "converted": None, "converted_from": None, "convert_skipped": None,
+    "convert_attempts": 0,
+    "last_research": None, "research_attempts": 0,
+}
+
+
+def _signed_size(signature: str | None) -> int | None:
+    try:
+        size = int(str(signature).split(":", 1)[0])
+    except (TypeError, ValueError):
+        return None
+    return size or None              # "0:0.0" is a stat that failed, not a size
+
+
+def forget_replaced(row: Any) -> dict[str, Any]:
+    """The row as a dict, its history cleared if the file is not the one it describes.
+
+    `checked_signature` is the size and mtime of the file the last check saw,
+    and every swap unfuckarr makes writes the replacement's at the moment of
+    the swap (`Remediator._move_db_row`, `recycle.restore`). So a file on disk
+    that differs from it was put there by something else — in practice an *arr
+    importing an upgrade under the same name — and the attempts, verdicts and
+    cooldowns recorded against the old bytes say nothing about the new ones.
+    Live, 2026-11-24: the genuine Cosmos (2014) remux arrived over a misfiled
+    1980 pack and inherited its history episode for episode; six episodes were
+    refused as already transcoded, and two were fully re-encoded as a "second
+    go" when all they needed was an AC-3 track.
+
+    Only the size decides. A changed mtime with the same size is a mover, a
+    backup tool or a `touch`, not a new file — and forgetting `shrunk` on one
+    of those would shrink the file a second time (invariant 11). An upgrade is
+    never byte-for-byte the same length as what it replaced.
+
+    Every path that reads a row and then checks or acts on the file calls this
+    first: the scan, the watch folder, the shrink worker, the playback-failure
+    check, and the UI's re-check and forced actions. `arr_id` is left alone; the next
+    enumeration brings the new one.
+    """
+    record = dict(row)
+    path = record.get("path")
+    recorded = _signed_size(record.get("checked_signature"))
+    if not path or recorded is None:
+        return record
+    try:
+        size = os.stat(path).st_size
+    except OSError:
+        return record
+    if size == recorded:
+        return record
+    forgotten = {k: record[k] for k, clean in FILE_HISTORY.items()
+                 if k in record and record[k] not in (clean, None)}
+    if not forgotten:
+        return record
+    db.ex("UPDATE files SET " + ", ".join(f"{k}=?" for k in FILE_HISTORY)
+          + " WHERE path=?", (*FILE_HISTORY.values(), path))
+    record.update(FILE_HISTORY)
+    db.log("file_replaced", "info", path, {
+        "was": recorded, "now": size, "forgot": forgotten,
+        "note": "replaced by something other than unfuckarr; its history "
+                "described the old file"})
+    return record
+
+
 def needs_check(row: Any, s: Settings) -> bool:
     """Whether this file is worth probing again this pass."""
     if not s.schedule.skip_unchanged:
@@ -453,6 +524,7 @@ class Scanner:
 
     def _check_one(self, row: Any, s: Settings,
                    emby: EmbyClient | None) -> tuple[dict[str, Any], CheckResult, MediaInfo | None]:
+        row = forget_replaced(row)
         path = row["path"]
         set_task("scan", kind="probing", path=path,
                  title=row["title"] or Path(path).name,

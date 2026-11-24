@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS files (
     last_checked    REAL,
     last_result     TEXT,            -- JSON CheckResult
     probe           TEXT,            -- JSON ffprobe summary
-    checked_signature TEXT,          -- size:mtime at last clean pass
+    checked_signature TEXT,          -- size:mtime at the last check, or of our last swap
     -- How many times we have transcoded this file and it still failed
     -- afterwards. Guards against transcoding the same file for ever.
     fix_attempts    INTEGER DEFAULT 0,

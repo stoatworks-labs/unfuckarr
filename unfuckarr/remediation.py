@@ -1001,12 +1001,24 @@ class Remediator:
             log.error("could not put %s back after a failed swap: %s", path, exc)
 
     def _move_db_row(self, old: str, new: str) -> None:
+        # The signature of what was just swapped in, written here rather than
+        # left to the re-check after it. That re-check swallows its errors and
+        # a restart can cut it short, and a file whose size matches no
+        # signature reads as replaced by something else, which forgets its
+        # history (`scanner.forget_replaced`) — a re-encode's capped attempts
+        # and `shrunk` included. `last_checked` goes to NULL in the same
+        # write, so `needs_check` still re-checks the file.
+        try:
+            st = os.stat(new)
+            signature: str | None = f"{st.st_size}:{st.st_mtime}"
+        except OSError:
+            signature = None
         if old == new:
-            db.ex("UPDATE files SET status='unknown', last_checked=NULL WHERE path=?",
-                  (old,))
+            db.ex("UPDATE files SET status='unknown', last_checked=NULL, "
+                  "checked_signature=? WHERE path=?", (signature, old))
             return
-        db.ex("UPDATE files SET path=?, status='unknown', last_checked=NULL "
-              "WHERE path=?", (new, old))
+        db.ex("UPDATE files SET path=?, status='unknown', last_checked=NULL, "
+              "checked_signature=? WHERE path=?", (new, signature, old))
         db.ex("UPDATE findings SET path=? WHERE path=?", (new, old))
 
     def _notify_arr_rescan(self, file_row: dict[str, Any]) -> None:
